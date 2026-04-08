@@ -1,13 +1,16 @@
 {
-  "name": "claude-hub",
+  "name": "herd",
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "restart": "lsof -ti:3456 | xargs kill -9 2>/dev/null; node server.js"
   },
   "dependencies": {
-    "dotenv": "^17.4.1",
     "express": "^4.21.0",
     "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "playwright": "^1.59.1"
   }
 }

@@ -3,7 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Claude Hub</title>
+  <title>Herd</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>%3E_</text></svg>">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
   <link rel="stylesheet" href="/style.css">
 </head>
@@ -11,9 +12,18 @@
   <div id="app">
     <aside id="sidebar">
       <div id="sidebar-header">
-        <span class="logo">&gt;_</span> Claude Hub
+        <span class="logo">&gt;_</span> Herd
+        <button id="refresh-btn" title="Refresh projects" onclick="window.__herd?.loadProjects()">&#x21bb;</button>
+      </div>
+      <div id="search-bar">
+        <input type="text" id="project-search" placeholder="Filter projects..." spellcheck="false">
       </div>
       <div id="project-list"></div>
+      <div id="sidebar-footer">
+        <button class="theme-btn" data-theme="light" title="Light theme">light</button>
+        <button class="theme-btn" data-theme="dark" title="Dark theme">dark</button>
+        <button class="theme-btn" data-theme="auto" title="System theme">auto</button>
+      </div>
     </aside>
     <div id="resize-handle"></div>
     <main id="main">
@@ -25,7 +35,7 @@
         <div class="empty-content">
           <pre class="ascii-logo">
   ┌─────────────────┐
-  │  &gt;_ Claude Hub   │
+  │  &gt;_ Herd         │
   └─────────────────┘</pre>
           <p>Select a project to start</p>
           <p class="hint">or resume an existing session</p>

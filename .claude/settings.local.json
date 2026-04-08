@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node -c public/app.js)",
+      "Bash(xargs kill:*)",
+      "Bash(node /Users/pd/Documents/claude-hub/server.js)",
+      "Bash(sed -n '39,98p' server.js)",
+      "Bash(node -e ':*)",
+      "Bash(node:*)",
+      "Bash(wc:*)",
+      "Bash(lsof -ti:3456)",
+      "Bash(disown)",
+      "Read(//tmp/**)",
+      "Bash(npx playwright:*)",
+      "Read(//Users/pd/.Trash/**)",
+      "Read(//Users/pd/.Trash//**)"
+    ]
+  }
+}

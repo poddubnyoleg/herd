@@ -1,4 +1,4 @@
-# Claude Hub
+# Herd
 
 Web-based terminal multiplexer for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) sessions.
 
@@ -7,11 +7,17 @@ Browse, resume, and manage Claude Code sessions across all your projects from a 
 ## Features
 
 - **Project sidebar** — all projects with Claude Code history, sorted by recency
+- **Search/filter** — filter projects by name and sessions by summary/preview text
 - **Session browser** — recent sessions per project with AI-generated summaries
-- **Terminal tabs** — multiple concurrent terminals (real shell via PTY)
+- **Terminal tabs** — multiple concurrent Claude Code terminals with tab management
 - **Resume sessions** — click any past session to `claude --resume` it
 - **Auto-naming** — tabs named by Haiku from terminal output
 - **Double-click rename** — manual tab naming
+- **Theme system** — dark, light, and auto (system) themes
+- **Keyboard shortcuts** — Ctrl+W (close tab), Ctrl+T (new session), Ctrl+PageDown/PageUp (cycle tabs)
+- **Auto-reconnect** — WebSocket reconnection with exponential backoff on disconnect
+- **Resizable sidebar** — drag to resize, width persisted across reloads
+- **Finished tab indicator** — green pulse on background tabs that finish while you're away
 
 ## Setup
 
@@ -19,16 +25,10 @@ Browse, resume, and manage Claude Code sessions across all your projects from a 
 npm install
 ```
 
-Create `.env` with your API key (for Haiku auto-naming):
+Create `.env` with your API key (optional — enables Haiku auto-naming):
 
 ```
 ANTHROPIC_API_KEY=sk-ant-...
-```
-
-Or copy from your existing project:
-
-```bash
-cp /path/to/your/project/.env .env
 ```
 
 ## Usage
@@ -38,15 +38,31 @@ npm start
 # → http://localhost:3456
 ```
 
-Open in browser. Click a project to see sessions. "New session" opens an interactive shell in that project's directory — run `claude`, `git`, or anything else.
+Open in browser. Click a project to see sessions. Click "+ new session" to launch Claude Code in that project's directory, or click an existing session to resume it.
+
+Configure with environment variables:
+
+- `PORT` — server port (default: `3456`)
+- `HOST` — bind address (default: `127.0.0.1`)
+- `ANTHROPIC_API_KEY` — enables AI-generated session names
+
+## Testing
+
+```bash
+npm test
+```
+
+Tests use [Playwright](https://playwright.dev/) for browser-level integration testing.
 
 ## How it works
 
 - Scans `~/.claude/projects/` for session history (JSONL files)
-- Parses first user message from each session for preview
+- Decodes project paths from Claude Code's dash-separated directory naming via a backtracking solver
+- Parses first user message from each session for preview text
 - Uses Claude Haiku to generate 2-4 word session summaries (cached in `summaries.json`)
-- Spawns real PTY via macOS `script` command
+- Spawns real PTY via macOS `script` command (no native dependencies)
 - xterm.js in the browser for terminal rendering
+- WebSocket per terminal for real-time I/O
 
 ## Stack
 
@@ -54,3 +70,10 @@ Open in browser. Click a project to see sessions. "New session" opens an interac
 - **Frontend**: Vanilla JS, xterm.js (CDN)
 - **PTY**: macOS `script -q /dev/null` (no native dependencies)
 - **Naming**: Claude Haiku via Anthropic API
+- **Tests**: Playwright
+
+## Limitations
+
+- **macOS only** — the `script -q /dev/null` PTY wrapper is macOS-specific
+- **Terminal resize** — SIGWINCH is sent but underlying PTY size is fixed at initial dimensions (full resize requires node-pty)
+- **No auth** — binds to localhost only; not intended for network exposure
