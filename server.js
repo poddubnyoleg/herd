@@ -191,7 +191,25 @@ function saveSummaryCache() {
 async function generateSummary(text) {
   if (!claudeBin || !text) return null;
 
-  const prompt = `Name this chat session in 2-4 words. Lowercase, no punctuation. Reply with ONLY the words.\n\n"${text.slice(0, 1000)}"`;
+  const prompt = `Name this chat session in 2-4 words based on the user's task or question. Lowercase, no punctuation. Focus on WHAT the user is doing, not which tools or editors they use. Never include words like "claude", "terminal", "session", "code editor", or project names unless the project itself is the topic. Reply with ONLY the name.\n\n"${text.slice(0, 1000)}"`;
+  try {
+    return await new Promise((resolve) => {
+      execFile(claudeBin, ['-p', '--no-session-persistence', '--model', 'haiku', prompt], { timeout: 15000 }, (err, stdout) => {
+        if (err) return resolve(null);
+        const result = stdout.trim();
+        resolve(result || null);
+      });
+    });
+  } catch {
+    return null;
+  }
+}
+
+// Separate prompt for live terminal output (noisier than JSONL previews)
+async function generateLiveTitle(text) {
+  if (!claudeBin || !text) return null;
+
+  const prompt = `Below is cleaned terminal output from a coding session. Name the task in 2-4 words. Lowercase, no punctuation. Focus on the specific task (e.g. "fix login bug", "add search feature", "refactor api routes"). Do NOT use generic words like "terminal", "session", "development", "code editing", "project work", or tool/editor names. If there is no clear task yet, reply with just "new session". Reply with ONLY the name.\n\n"${text.slice(0, 1000)}"`;
   try {
     return await new Promise((resolve) => {
       execFile(claudeBin, ['-p', '--no-session-persistence', '--model', 'haiku', prompt], { timeout: 15000 }, (err, stdout) => {
@@ -394,7 +412,7 @@ wss.on('connection', (ws, req) => {
   let charsSinceLastRename = 0;
   let renameCount = 0;
   const MAX_RENAMES = 5;
-  const INITIAL_DELAY = 60_000;      // 1 minute
+  const INITIAL_DELAY = 90_000;      // 1.5 minutes (wait for actual task content)
   const RENAME_INTERVAL = 5 * 60_000; // 5 minutes
   const MAX_RENAME_AGE = 30 * 60_000; // 30 minutes
   const MIN_NEW_CHARS = 1000;
@@ -407,15 +425,42 @@ wss.on('connection', (ws, req) => {
     return s.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '').replace(/\x1b\][^\x07]*\x07/g, '').replace(/[\x00-\x1f]/g, '');
   }
 
+  // Clean terminal output for naming: strip TUI chrome, banners, prompts
+  function cleanForNaming(raw) {
+    let s = stripAnsi(raw);
+    // Remove Claude Code startup banner lines
+    s = s.replace(/Claude Code v[\d.]+/g, '');
+    s = s.replace(/Opus \d+\.\d+.*?context\).*?(?:Claude Max|high effort|low effort|medium effort)/g, '');
+    s = s.replace(/~\/[^\s]*/g, '');  // ~/Documents/herd etc.
+    // Remove shell prompts like (base) user@host dir %
+    s = s.replace(/\(base\)\s*\S+@\S+\s+\S+\s*%/g, '');
+    // Remove box-drawing and TUI decoration characters
+    s = s.replace(/[─│┌┐└┘├┤┬┴┼╭╮╰╯═║╔╗╚╝╠╣╦╩╬▀▄█▌▐░▒▓■●◆◇○◎★☆►◄▲▼⊞⊟]/g, '');
+    // Remove common status bar content
+    s = s.replace(/\? for shortcuts/g, '');
+    s = s.replace(/ctrl\+[a-z] to \w+/gi, '');
+    s = s.replace(/Image in clipboard/g, '');
+    s = s.replace(/\/effort/g, '');
+    s = s.replace(/Running\.\.\./g, '');
+    s = s.replace(/In \S+\.js/g, '');
+    // Remove file paths
+    s = s.replace(/\/Users\/\S+/g, '');
+    // Remove repeated dots/underscores (TUI padding)
+    s = s.replace(/[_.]{3,}/g, ' ');
+    // Collapse whitespace
+    s = s.replace(/\s+/g, ' ').trim();
+    return s;
+  }
+
   async function generateTitle() {
     if (sessionEnded || renameCount >= MAX_RENAMES) return;
     if (Date.now() - sessionStart > MAX_RENAME_AGE) return;
-    const clean = stripAnsi(outputBuffer).replace(/\s+/g, ' ').trim().slice(-800);
-    if (clean.length < 20) return;
+    const clean = cleanForNaming(outputBuffer).slice(-800);
+    if (clean.length < 30) return;  // need enough meaningful content
     if (renameCount > 0 && charsSinceLastRename < MIN_NEW_CHARS) return;
     renameCount++;
     charsSinceLastRename = 0;
-    const title = await generateSummary(clean);
+    const title = await generateLiveTitle(clean);
     if (title) {
       try { ws.send(JSON.stringify({ type: 'title', title })); } catch {}
     }
@@ -444,21 +489,36 @@ wss.on('connection', (ws, req) => {
   }
 
   // stdout → WebSocket + buffer for auto-naming
+  // Coalesce rapid output chunks into fewer, larger WebSocket frames
+  let wsSendBuf = '';
+  let wsSendTimer = null;
+  const flushWsBuf = () => {
+    wsSendTimer = null;
+    if (wsSendBuf) {
+      const chunk = wsSendBuf;
+      wsSendBuf = '';
+      try { ws.send(JSON.stringify({ type: 'output', data: chunk })); } catch {}
+    }
+  };
+
   proc.stdout.on('data', data => {
     const str = data.toString();
-    try { ws.send(JSON.stringify({ type: 'output', data: str })); } catch {}
     outputBuffer += str;
     if (outputBuffer.length > 2048) outputBuffer = outputBuffer.slice(-2048);
     charsSinceLastRename += str.length;
+    wsSendBuf += str;
+    if (!wsSendTimer) wsSendTimer = setTimeout(flushWsBuf, 8);
   });
 
   proc.stderr.on('data', data => {
-    try { ws.send(JSON.stringify({ type: 'output', data: data.toString() })); } catch {}
+    wsSendBuf += data.toString();
+    if (!wsSendTimer) wsSendTimer = setTimeout(flushWsBuf, 8);
   });
 
   proc.on('exit', (code) => {
     sessionEnded = true;
     if (renameTimer) clearTimeout(renameTimer);
+    if (wsSendTimer) { clearTimeout(wsSendTimer); flushWsBuf(); }
     try { ws.send(JSON.stringify({ type: 'exit', code: code || 0 })); } catch {}
     terminals.delete(termId);
   });

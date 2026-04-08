@@ -365,11 +365,20 @@ class Herd {
     try { terminal.loadAddon(new WebLinksAddon.WebLinksAddon()); } catch {}
     terminal.open(wrapper);
 
+    // GPU-accelerated rendering via WebGL (major FPS improvement)
+    try {
+      const webglAddon = new WebglAddon.WebglAddon();
+      webglAddon.onContextLoss(() => { webglAddon.dispose(); });
+      terminal.loadAddon(webglAddon);
+    } catch {}
+
+
     const tab = {
       id: tabId, name: name || 'new session', terminal, fitAddon, ws: null,
       projectPath, sessionId: resumeId, alive: true, unread: false,
       finished: false, idleTimer: null, outputSinceViewed: 0,
       _closeRequested: 0, _inactiveSince: 0,
+      _writeBuf: '', _writeRaf: 0,
     };
     this.tabs.set(tabId, tab);
 
@@ -420,7 +429,16 @@ class Herd {
         const msg = JSON.parse(e.data);
         switch (msg.type) {
           case 'output':
-            terminal.write(msg.data);
+            // Batch writes via rAF to reduce render calls and improve FPS
+            tab._writeBuf += msg.data;
+            if (!tab._writeRaf) {
+              tab._writeRaf = requestAnimationFrame(() => {
+                tab._writeRaf = 0;
+                const chunk = tab._writeBuf;
+                tab._writeBuf = '';
+                terminal.write(chunk);
+              });
+            }
             if (tabId !== this.activeTabId && tab._inactiveSince && Date.now() - tab._inactiveSince > 5000) {
               tab.outputSinceViewed += this.stripAnsi(msg.data).trim().length;
               if (tab.outputSinceViewed > 200) {
@@ -537,6 +555,7 @@ class Herd {
 
     tab._destroyed = true;
     if (tab._reconnectTimer) clearTimeout(tab._reconnectTimer);
+    if (tab._writeRaf) cancelAnimationFrame(tab._writeRaf);
     try { tab.ws?.close(); } catch {}
     tab.terminal.dispose();
     document.getElementById(`term-${tabId}`)?.remove();
