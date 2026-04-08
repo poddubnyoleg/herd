@@ -307,7 +307,6 @@ body {
 
 #tabs {
   display: flex;
-  flex: 1;
   overflow-x: auto;
   scrollbar-width: none;
 }
@@ -397,6 +396,26 @@ body {
   background: rgba(248, 81, 73, 0.1);
 }
 
+#new-tab-btn {
+  background: none;
+  border: none;
+  border-left: 1px solid var(--border);
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 16px;
+  font-family: inherit;
+  font-weight: 600;
+  padding: 0 12px;
+  height: 34px;
+  flex-shrink: 0;
+  transition: color 0.1s, background 0.1s;
+}
+
+#new-tab-btn:hover {
+  color: var(--accent);
+  background: var(--bg-hover);
+}
+
 /* ── Terminal ── */
 
 #terminal-area {
@@ -404,6 +423,8 @@ body {
   position: relative;
   display: none;
   background: var(--bg);
+  min-height: 0;
+  overflow: hidden;
 }
 
 #terminal-area.has-tabs { display: block; }

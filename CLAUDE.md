@@ -28,13 +28,19 @@ Single-process Node.js server (`server.js`) serving a vanilla JS frontend (`publ
 - Project paths are encoded/decoded between the filesystem dash-separated format in `~/.claude/projects/` and real paths using a backtracking solver (`decodeProjectPath`) that validates against the actual filesystem. `findEncodedDir()` reverse-lookups the encoded directory name for a given real path
 - Security: binds to `127.0.0.1` by default (configurable via `HOST` env var), sets `X-Content-Type-Options` and `X-Frame-Options` headers, validates `resume` parameter as UUID format
 - Haiku summaries: spawns `claude -p --model haiku` to generate 2-4 word session names (no API key needed), cached in `summaries.json` on disk. Background-generates missing summaries when sessions are fetched. Tracks in-flight requests to prevent duplicate calls
-- Auto-naming: buffers terminal output (capped at 2KB) and periodically sends it to Haiku via CLI for tab title generation (max 5 renames over 30 minutes per session)
+- Auto-naming: buffers terminal output (capped at 2KB) and periodically sends it to Haiku via CLI for tab title generation (max 5 renames over 30 minutes per session). Live titles are persisted to the summary cache on disk
+- Session ID detection: for new (non-resumed) sessions, the server discovers the session ID by scanning the project dir for recently-created JSONL files, then notifies the client via a `ready` message
+- JSONL parsing: reads session files line-by-line with chunked I/O (up to 20 lines, 64KB chunks) instead of a fixed 16KB buffer
 - Graceful shutdown: SIGINT/SIGTERM kill terminal processes, close WebSocket server, then close HTTP server with a 3s timeout
 
 **Frontend (`public/app.js`, `public/index.html`, `public/style.css`):**
 - Single `Herd` class manages all state — project list, tabs, terminals, theme, search
 - Each tab holds an xterm.js terminal instance connected to the server via WebSocket
 - Tabs track `alive`, `unread`, and `finished` states; background tabs with 5s output idle are marked finished (green pulse)
+- Terminal auto-refit: each terminal uses a `ResizeObserver` on its container to refit on any size change (window resize, sidebar drag, etc.)
+- Smart scroll: output writes preserve scroll position when the user has scrolled up; auto-scrolls only when already at the bottom
+- "+" button in tab bar creates a new session in the most recent active project
+- Session cache updated in-memory when live titles arrive, so sidebar re-renders show current names
 - Search/filter: sidebar text input filters projects by name and sessions by summary/preview text. Auto-expands projects that match only by session content
 - WebSocket reconnection: auto-reconnects with exponential backoff (up to 30s) for sessions that have a `sessionId`
 - Keyboard shortcuts: Ctrl+W (close tab), Ctrl+T (new session in active project), Ctrl+PageDown/PageUp (cycle tabs)

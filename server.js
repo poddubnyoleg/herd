@@ -139,15 +139,29 @@ function getProjectName(p) {
 function getSessionInfo(jsonlPath) {
   try {
     const fd = fs.openSync(jsonlPath, 'r');
-    let content;
+    const lines = [];
     try {
-      const buffer = Buffer.alloc(16384);
-      const bytesRead = fs.readSync(fd, buffer, 0, 16384, 0);
-      content = buffer.toString('utf8', 0, bytesRead);
+      const MAX_LINES = 20;
+      const CHUNK_SIZE = 65536;
+      let remainder = '';
+      let offset = 0;
+      while (lines.length < MAX_LINES) {
+        const buffer = Buffer.alloc(CHUNK_SIZE);
+        const bytesRead = fs.readSync(fd, buffer, 0, CHUNK_SIZE, offset);
+        if (bytesRead === 0) break;
+        offset += bytesRead;
+        const chunk = remainder + buffer.toString('utf8', 0, bytesRead);
+        const parts = chunk.split('\n');
+        remainder = parts.pop();
+        for (const part of parts) {
+          if (part.trim()) lines.push(part);
+          if (lines.length >= MAX_LINES) break;
+        }
+      }
+      if (lines.length < MAX_LINES && remainder.trim()) lines.push(remainder);
     } finally {
       fs.closeSync(fd);
     }
-    const lines = content.split('\n').filter(l => l.trim());
 
     let firstUserMessage = null;
     let timestamp = null;
@@ -468,6 +482,28 @@ wss.on('connection', (ws, req) => {
     return s;
   }
 
+  // Detect session ID for new sessions by finding the newest JSONL in the project dir
+  function detectSessionId() {
+    if (sessionId) return sessionId;
+    if (!encodedDir) return null;
+    try {
+      const projDir = path.join(PROJECTS_DIR, encodedDir);
+      const files = fs.readdirSync(projDir)
+        .filter(f => f.endsWith('.jsonl'))
+        .map(f => ({ name: f.replace('.jsonl', ''), mtime: fs.statSync(path.join(projDir, f)).mtimeMs }))
+        .filter(f => f.mtime >= sessionStart - 5000) // created around when this session started
+        .sort((a, b) => b.mtime - a.mtime);
+      if (files.length > 0) {
+        sessionId = files[0].name;
+        const entry = terminals.get(termId);
+        if (entry) entry.sessionId = sessionId;
+        // Notify client of discovered session ID
+        try { ws.send(JSON.stringify({ type: 'ready', termId, sessionId })); } catch {}
+      }
+    } catch {}
+    return sessionId;
+  }
+
   async function generateTitle() {
     if (sessionEnded || renameCount >= MAX_RENAMES) return;
     if (Date.now() - sessionStart > MAX_RENAME_AGE) return;
@@ -479,6 +515,12 @@ wss.on('connection', (ws, req) => {
     const title = await generateLiveTitle(clean);
     if (title) {
       try { ws.send(JSON.stringify({ type: 'title', title })); } catch {}
+      // Persist live title to summary cache
+      const sid = detectSessionId();
+      if (sid) {
+        summaryCache[sid] = title;
+        saveSummaryCache();
+      }
     }
     scheduleNextRename();
   }

@@ -15,6 +15,8 @@ Browse, resume, and manage Claude Code sessions across all your projects from a 
 - **Double-click rename** — manual tab naming
 - **Theme system** — dark, light, and auto (system) themes
 - **Keyboard shortcuts** — Ctrl+W (close tab), Ctrl+T (new session), Ctrl+PageDown/PageUp (cycle tabs)
+- **New tab button** — "+" button in tab bar for quick session creation
+- **Smart scroll** — auto-scrolls output only when you're at the bottom; preserves position when scrolled up
 - **Auto-reconnect** — WebSocket reconnection with exponential backoff on disconnect
 - **Resizable sidebar** — drag to resize, width persisted across reloads
 - **Finished tab indicator** — green pulse on background tabs that finish while you're away
@@ -23,12 +25,6 @@ Browse, resume, and manage Claude Code sessions across all your projects from a 
 
 ```bash
 npm install
-```
-
-Create `.env` with your API key (optional — enables Haiku auto-naming):
-
-```
-ANTHROPIC_API_KEY=sk-ant-...
 ```
 
 ## Usage
@@ -44,7 +40,6 @@ Configure with environment variables:
 
 - `PORT` — server port (default: `3456`)
 - `HOST` — bind address (default: `127.0.0.1`)
-- `ANTHROPIC_API_KEY` — enables AI-generated session names
 
 ## Testing
 
@@ -69,7 +64,7 @@ Tests use [Playwright](https://playwright.dev/) for browser-level integration te
 - **Backend**: Node.js, Express, WebSocket (`ws`)
 - **Frontend**: Vanilla JS, xterm.js (CDN)
 - **PTY**: macOS `script -q /dev/null` (no native dependencies)
-- **Naming**: Claude Haiku via Anthropic API
+- **Naming**: Claude Haiku via `claude` CLI (no API key needed)
 - **Tests**: Playwright
 
 ## Limitations

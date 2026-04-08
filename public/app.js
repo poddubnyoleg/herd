@@ -66,7 +66,8 @@ class Herd {
     this.setupResize();
     this.setupSearch();
     this.setupAddProject();
-    window.addEventListener('resize', () => this.fitActiveTerminal());
+    document.getElementById('new-tab-btn').addEventListener('click', () => this.newSessionInLastProject());
+    // Window resize is handled per-terminal by ResizeObserver in createTab
 
     // B3: Keyboard shortcuts
     document.addEventListener('keydown', e => {
@@ -424,12 +425,21 @@ class Herd {
     } catch {}
 
 
+    // Auto-refit terminal when container resizes (window resize, sidebar drag, etc.)
+    const resizeObserver = new ResizeObserver(() => {
+      requestAnimationFrame(() => {
+        try { fitAddon.fit(); } catch {}
+      });
+    });
+    resizeObserver.observe(wrapper);
+
     const tab = {
       id: tabId, name: name || 'new session', terminal, fitAddon, ws: null,
       projectPath, sessionId: resumeId, alive: true, unread: false,
       finished: false, idleTimer: null, outputSinceViewed: 0,
       _closeRequested: 0, _inactiveSince: 0,
       _writeBuf: '', _writeRaf: 0,
+      _resizeObserver: resizeObserver,
     };
     this.tabs.set(tabId, tab);
 
@@ -519,7 +529,12 @@ class Herd {
                 tab._writeRaf = 0;
                 const chunk = tab._writeBuf;
                 tab._writeBuf = '';
-                terminal.write(chunk);
+                // Check if viewport is near the bottom before writing
+                const buf = terminal.buffer.active;
+                const atBottom = buf.viewportY >= buf.baseY - 1;
+                terminal.write(chunk, () => {
+                  if (atBottom) terminal.scrollToBottom();
+                });
               });
             }
             if (tabId !== this.activeTabId && tab._inactiveSince && Date.now() - tab._inactiveSince > 5000) {
@@ -556,6 +571,13 @@ class Herd {
             tab.name = msg.title;
             this.renderTabs();
             this.updateSidebarSession(tabId, msg.title);
+            // Update cached session data so sidebar re-renders use this title
+            if (tab.sessionId) {
+              for (const [, sessions] of this.sessionCache) {
+                const s = sessions.find(s => s.id === tab.sessionId);
+                if (s) { s.summary = msg.title; break; }
+              }
+            }
             this.saveTabState();
             break;
           case 'exit':
@@ -643,6 +665,7 @@ class Herd {
     tab._destroyed = true;
     if (tab._reconnectTimer) clearTimeout(tab._reconnectTimer);
     if (tab._writeRaf) cancelAnimationFrame(tab._writeRaf);
+    if (tab._resizeObserver) tab._resizeObserver.disconnect();
     try { tab.ws?.close(); } catch {}
     try { tab.terminal.dispose(); } catch {}
     document.getElementById(`term-${tabId}`)?.remove();
