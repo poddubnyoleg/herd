@@ -337,6 +337,19 @@ app.get('/api/projects/:id/sessions', (req, res) => {
   }
 });
 
+app.get('/api/pick-folder', (req, res) => {
+  execFile('osascript', ['-e', 'POSIX path of (choose folder)'], { timeout: 60000 }, (err, stdout) => {
+    if (err) {
+      // User cancelled the dialog
+      return res.json({ cancelled: true });
+    }
+    const dirPath = stdout.trim();
+    if (!dirPath) return res.json({ cancelled: true });
+    const resolved = path.resolve(dirPath);
+    res.json({ path: resolved, name: getProjectName(resolved) });
+  });
+});
+
 // --- WebSocket terminal (using `script` as PTY wrapper) ---
 
 const terminals = new Map();
@@ -358,15 +371,18 @@ wss.on('connection', (ws, req) => {
   // B8: Validate project path and capture encoded directory name
   const resolvedProject = projectPath && path.resolve(projectPath);
   const encodedDir = resolvedProject ? findEncodedDir(resolvedProject) : null;
-  if (!encodedDir) {
+
+  // For resume, we need the encoded dir to find the session file
+  if (resume && !encodedDir) {
     ws.send(JSON.stringify({ type: 'error', message: 'Invalid project path' }));
     ws.close();
     return;
   }
-  // For new shells the directory must still exist; resume works from anywhere
-  const projectDirExists = fs.existsSync(resolvedProject);
+
+  // For new sessions, the directory must exist on disk (but doesn't need to be in ~/.claude/projects yet)
+  const projectDirExists = resolvedProject && fs.existsSync(resolvedProject);
   if (!resume && !projectDirExists) {
-    ws.send(JSON.stringify({ type: 'error', message: 'Project directory no longer exists' }));
+    ws.send(JSON.stringify({ type: 'error', message: 'Project directory does not exist' }));
     ws.close();
     return;
   }
@@ -477,11 +493,13 @@ wss.on('connection', (ws, req) => {
   // For resumed sessions, use cached summary immediately
   if (resume) {
     renameCount = MAX_RENAMES; // don't auto-rename resumed sessions
-    const jsonlDir = path.join(PROJECTS_DIR, encodedDir);
-    const info = getSessionInfo(path.join(jsonlDir, `${resume}.jsonl`));
-    const title = summaryCache[resume] || (info.firstUserMessage && info.firstUserMessage.slice(0, 60));
-    if (title) {
-      ws.send(JSON.stringify({ type: 'title', title }));
+    if (encodedDir) {
+      const jsonlDir = path.join(PROJECTS_DIR, encodedDir);
+      const info = getSessionInfo(path.join(jsonlDir, `${resume}.jsonl`));
+      const title = summaryCache[resume] || (info.firstUserMessage && info.firstUserMessage.slice(0, 60));
+      if (title) {
+        ws.send(JSON.stringify({ type: 'title', title }));
+      }
     }
   } else {
     // First rename after 1 minute

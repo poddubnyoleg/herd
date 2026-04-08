@@ -87,8 +87,28 @@ body {
   gap: 8px;
 }
 
-#refresh-btn {
+#add-project-btn {
   margin-left: auto;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 18px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  line-height: 1;
+  transition: color 0.1s, background 0.1s;
+  font-family: inherit;
+  font-weight: 600;
+}
+
+#add-project-btn:hover {
+  color: var(--accent);
+  background: var(--bg-hover);
+}
+
+#refresh-btn {
+  margin-left: 0;
   background: none;
   border: none;
   color: var(--text-muted);

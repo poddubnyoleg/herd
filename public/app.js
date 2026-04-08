@@ -62,8 +62,10 @@ class Herd {
   async init() {
     this.initTheme();
     await this.loadProjects();
+    this.restoreTabState();
     this.setupResize();
     this.setupSearch();
+    this.setupAddProject();
     window.addEventListener('resize', () => this.fitActiveTerminal());
 
     // B3: Keyboard shortcuts
@@ -167,6 +169,36 @@ class Herd {
     }
   }
 
+  // ── Tab persistence ──
+
+  saveTabState() {
+    const tabs = [...this.tabs.values()]
+      .filter(t => t.sessionId)
+      .map(t => ({ sessionId: t.sessionId, projectPath: t.projectPath, name: t.name }));
+    const activeSession = this.activeTabId ? this.tabs.get(this.activeTabId)?.sessionId : null;
+    localStorage.setItem('herd-tabs', JSON.stringify({ tabs, activeSessionId: activeSession }));
+  }
+
+  restoreTabState() {
+    try {
+      const raw = localStorage.getItem('herd-tabs');
+      if (!raw) return;
+      const state = JSON.parse(raw);
+      if (!state.tabs?.length) return;
+
+      let activeTabId = null;
+      for (const saved of state.tabs) {
+        this.createTab(saved.projectPath, saved.name, saved.sessionId);
+        if (saved.sessionId === state.activeSessionId) {
+          for (const [id, tab] of this.tabs) {
+            if (tab.sessionId === saved.sessionId) { activeTabId = id; break; }
+          }
+        }
+      }
+      if (activeTabId) this.switchTab(activeTabId);
+    } catch {}
+  }
+
   // ── Search (F1) ──
 
   setupSearch() {
@@ -217,6 +249,25 @@ class Herd {
         // Project name matched — show all sessions
         el.querySelectorAll('.session-item').forEach(s => s.style.display = '');
       }
+    });
+  }
+
+  // ── Add project dialog ──
+
+  setupAddProject() {
+    const btn = document.getElementById('add-project-btn');
+    if (!btn) return;
+
+    btn.addEventListener('click', async () => {
+      if (btn.disabled) return;
+      btn.disabled = true;
+      try {
+        const res = await fetch('/api/pick-folder');
+        const data = await res.json();
+        if (data.cancelled || !data.path) return;
+        this.createTab(data.path, data.name);
+      } catch {}
+      finally { btn.disabled = false; }
     });
   }
 
@@ -290,7 +341,7 @@ class Herd {
       ${projectExists ? '<button class="new-session-btn">+ new session</button>' : ''}
       ${sessions.map(s => `
         <div class="session-item" data-sid="${s.id}" title="${this.esc(s.preview || '')}">
-          ${this.esc(this.truncate(s.summary || s.preview || s.id.slice(0, 8), 40))}
+          ${this.esc(this.truncate(s.summary || s.preview || 'New Session', 40))}
           <span class="session-date">${this.relDate(s.date)}</span>
         </div>
       `).join('')}
@@ -312,7 +363,7 @@ class Herd {
       }
       item.addEventListener('click', e => {
         e.stopPropagation();
-        this.createTab(el.dataset.path, s.summary || this.truncate(s.preview || '', 40), s.id);
+        this.createTab(el.dataset.path, s.summary || this.truncate(s.preview || 'New Session', 40), s.id);
       });
     });
 
@@ -381,6 +432,38 @@ class Herd {
       _writeBuf: '', _writeRaf: 0,
     };
     this.tabs.set(tabId, tab);
+
+    // macOS keyboard navigation: Option+Arrow for word jump, Cmd+Arrow for line jump
+    terminal.attachCustomKeyEventHandler(e => {
+      if (e.type !== 'keydown') return true;
+      // Option+Left/Right: word jump (send ESC+b / ESC+f)
+      if (e.altKey && !e.metaKey && !e.ctrlKey) {
+        if (e.key === 'ArrowLeft') {
+          e.preventDefault();
+          if (tab.ws?.readyState === WebSocket.OPEN) tab.ws.send(JSON.stringify({ type: 'input', data: '\x1bb' }));
+          return false;
+        }
+        if (e.key === 'ArrowRight') {
+          e.preventDefault();
+          if (tab.ws?.readyState === WebSocket.OPEN) tab.ws.send(JSON.stringify({ type: 'input', data: '\x1bf' }));
+          return false;
+        }
+      }
+      // Cmd+Left/Right: beginning/end of line (send Home/End escape)
+      if (e.metaKey && !e.altKey && !e.ctrlKey) {
+        if (e.key === 'ArrowLeft') {
+          e.preventDefault();
+          if (tab.ws?.readyState === WebSocket.OPEN) tab.ws.send(JSON.stringify({ type: 'input', data: '\x01' }));
+          return false;
+        }
+        if (e.key === 'ArrowRight') {
+          e.preventDefault();
+          if (tab.ws?.readyState === WebSocket.OPEN) tab.ws.send(JSON.stringify({ type: 'input', data: '\x05' }));
+          return false;
+        }
+      }
+      return true;
+    });
 
     // Register terminal I/O handlers once (they reference tab.ws dynamically)
     terminal.onData(data => {
@@ -467,11 +550,13 @@ class Herd {
             tab.sessionId = msg.sessionId;
             const sidebarItem = document.querySelector(`.session-item[data-tab-id="${tabId}"]`);
             if (sidebarItem) sidebarItem.dataset.sid = msg.sessionId;
+            this.saveTabState();
             break;
           case 'title':
             tab.name = msg.title;
             this.renderTabs();
             this.updateSidebarSession(tabId, msg.title);
+            this.saveTabState();
             break;
           case 'exit':
             tab.alive = false;
@@ -491,6 +576,7 @@ class Herd {
     };
 
     ws.onclose = () => {
+      if (tab._destroyed) return;
       if (tab.alive) {
         tab.alive = false;
         terminal.write('\r\n\x1b[38;5;240m[disconnected]\x1b[0m\r\n');
@@ -547,6 +633,7 @@ class Herd {
     this.renderTabs();
     // F8: Highlight active project in sidebar
     this.highlightActiveProject();
+    this.saveTabState();
   }
 
   closeTab(tabId) {
@@ -557,7 +644,7 @@ class Herd {
     if (tab._reconnectTimer) clearTimeout(tab._reconnectTimer);
     if (tab._writeRaf) cancelAnimationFrame(tab._writeRaf);
     try { tab.ws?.close(); } catch {}
-    tab.terminal.dispose();
+    try { tab.terminal.dispose(); } catch {}
     document.getElementById(`term-${tabId}`)?.remove();
     const sidebarEl = document.querySelector(`.session-item[data-tab-id="${tabId}"]`);
     if (sidebarEl) delete sidebarEl.dataset.tabId;
@@ -574,6 +661,7 @@ class Herd {
       }
     }
     this.renderTabs();
+    this.saveTabState();
   }
 
   renderTabs() {
