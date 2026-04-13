@@ -55,17 +55,20 @@ class Herd {
     this.activeTabId = null;
     this.projects = [];
     this.searchQuery = '';
-    this.sessionCache = new Map(); // projectId -> sessions array
+    this.sessionCache = new Map(); // projectPath -> sessions array
+    this.codexAvailable = false;
     this.init();
   }
 
   async init() {
     this.initTheme();
     await this.loadProjects();
+    await this.loadRecentSessions();
     this.restoreTabState();
     this.setupResize();
     this.setupSearch();
     this.setupAddProject();
+    this.listenForSummaryUpdates();
     document.getElementById('new-tab-btn').addEventListener('click', () => this.newSessionInLastProject());
     // Window resize is handled per-terminal by ResizeObserver in createTab
 
@@ -111,14 +114,15 @@ class Herd {
     this.switchTab(next);
   }
 
-  newSessionInLastProject() {
+  newSessionInLastProject(agent) {
     // Use the active tab's project, or the first project
     const activeTab = this.activeTabId && this.tabs.get(this.activeTabId);
+    const useAgent = agent || (activeTab?.agent) || 'claude';
     if (activeTab) {
-      this.createTab(activeTab.projectPath, this.lastName(activeTab.projectPath));
+      this.createTab(activeTab.projectPath, this.lastName(activeTab.projectPath), null, useAgent);
     } else if (this.projects.length) {
       const p = this.projects[0];
-      if (p.exists) this.createTab(p.path, this.lastName(p.path));
+      if (p.exists) this.createTab(p.path, this.lastName(p.path), null, useAgent);
     }
   }
 
@@ -175,7 +179,7 @@ class Herd {
   saveTabState() {
     const tabs = [...this.tabs.values()]
       .filter(t => t.sessionId)
-      .map(t => ({ sessionId: t.sessionId, projectPath: t.projectPath, name: t.name }));
+      .map(t => ({ sessionId: t.sessionId, projectPath: t.projectPath, name: t.name, agent: t.agent }));
     const activeSession = this.activeTabId ? this.tabs.get(this.activeTabId)?.sessionId : null;
     localStorage.setItem('herd-tabs', JSON.stringify({ tabs, activeSessionId: activeSession }));
   }
@@ -189,7 +193,7 @@ class Herd {
 
       let activeTabId = null;
       for (const saved of state.tabs) {
-        this.createTab(saved.projectPath, saved.name, saved.sessionId);
+        this.createTab(saved.projectPath, saved.name, saved.sessionId, saved.agent || 'claude');
         if (saved.sessionId === state.activeSessionId) {
           for (const [id, tab] of this.tabs) {
             if (tab.sessionId === saved.sessionId) { activeTabId = id; break; }
@@ -201,6 +205,40 @@ class Herd {
   }
 
   // ── Search (F1) ──
+
+  listenForSummaryUpdates() {
+    const es = new EventSource('/api/summary-events');
+    es.onmessage = (event) => {
+      try {
+        const { sessionId, agent, summary } = JSON.parse(event.data);
+        // Update session cache
+        for (const [, sessions] of this.sessionCache) {
+          const s = sessions.find(s => s.id === sessionId && (s.agent || 'claude') === agent);
+          if (s) { s.summary = summary; break; }
+        }
+        // Update recent sessions
+        if (this.recentSessions) {
+          const r = this.recentSessions.find(s => s.id === sessionId && (s.agent || 'claude') === agent);
+          if (r) r.summary = summary;
+        }
+        // Update sidebar session names in-place (no full re-render)
+        document.querySelectorAll(`.session-item[data-sid="${sessionId}"][data-agent="${agent}"]`).forEach(el => {
+          const nameEl = el.querySelector('.recent-session-name');
+          if (nameEl) { nameEl.textContent = this.truncate(summary, 28); return; }
+          // Regular session items: text is directly in the element after the badge
+          const badge = el.querySelector(`span[class^="badge-"]`);
+          if (badge && badge.nextSibling) {
+            badge.nextSibling.textContent = '\n          ' + this.truncate(summary, 38);
+          }
+        });
+        // Update recent session items separately
+        document.querySelectorAll(`.recent-session-item[data-sid="${sessionId}"]`).forEach(el => {
+          const nameEl = el.querySelector('.recent-session-name');
+          if (nameEl) nameEl.textContent = this.truncate(summary, 28);
+        });
+      } catch {}
+    };
+  }
 
   setupSearch() {
     const input = document.getElementById('project-search');
@@ -224,7 +262,7 @@ class Herd {
       const projectMatch = name.includes(q);
 
       // Check cached sessions for matches
-      const sessions = this.sessionCache.get(el.dataset.id);
+      const sessions = this.sessionCache.get(el.dataset.path);
       const matchingSessions = sessions
         ? sessions.filter(s => {
             const text = (s.summary || s.preview || '').toLowerCase();
@@ -279,7 +317,9 @@ class Herd {
       const res = await fetch('/api/projects');
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       this.projects = await res.json();
+      this.codexAvailable = this.projects.some(p => p.codexAvailable);
       this.renderProjects();
+      this.loadRecentSessions();
     } catch (err) {
       document.getElementById('project-list').innerHTML =
         `<div style="padding:12px 16px;color:var(--red);font-size:11px">Failed to load projects: ${this.esc(err.message)}</div>`;
@@ -288,22 +328,110 @@ class Herd {
 
   renderProjects() {
     const el = document.getElementById('project-list');
-    el.innerHTML = this.projects.map(p => `
+
+    const renderProject = p => `
       <div class="project-item${p.exists ? '' : ' archived'}" data-id="${p.id}" data-path="${this.esc(p.path)}" data-exists="${p.exists}">
         <div class="project-header">
           <span class="project-chevron">&#x25B8;</span>
-          <span class="project-name" title="${this.esc(p.path)}">${this.esc(p.name)}</span>
+          <span class="project-name" title="${this.esc(p.path)}">${this.esc(this.lastName(p.path))}</span>
           <span class="project-count">${p.sessionCount}</span>
         </div>
         <div class="project-sessions"></div>
       </div>
-    `).join('');
+    `;
+
+    // Group by parent folder (first segment of name, e.g. "pd" from "pd/herd")
+    const grouped = new Map();
+    for (const p of this.projects) {
+      const parts = p.name.split('/');
+      const group = parts.length >= 2 ? parts[0] : '';
+      if (!grouped.has(group)) grouped.set(group, []);
+      grouped.get(group).push(p);
+    }
+
+    let html = '';
+    if (grouped.size > 1 || (grouped.size === 1 && !grouped.has(''))) {
+      for (const [group, projects] of grouped) {
+        const count = projects.reduce((s, p) => s + p.sessionCount, 0);
+        html += `<div class="project-group" data-group="${this.esc(group || 'other')}">
+          <div class="project-group-header">
+            <span class="group-label">${this.esc(group || 'other')}</span>
+            <span class="group-count">${count}</span>
+          </div>
+          ${projects.map(renderProject).join('')}
+        </div>`;
+      }
+    } else {
+      html = this.projects.map(renderProject).join('');
+    }
+
+    el.innerHTML = html;
 
     el.querySelectorAll('.project-header').forEach(h => {
       h.addEventListener('click', () => this.toggleProject(h.parentElement));
     });
 
     this.filterProjects();
+  }
+
+  async loadRecentSessions() {
+    try {
+      const res = await fetch('/api/recent-sessions?limit=20');
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      this.recentSessions = await res.json();
+      this.renderRecentSessions();
+    } catch {}
+  }
+
+  renderRecentSessions() {
+    const el = document.getElementById('project-list');
+    const sessions = this.recentSessions;
+    if (!sessions?.length) return;
+
+    // Remove existing recent section if any
+    el.querySelector('.recent-section')?.remove();
+
+    const section = document.createElement('div');
+    section.className = 'recent-section project-item expanded';
+    section.innerHTML = `
+      <div class="project-header recent-header">
+        <span class="project-chevron">&#x25B8;</span>
+        <span class="project-name">Recent</span>
+        <span class="project-count">${sessions.length}</span>
+      </div>
+      <div class="project-sessions" style="display:block">
+        ${sessions.map(s => `
+          <div class="session-item recent-session-item" data-sid="${s.id}" data-agent="${s.agent || 'claude'}" data-project="${this.esc(s.projectPath)}" title="${this.esc(s.projectPath)}">
+            <span class="badge-${s.agent || 'claude'}"></span>
+            <span class="recent-session-name">${this.esc(this.truncate(s.summary || s.preview || 'New Session', 28))}</span>
+            <span class="recent-project-label">${this.esc(this.lastName(s.projectPath))}</span>
+            <span class="session-date">${this.relDate(s.date)}</span>
+          </div>
+        `).join('')}
+      </div>
+    `;
+
+    el.prepend(section);
+
+    // Toggle expand/collapse
+    section.querySelector('.recent-header').addEventListener('click', () => {
+      section.classList.toggle('expanded');
+      section.querySelector('.project-sessions').style.display =
+        section.classList.contains('expanded') ? 'block' : 'none';
+    });
+
+    // Click to open session
+    section.querySelectorAll('.recent-session-item').forEach((item, idx) => {
+      const s = sessions[idx];
+      // Mark if already open in a tab
+      for (const [tabId, tab] of this.tabs) {
+        if (tab.sessionId === s.id && tab.agent === (s.agent || 'claude')) { item.dataset.tabId = tabId; break; }
+      }
+      item.addEventListener('click', e => {
+        e.stopPropagation();
+        this.createTab(s.projectPath, s.summary || this.truncate(s.preview || 'New Session', 40), s.id, s.agent || 'claude');
+      });
+    });
   }
 
   async toggleProject(el, { fromFilter = false } = {}) {
@@ -319,10 +447,9 @@ class Herd {
 
     let sessions, truncated;
     try {
-      const res = await fetch(`/api/projects/${el.dataset.id}/sessions`);
+      const res = await fetch(`/api/sessions?project=${encodeURIComponent(el.dataset.path)}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
-      // Handle both new {sessions, total, truncated} and old array format
       if (Array.isArray(data)) {
         sessions = data;
         truncated = false;
@@ -335,14 +462,18 @@ class Herd {
       return;
     }
 
-    this.sessionCache.set(el.dataset.id, sessions);
+    this.sessionCache.set(el.dataset.path, sessions);
 
     const projectExists = el.dataset.exists === 'true';
+    const codexBtn = this.codexAvailable
+      ? '<button class="new-session-btn new-session-codex" data-agent="codex"><span class="badge-codex"></span> new codex</button>'
+      : '';
     container.innerHTML = `
-      ${projectExists ? '<button class="new-session-btn">+ new session</button>' : ''}
+      ${projectExists ? `<button class="new-session-btn new-session-claude" data-agent="claude"><span class="badge-claude"></span> new claude</button>${codexBtn}` : ''}
       ${sessions.map(s => `
-        <div class="session-item" data-sid="${s.id}" title="${this.esc(s.preview || '')}">
-          ${this.esc(this.truncate(s.summary || s.preview || 'New Session', 40))}
+        <div class="session-item" data-sid="${s.id}" data-agent="${s.agent || 'claude'}" title="${this.esc(s.preview || '')}">
+          <span class="badge-${s.agent || 'claude'}"></span>
+          ${this.esc(this.truncate(s.summary || s.preview || 'New Session', 38))}
           <span class="session-date">${this.relDate(s.date)}</span>
         </div>
       `).join('')}
@@ -350,21 +481,22 @@ class Herd {
     `;
 
     if (projectExists) {
-      container.querySelector('.new-session-btn').addEventListener('click', e => {
-        e.stopPropagation();
-        this.createTab(el.dataset.path, this.lastName(el.dataset.path));
+      container.querySelectorAll('.new-session-btn').forEach(btn => {
+        btn.addEventListener('click', e => {
+          e.stopPropagation();
+          this.createTab(el.dataset.path, this.lastName(el.dataset.path), null, btn.dataset.agent || 'claude');
+        });
       });
     }
 
     container.querySelectorAll('.session-item').forEach((item, idx) => {
       const s = sessions[idx];
-      // Re-link open tabs so the highlight is preserved after collapse/expand
       for (const [tabId, tab] of this.tabs) {
-        if (tab.sessionId === s.id) { item.dataset.tabId = tabId; break; }
+        if (tab.sessionId === s.id && tab.agent === (s.agent || 'claude')) { item.dataset.tabId = tabId; break; }
       }
       item.addEventListener('click', e => {
         e.stopPropagation();
-        this.createTab(el.dataset.path, s.summary || this.truncate(s.preview || 'New Session', 40), s.id);
+        this.createTab(el.dataset.path, s.summary || this.truncate(s.preview || 'New Session', 40), s.id, s.agent || 'claude');
       });
     });
 
@@ -377,11 +509,11 @@ class Herd {
 
   // ── Tabs ──
 
-  createTab(projectPath, name, resumeId) {
+  createTab(projectPath, name, resumeId, agent = 'claude') {
     // Don't open duplicate resume
     if (resumeId) {
       for (const [id, tab] of this.tabs) {
-        if (tab.sessionId === resumeId) { this.switchTab(id); return; }
+        if (tab.sessionId === resumeId && tab.agent === agent) { this.switchTab(id); return; }
       }
     }
 
@@ -415,31 +547,19 @@ class Herd {
     const fitAddon = new FitAddon.FitAddon();
     terminal.loadAddon(fitAddon);
     try { terminal.loadAddon(new WebLinksAddon.WebLinksAddon()); } catch {}
-    terminal.open(wrapper);
-
-    // GPU-accelerated rendering via WebGL (major FPS improvement)
-    try {
-      const webglAddon = new WebglAddon.WebglAddon();
-      webglAddon.onContextLoss(() => { webglAddon.dispose(); });
-      terminal.loadAddon(webglAddon);
-    } catch {}
-
-
-    // Auto-refit terminal when container resizes (window resize, sidebar drag, etc.)
-    const resizeObserver = new ResizeObserver(() => {
-      requestAnimationFrame(() => {
-        try { fitAddon.fit(); } catch {}
-      });
-    });
-    resizeObserver.observe(wrapper);
+    // IMPORTANT: terminal.open() is deferred until AFTER switchTab makes the
+    // wrapper visible. xterm's CharSizeService measures the font against a
+    // DOM element at open time — if the wrapper is display:none then, it
+    // caches cell width/height = 0 and fitAddon.proposeDimensions() returns
+    // undefined forever, so the PTY stays at xterm's 80x24 default.
 
     const tab = {
       id: tabId, name: name || 'new session', terminal, fitAddon, ws: null,
-      projectPath, sessionId: resumeId, alive: true, unread: false,
+      projectPath, sessionId: resumeId, agent, alive: true, unread: false,
       finished: false, idleTimer: null, outputSinceViewed: 0,
       _closeRequested: 0, _inactiveSince: 0,
       _writeBuf: '', _writeRaf: 0,
-      _resizeObserver: resizeObserver,
+      _resizeObserver: null,
     };
     this.tabs.set(tabId, tab);
 
@@ -483,9 +603,10 @@ class Herd {
       if (tab.ws?.readyState === WebSocket.OPEN) tab.ws.send(JSON.stringify({ type: 'resize', cols, rows }));
     });
 
-    this.connectWebSocket(tab);
+    // Activate the tab so #terminal-area + wrapper become visible (display
+    // goes from none → flex). This MUST happen before terminal.open() so
+    // xterm's font measurement sees a real DOM, not 0x0.
     this.switchTab(tabId);
-    this.renderTabs();
     if (!resumeId) {
       this.addSessionToSidebar(tabId, projectPath);
     } else {
@@ -493,7 +614,47 @@ class Herd {
       const existing = document.querySelector(`.session-item[data-sid="${resumeId}"]`);
       if (existing) existing.dataset.tabId = tabId;
     }
-    requestAnimationFrame(() => { fitAddon.fit(); terminal.focus(); });
+
+    // Wait a frame so the browser lays out the now-visible wrapper, THEN
+    // open the terminal (correct font measurement → correct cell dims →
+    // fitAddon works), then fit + spawn the PTY with real cols/rows.
+    requestAnimationFrame(() => {
+      terminal.open(wrapper);
+
+      // GPU-accelerated rendering via WebGL (major FPS improvement)
+      try {
+        const webglAddon = new WebglAddon.WebglAddon();
+        webglAddon.onContextLoss(() => { webglAddon.dispose(); });
+        terminal.loadAddon(webglAddon);
+      } catch {}
+
+      // Snap to exact buffer bottom when user drags the scrollbar all the way down.
+      // With lineHeight 1.25 the per-row pixel height is fractional, so xterm's
+      // internal `floor(scrollTop / rowHeight)` can land at `baseY - 1` at max
+      // scroll — cropping the last row (e.g. the bottom of Claude's approval box).
+      const xtermViewport = wrapper.querySelector('.xterm-viewport');
+      if (xtermViewport) {
+        xtermViewport.addEventListener('scroll', () => {
+          if (xtermViewport.scrollTop + xtermViewport.clientHeight >= xtermViewport.scrollHeight - 1) {
+            const buf = terminal.buffer.active;
+            if (buf.viewportY < buf.baseY) terminal.scrollToBottom();
+          }
+        }, { passive: true });
+      }
+
+      // Auto-refit terminal when container resizes (window resize, sidebar drag, etc.)
+      const resizeObserver = new ResizeObserver(() => {
+        requestAnimationFrame(() => {
+          try { fitAddon.fit(); } catch {}
+        });
+      });
+      resizeObserver.observe(wrapper);
+      tab._resizeObserver = resizeObserver;
+
+      try { fitAddon.fit(); } catch {}
+      this.connectWebSocket(tab);
+      terminal.focus();
+    });
   }
 
   // F2: WebSocket connection (extracted for reconnection support)
@@ -502,6 +663,7 @@ class Herd {
 
     const wsUrl = new URL(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws`);
     wsUrl.searchParams.set('project', projectPath);
+    wsUrl.searchParams.set('agent', tab.agent || 'claude');
     if (tab.sessionId) wsUrl.searchParams.set('resume', tab.sessionId);
     wsUrl.searchParams.set('cols', terminal.cols);
     wsUrl.searchParams.set('rows', terminal.rows);
@@ -511,6 +673,15 @@ class Herd {
     tab.alive = true;
 
     ws.onopen = () => {
+      // Suppress finished/unread tracking for 15s after (re)connect. On page
+      // refresh or WS reconnect, `claude --resume` replays session history as
+      // a burst of output — indistinguishable from a real completed run
+      // (output, then quiet), which used to mark every restored background
+      // tab with the green "finished" pulse.
+      tab._suppressUntil = Date.now() + 15000;
+      // Clear any stale finished-tracking from the prior connection
+      if (tab.idleTimer) { clearTimeout(tab.idleTimer); tab.idleTimer = null; }
+      tab.outputSinceViewed = 0;
       // Remove loading/reconnect overlay
       const overlay = document.getElementById(`term-${tabId}`)?.querySelector('.terminal-overlay');
       if (overlay) overlay.remove();
@@ -522,6 +693,14 @@ class Herd {
         const msg = JSON.parse(e.data);
         switch (msg.type) {
           case 'output':
+            // While a suppress window is active, keep sliding it forward as
+            // long as output is streaming. `claude --resume` replay bursts can
+            // easily outlast the initial 15s window on long sessions; without
+            // this, the tail of the replay flips every restored background
+            // tab to "finished" (green pulse) a few seconds after refresh.
+            if (tab._suppressUntil && Date.now() < tab._suppressUntil) {
+              tab._suppressUntil = Math.max(tab._suppressUntil, Date.now() + 3000);
+            }
             // Batch writes via rAF to reduce render calls and improve FPS
             tab._writeBuf += msg.data;
             if (!tab._writeRaf) {
@@ -537,7 +716,7 @@ class Herd {
                 });
               });
             }
-            if (tabId !== this.activeTabId && tab._inactiveSince && Date.now() - tab._inactiveSince > 5000) {
+            if (tabId !== this.activeTabId && tab._inactiveSince && Date.now() - tab._inactiveSince > 5000 && Date.now() >= (tab._suppressUntil || 0)) {
               tab.outputSinceViewed += this.stripAnsi(msg.data).trim().length;
               if (tab.outputSinceViewed > 200) {
                 if (tab.finished) {
@@ -696,6 +875,7 @@ class Herd {
       el.className = `tab${id === this.activeTabId ? ' active' : ''}${tab.finished ? ' finished' : tab.unread ? ' unread' : ''}`;
       el.innerHTML = `
         <span class="tab-dot${tab.alive ? '' : ' dead'}"></span>
+        <span class="badge-${tab.agent || 'claude'}" title="${tab.agent || 'claude'}"></span>
         <span class="tab-name">${this.esc(this.truncate(tab.name, 30))}</span>
         <span class="tab-close">&times;</span>
       `;
@@ -747,19 +927,22 @@ class Herd {
   }
 
   addSessionToSidebar(tabId, projectPath) {
+    const tab = this.tabs.get(tabId);
     const projectEl = [...document.querySelectorAll('.project-item')].find(
       el => el.dataset.path === projectPath
     );
     if (!projectEl || !projectEl.classList.contains('expanded')) return;
 
     const container = projectEl.querySelector('.project-sessions');
-    const newBtn = container.querySelector('.new-session-btn');
+    const firstSession = container.querySelector('.session-item');
 
     const item = document.createElement('div');
     item.className = 'session-item';
     item.dataset.tabId = tabId;
+    item.dataset.agent = tab?.agent || 'claude';
     item.innerHTML = `
-      ${this.esc(this.truncate(this.lastName(projectPath), 40))}
+      <span class="badge-${tab?.agent || 'claude'}"></span>
+      ${this.esc(this.truncate(this.lastName(projectPath), 38))}
       <span class="session-date">now</span>
     `;
     item.addEventListener('click', e => {
@@ -771,8 +954,8 @@ class Herd {
       }
     });
 
-    if (newBtn) newBtn.after(item);
-    else container.prepend(item);
+    if (firstSession) firstSession.before(item);
+    else container.append(item);
 
     // Update count
     const countEl = projectEl.querySelector('.project-count');
@@ -780,17 +963,26 @@ class Herd {
   }
 
   updateSidebarSession(tabId, name) {
-    const item = document.querySelector(`.session-item[data-tab-id="${tabId}"]`);
-    if (!item) return;
-    item.innerHTML = `
-      ${this.esc(this.truncate(name, 40))}
-      <span class="session-date">now</span>
-    `;
+    document.querySelectorAll(`.session-item[data-tab-id="${tabId}"]`).forEach(item => {
+      if (item.classList.contains('recent-session-item')) {
+        // Preserve badge and project label in recent section
+        const nameEl = item.querySelector('.recent-session-name');
+        if (nameEl) nameEl.textContent = this.truncate(name, 28);
+        const dateEl = item.querySelector('.session-date');
+        if (dateEl) dateEl.textContent = 'now';
+      } else {
+        item.innerHTML = `
+          ${this.esc(this.truncate(name, 40))}
+          <span class="session-date">now</span>
+        `;
+      }
+    });
   }
 
   updateSidebarFinished(tabId, finished) {
-    const item = document.querySelector(`.session-item[data-tab-id="${tabId}"]`);
-    if (item) item.classList.toggle('finished', finished);
+    document.querySelectorAll(`.session-item[data-tab-id="${tabId}"]`).forEach(item => {
+      item.classList.toggle('finished', finished);
+    });
   }
 
   // ── Sidebar resize ──

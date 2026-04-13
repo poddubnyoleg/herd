@@ -10,6 +10,7 @@ const os = require('os');
 const PORT = process.env.PORT || 3456;
 const CLAUDE_DIR = path.join(os.homedir(), '.claude');
 const PROJECTS_DIR = path.join(CLAUDE_DIR, 'projects');
+const CODEX_SESSIONS_DIR = path.join(os.homedir(), '.codex', 'sessions');
 
 const app = express();
 const server = http.createServer(app);
@@ -48,6 +49,131 @@ const claudeBin = (() => {
   catch { return 'claude'; }
 })();
 console.log(`  Claude binary: ${claudeBin}`);
+
+// Resolve codex binary once at startup
+const codexBin = (() => {
+  const { execSync } = require('child_process');
+  try { return execSync('/bin/sh -lc "which codex"', { encoding: 'utf8' }).trim(); }
+  catch { return null; }
+})();
+console.log(`  Codex binary: ${codexBin || '(not installed)'}`);
+
+// --- Codex rollout index ---
+// Scans ~/.codex/sessions/**/*.jsonl, reads line 1 (session_meta) to extract cwd/id.
+// Cached by (filePath, mtimeMs) for incremental rescans.
+
+const codexIndex = new Map(); // filePath -> { id, cwd, mtime, date, preview }
+
+function scanCodexSessions() {
+  if (!codexBin) return;
+  try { fs.statSync(CODEX_SESSIONS_DIR); } catch { return; }
+
+  const seen = new Set();
+  // Walk YYYY/MM/DD dirs
+  for (const year of readdirSafe(CODEX_SESSIONS_DIR)) {
+    const yearDir = path.join(CODEX_SESSIONS_DIR, year);
+    if (!isDir(yearDir)) continue;
+    for (const month of readdirSafe(yearDir)) {
+      const monthDir = path.join(yearDir, month);
+      if (!isDir(monthDir)) continue;
+      for (const day of readdirSafe(monthDir)) {
+        const dayDir = path.join(monthDir, day);
+        if (!isDir(dayDir)) continue;
+        for (const file of readdirSafe(dayDir)) {
+          if (!file.endsWith('.jsonl')) continue;
+          const filePath = path.join(dayDir, file);
+          seen.add(filePath);
+          try {
+            const stat = fs.statSync(filePath);
+            const cached = codexIndex.get(filePath);
+            if (cached && cached.mtime === stat.mtimeMs) continue;
+            const info = parseCodexRollout(filePath, stat);
+            if (info) codexIndex.set(filePath, info);
+          } catch {}
+        }
+      }
+    }
+  }
+  // Prune deleted files
+  for (const key of codexIndex.keys()) {
+    if (!seen.has(key)) codexIndex.delete(key);
+  }
+}
+
+function readdirSafe(dir) {
+  try { return fs.readdirSync(dir); } catch { return []; }
+}
+function isDir(p) {
+  try { return fs.statSync(p).isDirectory(); } catch { return false; }
+}
+
+function parseCodexRollout(filePath, stat) {
+  // Use chunked line reading — session_meta can be 15KB+ due to base_instructions
+  const fd = fs.openSync(filePath, 'r');
+  try {
+    const CHUNK_SIZE = 65536;
+    const MAX_LINES = 15;
+    const lines = [];
+    let remainder = '';
+    let offset = 0;
+    while (lines.length < MAX_LINES) {
+      const buf = Buffer.alloc(CHUNK_SIZE);
+      const bytesRead = fs.readSync(fd, buf, 0, CHUNK_SIZE, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+      const chunk = remainder + buf.toString('utf8', 0, bytesRead);
+      const parts = chunk.split('\n');
+      remainder = parts.pop();
+      for (const part of parts) {
+        if (part.trim()) lines.push(part);
+        if (lines.length >= MAX_LINES) break;
+      }
+    }
+    if (lines.length < MAX_LINES && remainder.trim()) lines.push(remainder);
+    if (lines.length === 0) return null;
+
+    let id = null, cwd = null, timestamp = null, preview = null;
+
+    for (const line of lines) {
+      try {
+        const entry = JSON.parse(line);
+        if (entry.type === 'session_meta' && entry.payload) {
+          id = entry.payload.id;
+          cwd = entry.payload.cwd;
+          timestamp = entry.payload.timestamp || entry.timestamp;
+        }
+        if (!preview && entry.type === 'event_msg' && entry.payload?.type === 'user_message' && entry.payload.message) {
+          preview = entry.payload.message.slice(0, 150).replace(/\n/g, ' ').trim();
+        }
+        if (id && preview) break;
+      } catch {}
+    }
+    if (!id || !cwd) return null;
+
+    // Canonicalize cwd for reliable merging with Claude projects
+    let realCwd = cwd;
+    try { realCwd = fs.realpathSync(cwd); } catch {}
+
+    return {
+      id, cwd: realCwd, rawCwd: cwd,
+      mtime: stat.mtimeMs,
+      date: stat.mtime.toISOString(),
+      preview,
+      filePath,
+    };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// Extract UUID from codex rollout filename: rollout-YYYY-MM-DDThh-mm-ss-<UUID>.jsonl
+function codexFileSessionId(filename) {
+  const m = filename.match(/rollout-[^-]+-[^-]+-[^T]+T[^-]+-[^-]+-[^-]+-(.+)\.jsonl$/);
+  return m ? m[1] : null;
+}
+
+// Initial scan
+scanCodexSessions();
 
 // --- Path decoding ---
 
@@ -135,6 +261,49 @@ function getProjectName(p) {
 }
 
 // --- Session parsing ---
+
+// Extract user messages from a JSONL file for naming purposes.
+// Reads up to maxBytes from the file to find user messages.
+function getUserMessages(jsonlPath, maxBytes = 256 * 1024) {
+  const messages = [];
+  try {
+    const fd = fs.openSync(jsonlPath, 'r');
+    try {
+      const buf = Buffer.alloc(Math.min(65536, maxBytes));
+      let remainder = '';
+      let offset = 0;
+      let totalRead = 0;
+      while (totalRead < maxBytes) {
+        const bytesRead = fs.readSync(fd, buf, 0, buf.length, offset);
+        if (bytesRead === 0) break;
+        offset += bytesRead;
+        totalRead += bytesRead;
+        const chunk = remainder + buf.toString('utf8', 0, bytesRead);
+        const parts = chunk.split('\n');
+        remainder = parts.pop();
+        for (const part of parts) {
+          if (!part.trim()) continue;
+          try {
+            const entry = JSON.parse(part);
+            if (entry.type === 'user' && entry.message?.content) {
+              const text = typeof entry.message.content === 'string'
+                ? entry.message.content
+                : Array.isArray(entry.message.content)
+                  ? (entry.message.content.find(c => c.type === 'text')?.text || '')
+                  : '';
+              if (text && text.length > 3 && !text.startsWith('You are a') && !text.includes('<local-command-caveat>') && !text.includes('<command-name>')) {
+                messages.push(text.slice(0, 300).replace(/\n/g, ' ').trim());
+              }
+            }
+          } catch {}
+        }
+      }
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {}
+  return messages;
+}
 
 function getSessionInfo(jsonlPath) {
   try {
@@ -240,41 +409,98 @@ async function generateLiveTitle(text) {
 // B2: Track in-flight summary generation to prevent duplicate API calls
 const summarizing = new Set();
 
+// Summary cache keys are namespaced as "agent:id" for Codex, plain id for Claude (backward compat)
+function summaryCacheKey(agent, id) {
+  return agent === 'codex' ? `codex:${id}` : id;
+}
+
+// --- SSE for summary updates ---
+const sseClients = new Set();
+
+app.get('/api/summary-events', (req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+    'X-Content-Type-Options': 'nosniff',
+  });
+  res.write(':\n\n'); // heartbeat
+  sseClients.add(res);
+  req.on('close', () => sseClients.delete(res));
+});
+
+function broadcastSummaryUpdate(sessionId, agent, summary) {
+  const data = JSON.stringify({ sessionId, agent, summary });
+  for (const client of sseClients) {
+    try { client.write(`data: ${data}\n\n`); } catch {}
+  }
+}
+
+// Build richer naming text from all user messages in a JSONL file
+function getNamingText(session) {
+  if (session.jsonlPath) {
+    const msgs = getUserMessages(session.jsonlPath);
+    if (msgs.length) {
+      let text = '';
+      for (const m of msgs) {
+        if (text.length + m.length > 1500) break;
+        text += (text ? ' | ' : '') + m;
+      }
+      if (text.length >= 10) return text;
+    }
+  }
+  return session.preview;
+}
+
 async function generateMissingSummaries(sessions) {
-  const uncached = sessions.filter(s => !summaryCache[s.id] && !summarizing.has(s.id) && s.preview);
+  const uncached = sessions.filter(s => {
+    const key = summaryCacheKey(s.agent, s.id);
+    return !summaryCache[key] && !summarizing.has(key) && s.preview;
+  });
   if (!uncached.length) return;
 
-  uncached.forEach(s => summarizing.add(s.id));
+  uncached.forEach(s => summarizing.add(summaryCacheKey(s.agent, s.id)));
 
   // Process in parallel batches of 5
   for (let i = 0; i < uncached.length; i += 5) {
     const batch = uncached.slice(i, i + 5);
     await Promise.all(batch.map(async s => {
+      const key = summaryCacheKey(s.agent, s.id);
       try {
-        const summary = await generateSummary(s.preview);
-        if (summary) summaryCache[s.id] = summary;
+        const summary = await generateSummary(getNamingText(s));
+        if (summary) {
+          summaryCache[key] = summary;
+          broadcastSummaryUpdate(s.id, s.agent || 'claude', summary);
+        }
       } finally {
-        summarizing.delete(s.id);
+        summarizing.delete(key);
       }
     }));
+    saveSummaryCache();
   }
-  saveSummaryCache();
 }
 
 // --- API ---
 
 app.get('/api/projects', (req, res) => {
   try {
+    // Rescan Codex sessions for fresh data
+    scanCodexSessions();
+
+    const projectMap = new Map(); // realPath -> project info
+
+    // Claude projects from ~/.claude/projects/
     const dirs = fs.readdirSync(PROJECTS_DIR).filter(d => {
       try { return fs.statSync(path.join(PROJECTS_DIR, d)).isDirectory(); }
       catch { return false; }
     });
 
-    const projects = dirs.map(encoded => {
+    for (const encoded of dirs) {
       const decoded = decodeProjectPath(encoded);
       const exists = fs.existsSync(decoded);
       const projDir = path.join(PROJECTS_DIR, encoded);
       const jsonls = fs.readdirSync(projDir).filter(f => f.endsWith('.jsonl'));
+      if (jsonls.length === 0) continue;
 
       let latestMtime = 0;
       for (const f of jsonls) {
@@ -284,26 +510,63 @@ app.get('/api/projects', (req, res) => {
         } catch {}
       }
 
-      return { id: encoded, path: decoded, name: getProjectName(decoded), exists, sessionCount: jsonls.length, latestMtime };
-    })
-    .filter(p => p.sessionCount > 0)
-    .sort((a, b) => b.latestMtime - a.latestMtime);
+      projectMap.set(decoded, {
+        path: decoded, name: getProjectName(decoded), exists,
+        claudeCount: jsonls.length, codexCount: 0, latestMtime,
+        claudeEncoded: encoded,
+      });
+    }
+
+    // Codex projects grouped by cwd
+    for (const entry of codexIndex.values()) {
+      const existing = projectMap.get(entry.cwd);
+      if (existing) {
+        existing.codexCount++;
+        if (entry.mtime > existing.latestMtime) existing.latestMtime = entry.mtime;
+      } else {
+        const exists = fs.existsSync(entry.cwd);
+        projectMap.set(entry.cwd, {
+          path: entry.cwd, name: getProjectName(entry.cwd), exists,
+          claudeCount: 0, codexCount: 1, latestMtime: entry.mtime,
+          claudeEncoded: null,
+        });
+      }
+    }
+
+    const projects = [...projectMap.values()]
+      .map(p => ({
+        path: p.path,
+        name: p.name,
+        exists: p.exists,
+        sessionCount: p.claudeCount + p.codexCount,
+        latestMtime: p.latestMtime,
+        codexAvailable: !!codexBin,
+        // Keep encoded id for backward compat with session endpoint
+        id: p.claudeEncoded || null,
+      }))
+      .filter(p => p.sessionCount > 0)
+      .sort((a, b) => a.name.localeCompare(b.name));
 
     res.json(projects);
 
     // B5: Lazily prune stale summaries
-    const allSessionIds = new Set();
-    for (const p of projects) {
-      try {
-        const projDir = path.join(PROJECTS_DIR, p.id);
-        for (const f of fs.readdirSync(projDir)) {
-          if (f.endsWith('.jsonl')) allSessionIds.add(f.replace('.jsonl', ''));
-        }
-      } catch {}
+    const allSessionKeys = new Set();
+    for (const p of projectMap.values()) {
+      if (p.claudeEncoded) {
+        try {
+          const projDir = path.join(PROJECTS_DIR, p.claudeEncoded);
+          for (const f of fs.readdirSync(projDir)) {
+            if (f.endsWith('.jsonl')) allSessionKeys.add(f.replace('.jsonl', ''));
+          }
+        } catch {}
+      }
+    }
+    for (const entry of codexIndex.values()) {
+      allSessionKeys.add(`codex:${entry.id}`);
     }
     let pruned = false;
-    for (const id of Object.keys(summaryCache)) {
-      if (!allSessionIds.has(id)) { delete summaryCache[id]; pruned = true; }
+    for (const key of Object.keys(summaryCache)) {
+      if (!allSessionKeys.has(key)) { delete summaryCache[key]; pruned = true; }
     }
     if (pruned) saveSummaryCache();
   } catch (err) {
@@ -311,45 +574,168 @@ app.get('/api/projects', (req, res) => {
   }
 });
 
-app.get('/api/projects/:id/sessions', (req, res) => {
+// Unified sessions endpoint: /api/sessions?project=<realPath>
+// Also keep legacy /api/projects/:id/sessions for backward compat
+app.get('/api/sessions', (req, res) => {
   try {
-    const projectDir = path.join(PROJECTS_DIR, req.params.id);
-    // Prevent path traversal — resolved path must stay inside PROJECTS_DIR
-    if (!path.resolve(projectDir).startsWith(PROJECTS_DIR + path.sep)) {
-      return res.status(400).json({ error: 'Invalid project id' });
+    const projectPath = req.query.project;
+    if (!projectPath) return res.status(400).json({ error: 'Missing project param' });
+    const resolved = path.resolve(projectPath);
+    serveSessions(res, resolved);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Recent sessions across all projects (must be before :id route)
+app.get('/api/recent-sessions', (req, res) => {
+  try {
+    scanCodexSessions();
+    const limit = Math.min(parseInt(req.query.limit) || 20, 50);
+    const allSessions = [];
+
+    // Claude sessions
+    let dirs;
+    try { dirs = fs.readdirSync(PROJECTS_DIR).filter(d => { try { return fs.statSync(path.join(PROJECTS_DIR, d)).isDirectory(); } catch { return false; } }); }
+    catch { dirs = []; }
+
+    for (const encoded of dirs) {
+      const decoded = decodeProjectPath(encoded);
+      const projDir = path.join(PROJECTS_DIR, encoded);
+      try {
+        const files = fs.readdirSync(projDir).filter(f => f.endsWith('.jsonl'));
+        for (const f of files) {
+          const filePath = path.join(projDir, f);
+          try {
+            const stat = fs.statSync(filePath);
+            const id = f.replace('.jsonl', '');
+            const info = getSessionInfo(filePath);
+            if (!info.firstUserMessage) continue;
+            allSessions.push({
+              id, agent: 'claude', date: stat.mtime.toISOString(), mtime: stat.mtimeMs,
+              preview: info.firstUserMessage, jsonlPath: filePath,
+              summary: summaryCache[id] || null,
+              projectPath: decoded, projectName: getProjectName(decoded),
+            });
+          } catch {}
+        }
+      } catch {}
     }
-    const MAX_SESSIONS = 30;
-    const allFiles = fs.readdirSync(projectDir)
-      .filter(f => f.endsWith('.jsonl'))
-      .map(f => {
-        const filePath = path.join(projectDir, f);
-        const stat = fs.statSync(filePath);
-        return { file: f, path: filePath, mtime: stat.mtimeMs, date: stat.mtime.toISOString() };
-      })
-      .sort((a, b) => b.mtime - a.mtime);
-    const totalCount = allFiles.length;
-    const files = allFiles.slice(0, MAX_SESSIONS);
 
-    const sessions = files.map(f => {
-      const info = getSessionInfo(f.path);
-      return {
-        id: f.file.replace('.jsonl', ''),
-        date: f.date,
-        mtime: f.mtime,
-        preview: info.firstUserMessage,
-        summary: summaryCache[f.file.replace('.jsonl', '')] || null,
-      };
-    }).filter(s => s.preview);
+    // Codex sessions
+    for (const entry of codexIndex.values()) {
+      const key = summaryCacheKey('codex', entry.id);
+      if (!entry.preview) continue;
+      allSessions.push({
+        id: entry.id, agent: 'codex', date: entry.date, mtime: entry.mtime,
+        preview: entry.preview,
+        summary: summaryCache[key] || null,
+        projectPath: entry.cwd, projectName: getProjectName(entry.cwd),
+      });
+    }
 
-    // B7: Include truncation info
-    res.json({ sessions, total: totalCount, truncated: totalCount > MAX_SESSIONS });
+    allSessions.sort((a, b) => b.mtime - a.mtime);
+    const sessions = allSessions.slice(0, limit);
+    res.json(sessions);
 
-    // Background: generate missing summaries
     generateMissingSummaries(sessions).catch(() => {});
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
+
+// Force-regenerate summaries for a session or all sessions in a project
+app.post('/api/regenerate-summaries', (req, res) => {
+  const { sessionId, projectId } = req.query;
+  let cleared = 0;
+  if (sessionId) {
+    // Clear one specific session
+    if (summaryCache[sessionId]) { delete summaryCache[sessionId]; cleared++; }
+    const codexKey = `codex:${sessionId}`;
+    if (summaryCache[codexKey]) { delete summaryCache[codexKey]; cleared++; }
+  } else if (projectId) {
+    // Clear all sessions for a project
+    const projectDir = path.join(PROJECTS_DIR, projectId);
+    if (path.resolve(projectDir).startsWith(PROJECTS_DIR + path.sep)) {
+      try {
+        const files = fs.readdirSync(projectDir).filter(f => f.endsWith('.jsonl'));
+        for (const f of files) {
+          const id = f.replace('.jsonl', '');
+          if (summaryCache[id]) { delete summaryCache[id]; cleared++; }
+        }
+      } catch {}
+    }
+  } else {
+    // Clear all summaries
+    cleared = Object.keys(summaryCache).length;
+    summaryCache = {};
+  }
+  saveSummaryCache();
+  res.json({ cleared, message: 'Summaries will regenerate on next load' });
+});
+
+app.get('/api/projects/:id/sessions', (req, res) => {
+  try {
+    const projectDir = path.join(PROJECTS_DIR, req.params.id);
+    if (!path.resolve(projectDir).startsWith(PROJECTS_DIR + path.sep)) {
+      return res.status(400).json({ error: 'Invalid project id' });
+    }
+    const decoded = decodeProjectPath(req.params.id);
+    serveSessions(res, decoded);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+function serveSessions(res, projectPath) {
+  const MAX_SESSIONS = 30;
+  const allSessions = [];
+
+  // Claude sessions
+  const encodedDir = findEncodedDir(projectPath);
+  if (encodedDir) {
+    const projectDir = path.join(PROJECTS_DIR, encodedDir);
+    try {
+      const files = fs.readdirSync(projectDir)
+        .filter(f => f.endsWith('.jsonl'))
+        .map(f => {
+          const filePath = path.join(projectDir, f);
+          const stat = fs.statSync(filePath);
+          return { file: f, path: filePath, mtime: stat.mtimeMs, date: stat.mtime.toISOString() };
+        });
+      for (const f of files) {
+        const info = getSessionInfo(f.path);
+        const id = f.file.replace('.jsonl', '');
+        allSessions.push({
+          id, agent: 'claude', date: f.date, mtime: f.mtime,
+          preview: info.firstUserMessage, jsonlPath: f.path,
+          summary: summaryCache[id] || null,
+        });
+      }
+    } catch {}
+  }
+
+  // Codex sessions
+  for (const entry of codexIndex.values()) {
+    if (entry.cwd !== projectPath) continue;
+    const key = summaryCacheKey('codex', entry.id);
+    allSessions.push({
+      id: entry.id, agent: 'codex', date: entry.date, mtime: entry.mtime,
+      preview: entry.preview,
+      summary: summaryCache[key] || null,
+    });
+  }
+
+  // Sort by recency, filter, truncate
+  allSessions.sort((a, b) => b.mtime - a.mtime);
+  const totalCount = allSessions.length;
+  const sessions = allSessions.filter(s => s.preview).slice(0, MAX_SESSIONS);
+
+  res.json({ sessions, total: totalCount, truncated: totalCount > MAX_SESSIONS });
+
+  // Background: generate missing summaries
+  generateMissingSummaries(sessions).catch(() => {});
+}
 
 app.get('/api/pick-folder', (req, res) => {
   execFile('osascript', ['-e', 'POSIX path of (choose folder)'], { timeout: 60000 }, (err, stdout) => {
@@ -371,9 +757,22 @@ const terminals = new Map();
 wss.on('connection', (ws, req) => {
   const params = new URL(req.url, 'http://localhost').searchParams;
   const projectPath = params.get('project');
-  const resume = params.get('resume');  // session ID to resume claude
+  const resume = params.get('resume');  // session ID to resume
+  const agent = params.get('agent') || 'claude';
   const cols = parseInt(params.get('cols')) || 120;
   const rows = parseInt(params.get('rows')) || 30;
+
+  // Validate agent
+  if (agent !== 'claude' && agent !== 'codex') {
+    ws.send(JSON.stringify({ type: 'error', message: 'Invalid agent' }));
+    ws.close();
+    return;
+  }
+  if (agent === 'codex' && !codexBin) {
+    ws.send(JSON.stringify({ type: 'error', message: 'Codex is not installed' }));
+    ws.close();
+    return;
+  }
 
   // B6: Validate resume parameter format
   if (resume && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(resume)) {
@@ -386,8 +785,8 @@ wss.on('connection', (ws, req) => {
   const resolvedProject = projectPath && path.resolve(projectPath);
   const encodedDir = resolvedProject ? findEncodedDir(resolvedProject) : null;
 
-  // For resume, we need the encoded dir to find the session file
-  if (resume && !encodedDir) {
+  // For Claude resume, we need the encoded dir to find the session file
+  if (resume && agent === 'claude' && !encodedDir) {
     ws.send(JSON.stringify({ type: 'error', message: 'Invalid project path' }));
     ws.close();
     return;
@@ -402,7 +801,7 @@ wss.on('connection', (ws, req) => {
   }
 
   // Spawn an interactive shell wrapped in `script` for PTY.
-  // Claude is launched as a command inside the shell so that when it exits,
+  // The agent is launched as a command inside the shell so that when it exits,
   // the user drops back to a live shell prompt in the same tab.
   const shell = process.env.SHELL || '/bin/zsh';
   let sessionId = resume || null;
@@ -427,20 +826,38 @@ wss.on('connection', (ws, req) => {
   }
 
   const termId = crypto.randomUUID();
-  terminals.set(termId, { proc, ws, sessionId });
+  terminals.set(termId, { proc, ws, sessionId, agent });
 
   ws.send(JSON.stringify({ type: 'ready', termId, sessionId }));
 
-  // Launch claude inside the shell — when it exits the shell stays alive
-  const claudeCmd = resume
-    ? `${claudeBin} --resume ${resume}\n`
-    : `${claudeBin}\n`;
-  proc.stdin.write(claudeCmd);
+  // Launch agent inside the shell.
+  // `stty cols` issues TIOCSWINSZ on the PTY slave so the agent picks up the
+  // new width at startup. 96 = 80 × 1.2.
+  const targetCols = 96;
+  const setSize = `stty cols ${targetCols} rows ${rows} 2>/dev/null; clear; `;
+
+  let launchCmd;
+  if (agent === 'codex') {
+    if (resume) {
+      launchCmd = `${setSize}${codexBin} resume -C ${JSON.stringify(resolvedProject)} ${resume}\n`;
+    } else {
+      launchCmd = `${setSize}${codexBin} -C ${JSON.stringify(resolvedProject)}\n`;
+    }
+  } else {
+    const sandboxFlag = `--settings '{"sandbox":{"enabled":true}}'`;
+    if (resume) {
+      launchCmd = `${setSize}${claudeBin} ${sandboxFlag} --resume ${resume}\n`;
+    } else {
+      launchCmd = `${setSize}${claudeBin} ${sandboxFlag}\n`;
+    }
+  }
+  proc.stdin.write(launchCmd);
 
   // --- Auto-naming ---
   let outputBuffer = '';
   let charsSinceLastRename = 0;
-  let renameCount = 0;
+  let renameCount = 0;   // successful meaningful renames (caps at MAX_RENAMES)
+  let hasAttempted = false;  // whether we've called haiku at least once
   const MAX_RENAMES = 5;
   const INITIAL_DELAY = 90_000;      // 1.5 minutes (wait for actual task content)
   const RENAME_INTERVAL = 5 * 60_000; // 5 minutes
@@ -485,44 +902,117 @@ wss.on('connection', (ws, req) => {
   // Detect session ID for new sessions by finding the newest JSONL in the project dir
   function detectSessionId() {
     if (sessionId) return sessionId;
-    if (!encodedDir) return null;
-    try {
-      const projDir = path.join(PROJECTS_DIR, encodedDir);
-      const files = fs.readdirSync(projDir)
-        .filter(f => f.endsWith('.jsonl'))
-        .map(f => ({ name: f.replace('.jsonl', ''), mtime: fs.statSync(path.join(projDir, f)).mtimeMs }))
-        .filter(f => f.mtime >= sessionStart - 5000) // created around when this session started
-        .sort((a, b) => b.mtime - a.mtime);
-      if (files.length > 0) {
-        sessionId = files[0].name;
-        const entry = terminals.get(termId);
-        if (entry) entry.sessionId = sessionId;
-        // Notify client of discovered session ID
-        try { ws.send(JSON.stringify({ type: 'ready', termId, sessionId })); } catch {}
-      }
-    } catch {}
+
+    if (agent === 'codex') {
+      // Scan today's Codex rollout dir for recently-created files
+      try {
+        const now = new Date();
+        const dayDir = path.join(CODEX_SESSIONS_DIR,
+          String(now.getFullYear()),
+          String(now.getMonth() + 1).padStart(2, '0'),
+          String(now.getDate()).padStart(2, '0'));
+        const files = readdirSafe(dayDir)
+          .filter(f => f.endsWith('.jsonl'))
+          .map(f => {
+            const fp = path.join(dayDir, f);
+            return { name: codexFileSessionId(f), mtime: fs.statSync(fp).mtimeMs, path: fp };
+          })
+          .filter(f => f.name && f.mtime >= sessionStart - 5000)
+          .sort((a, b) => b.mtime - a.mtime);
+        if (files.length > 0) {
+          sessionId = files[0].name;
+          const entry = terminals.get(termId);
+          if (entry) entry.sessionId = sessionId;
+          try { ws.send(JSON.stringify({ type: 'ready', termId, sessionId })); } catch {}
+        }
+      } catch {}
+    } else {
+      if (!encodedDir) return null;
+      try {
+        const projDir = path.join(PROJECTS_DIR, encodedDir);
+        const files = fs.readdirSync(projDir)
+          .filter(f => f.endsWith('.jsonl'))
+          .map(f => ({ name: f.replace('.jsonl', ''), mtime: fs.statSync(path.join(projDir, f)).mtimeMs }))
+          .filter(f => f.mtime >= sessionStart - 5000)
+          .sort((a, b) => b.mtime - a.mtime);
+        if (files.length > 0) {
+          sessionId = files[0].name;
+          const entry = terminals.get(termId);
+          if (entry) entry.sessionId = sessionId;
+          try { ws.send(JSON.stringify({ type: 'ready', termId, sessionId })); } catch {}
+        }
+      } catch {}
+    }
     return sessionId;
+  }
+
+  // Build naming input from JSONL user messages when available
+  function getJsonlNamingText() {
+    const sid = detectSessionId();
+    if (!sid) return null;
+    let jsonlPath = null;
+    if (agent === 'codex') {
+      // Find Codex session file from index
+      for (const [fp, entry] of codexIndex.entries()) {
+        if (entry.id === sid) { jsonlPath = fp; break; }
+      }
+    } else if (encodedDir) {
+      jsonlPath = path.join(PROJECTS_DIR, encodedDir, `${sid}.jsonl`);
+    }
+    if (!jsonlPath) return null;
+    const msgs = getUserMessages(jsonlPath);
+    if (!msgs.length) return null;
+    // Include all user messages, truncated to ~1500 chars total
+    let text = '';
+    for (const m of msgs) {
+      if (text.length + m.length > 1500) break;
+      text += (text ? ' | ' : '') + m;
+    }
+    return text;
   }
 
   async function generateTitle() {
     if (sessionEnded || renameCount >= MAX_RENAMES) return;
     if (Date.now() - sessionStart > MAX_RENAME_AGE) return;
-    const clean = cleanForNaming(outputBuffer).slice(-800);
-    if (clean.length < 30) return;  // need enough meaningful content
-    if (renameCount > 0 && charsSinceLastRename < MIN_NEW_CHARS) return;
-    renameCount++;
-    charsSinceLastRename = 0;
-    const title = await generateLiveTitle(clean);
-    if (title) {
-      try { ws.send(JSON.stringify({ type: 'title', title })); } catch {}
-      // Persist live title to summary cache
-      const sid = detectSessionId();
-      if (sid) {
-        summaryCache[sid] = title;
-        saveSummaryCache();
-      }
-    }
+
+    // Always schedule the next attempt up front so early returns below
+    // don't leave the timer dead.
     scheduleNextRename();
+
+    // Prefer JSONL user messages over noisy terminal output
+    const jsonlText = getJsonlNamingText();
+    let namingInput, title;
+    if (jsonlText && jsonlText.length >= 10) {
+      if (hasAttempted && charsSinceLastRename < MIN_NEW_CHARS) return;
+      hasAttempted = true;
+      charsSinceLastRename = 0;
+      namingInput = jsonlText;
+      title = await generateSummary(namingInput);
+    } else {
+      const clean = cleanForNaming(outputBuffer).slice(-800);
+      if (clean.length < 30) return;
+      if (hasAttempted && charsSinceLastRename < MIN_NEW_CHARS) return;
+      hasAttempted = true;
+      charsSinceLastRename = 0;
+      namingInput = clean;
+      title = await generateLiveTitle(namingInput);
+    }
+    if (!title) return;
+
+    // Haiku is instructed to reply "new session" when the task isn't clear
+    // yet — don't consume a rename slot or notify the client for that.
+    const normalized = title.replace(/["'.]/g, '').trim().toLowerCase();
+    if (!normalized || normalized === 'new session') return;
+
+    renameCount++;
+    try { ws.send(JSON.stringify({ type: 'title', title })); } catch {}
+    // Persist live title to summary cache
+    const sid = detectSessionId();
+    if (sid) {
+      summaryCache[summaryCacheKey(agent, sid)] = title;
+      saveSummaryCache();
+      broadcastSummaryUpdate(sid, agent, title);
+    }
   }
 
   function scheduleNextRename() {
@@ -535,13 +1025,20 @@ wss.on('connection', (ws, req) => {
   // For resumed sessions, use cached summary immediately
   if (resume) {
     renameCount = MAX_RENAMES; // don't auto-rename resumed sessions
-    if (encodedDir) {
+    const cacheKey = summaryCacheKey(agent, resume);
+    if (agent === 'codex') {
+      // Look up Codex session preview from rollout index
+      let preview = null;
+      for (const entry of codexIndex.values()) {
+        if (entry.id === resume) { preview = entry.preview; break; }
+      }
+      const title = summaryCache[cacheKey] || (preview && preview.slice(0, 60));
+      if (title) ws.send(JSON.stringify({ type: 'title', title }));
+    } else if (encodedDir) {
       const jsonlDir = path.join(PROJECTS_DIR, encodedDir);
       const info = getSessionInfo(path.join(jsonlDir, `${resume}.jsonl`));
-      const title = summaryCache[resume] || (info.firstUserMessage && info.firstUserMessage.slice(0, 60));
-      if (title) {
-        ws.send(JSON.stringify({ type: 'title', title }));
-      }
+      const title = summaryCache[cacheKey] || (info.firstUserMessage && info.firstUserMessage.slice(0, 60));
+      if (title) ws.send(JSON.stringify({ type: 'title', title }));
     }
   } else {
     // First rename after 1 minute
