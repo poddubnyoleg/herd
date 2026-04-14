@@ -56,7 +56,8 @@
       "Bash(ls -d ~/.claude/projects/*gpt*meditation*)",
       "Bash(ls -d ~/.claude/projects/*mia*evals*)",
       "Bash(ls -d ~/.claude/projects/*lightdash*)",
-      "Bash(chmod +x:*)"
+      "Bash(chmod +x:*)",
+      "WebFetch(domain:docs.anthropic.com)"
     ]
   }
 }

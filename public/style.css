@@ -565,6 +565,176 @@ body {
 .empty-content p { font-size: 12px; margin-top: 4px; }
 .hint { opacity: 0.5; }
 
+/* ── Token usage badge + popup ── */
+
+.usage-badge {
+  font-size: 10px;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 4px;
+  transition: color 0.1s, background 0.1s;
+  font-weight: 600;
+}
+
+.usage-badge:hover {
+  color: var(--accent);
+  background: var(--bg-hover);
+}
+
+.usage-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.usage-popup {
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 20px 24px;
+  width: 360px;
+  max-height: 80vh;
+  overflow-y: auto;
+}
+
+.usage-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 16px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.usage-title {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--text-muted);
+  font-weight: 600;
+}
+
+.usage-total-cost {
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--text);
+  letter-spacing: -0.5px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+}
+
+.usage-note {
+  font-size: 9px;
+  font-weight: 400;
+  color: var(--text-muted);
+  letter-spacing: 0;
+}
+
+.usage-stats {
+  display: flex;
+  gap: 20px;
+  margin-bottom: 16px;
+}
+
+.usage-stat { display: flex; flex-direction: column; }
+
+.stat-value {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+
+.stat-label {
+  font-size: 10px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.usage-models {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.model-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 3px;
+}
+
+.model-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+
+.model-cost {
+  font-size: 12px;
+  color: var(--text);
+  font-weight: 600;
+}
+
+.model-bar-track {
+  height: 3px;
+  background: var(--border);
+  border-radius: 2px;
+  margin-bottom: 3px;
+}
+
+.model-bar-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+  transition: width 0.3s;
+}
+
+.model-detail {
+  display: flex;
+  gap: 10px;
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.usage-spark {
+  margin-top: 4px;
+}
+
+.spark-label {
+  font-size: 10px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 6px;
+}
+
+.spark-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 36px;
+}
+
+.spark-bar {
+  flex: 1;
+  background: var(--accent);
+  border-radius: 1px;
+  opacity: 0.6;
+  transition: opacity 0.15s;
+}
+
+.spark-bar:hover {
+  opacity: 1;
+}
+
 /* ── Scrollbar ── */
 
 ::-webkit-scrollbar { width: 5px; }

@@ -371,6 +371,24 @@ function saveSummaryCache() {
   try { fs.writeFileSync(SUMMARY_CACHE_PATH, JSON.stringify(summaryCache, null, 2)); } catch {}
 }
 
+// Summary cache entries: new format is { text, ts }, old format is plain string.
+// Helpers provide backward-compatible access.
+function getSummaryText(key) {
+  const v = summaryCache[key];
+  if (!v) return null;
+  return typeof v === 'string' ? v : v.text;
+}
+
+function getSummaryTs(key) {
+  const v = summaryCache[key];
+  if (!v || typeof v === 'string') return 0; // old entries: treat as ancient
+  return v.ts || 0;
+}
+
+function setSummary(key, text) {
+  summaryCache[key] = { text, ts: Date.now() };
+}
+
 async function generateSummary(text) {
   if (!claudeBin || !text) return null;
 
@@ -452,24 +470,32 @@ function getNamingText(session) {
   return session.preview;
 }
 
-async function generateMissingSummaries(sessions) {
-  const uncached = sessions.filter(s => {
-    const key = summaryCacheKey(s.agent, s.id);
-    return !summaryCache[key] && !summarizing.has(key) && s.preview;
-  });
-  if (!uncached.length) return;
+const STALE_SUMMARY_AGE = 5 * 60_000; // re-check summaries 5 min after last generation
 
-  uncached.forEach(s => summarizing.add(summaryCacheKey(s.agent, s.id)));
+async function generateMissingSummaries(sessions) {
+  const now = Date.now();
+  const toGenerate = sessions.filter(s => {
+    const key = summaryCacheKey(s.agent, s.id);
+    if (summarizing.has(key) || !s.preview) return false;
+    // No summary yet — needs one
+    if (!summaryCache[key]) return true;
+    // Has summary but session was modified after it was generated (stale)
+    const ts = getSummaryTs(key);
+    return s.mtime > ts && (now - ts) >= STALE_SUMMARY_AGE;
+  });
+  if (!toGenerate.length) return;
+
+  toGenerate.forEach(s => summarizing.add(summaryCacheKey(s.agent, s.id)));
 
   // Process in parallel batches of 5
-  for (let i = 0; i < uncached.length; i += 5) {
-    const batch = uncached.slice(i, i + 5);
+  for (let i = 0; i < toGenerate.length; i += 5) {
+    const batch = toGenerate.slice(i, i + 5);
     await Promise.all(batch.map(async s => {
       const key = summaryCacheKey(s.agent, s.id);
       try {
         const summary = await generateSummary(getNamingText(s));
         if (summary) {
-          summaryCache[key] = summary;
+          setSummary(key, summary);
           broadcastSummaryUpdate(s.id, s.agent || 'claude', summary);
         }
       } finally {
@@ -479,6 +505,165 @@ async function generateMissingSummaries(sessions) {
     saveSummaryCache();
   }
 }
+
+// --- Token usage ---
+
+const MODEL_PRICING = {
+  'claude-opus-4-6':              { input: 5,     output: 25,    cache_write_5m: 6.25,  cache_write_1h: 10,    cache_read: 0.50 },
+  'claude-opus-4-5':              { input: 5,     output: 25,    cache_write_5m: 6.25,  cache_write_1h: 10,    cache_read: 0.50 },
+  'claude-opus-4-1':              { input: 15,    output: 75,    cache_write_5m: 18.75, cache_write_1h: 30,    cache_read: 1.50 },
+  'claude-sonnet-4-6':            { input: 3,     output: 15,    cache_write_5m: 3.75,  cache_write_1h: 6,     cache_read: 0.30 },
+  'claude-haiku-4-5-20251001':    { input: 1,     output: 5,     cache_write_5m: 1.25,  cache_write_1h: 2,     cache_read: 0.10 },
+};
+// Aliases for model strings that appear with different names
+const MODEL_ALIASES = {
+  'anthropic/claude-4.6-sonnet-20260217': 'claude-sonnet-4-6',
+  'anthropic/claude-4.6-opus-20260205': 'claude-opus-4-6',
+};
+const DEFAULT_PRICING = MODEL_PRICING['claude-opus-4-6']; // user's default
+
+let tokenUsageCache = null;
+let tokenUsageCacheTime = 0;
+const TOKEN_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+function computeTokenUsage() {
+  const now = Date.now();
+  if (tokenUsageCache && now - tokenUsageCacheTime < TOKEN_CACHE_TTL) return tokenUsageCache;
+
+  const cutoff = new Date(now - 30 * 24 * 60 * 60 * 1000);
+  const byModel = {};
+  const byDate = {};
+  let totalMessages = 0;
+  let totalSessions = 0;
+
+  let dirs;
+  try { dirs = fs.readdirSync(PROJECTS_DIR).filter(d => { try { return fs.statSync(path.join(PROJECTS_DIR, d)).isDirectory(); } catch { return false; } }); }
+  catch { dirs = []; }
+
+  for (const encoded of dirs) {
+    const projDir = path.join(PROJECTS_DIR, encoded);
+    let files;
+    try { files = fs.readdirSync(projDir).filter(f => f.endsWith('.jsonl')); } catch { continue; }
+
+    for (const file of files) {
+      const filePath = path.join(projDir, file);
+      let stat;
+      try { stat = fs.statSync(filePath); } catch { continue; }
+      if (stat.mtime < cutoff) continue;
+
+      let sessionHadUsage = false;
+      try {
+        const fd = fs.openSync(filePath, 'r');
+        try {
+          const CHUNK = 65536;
+          let remainder = '';
+          let offset = 0;
+          let reading = true;
+          while (reading) {
+            const buf = Buffer.alloc(CHUNK);
+            const bytesRead = fs.readSync(fd, buf, 0, CHUNK, offset);
+            if (bytesRead === 0) break;
+            offset += bytesRead;
+            const chunk = remainder + buf.toString('utf8', 0, bytesRead);
+            const parts = chunk.split('\n');
+            remainder = parts.pop();
+            for (const part of parts) {
+              if (!part.trim()) continue;
+              try {
+                const entry = JSON.parse(part);
+                // Check timestamp
+                const ts = entry.timestamp;
+                if (ts && typeof ts === 'string') {
+                  try { if (new Date(ts) < cutoff) continue; } catch {}
+                }
+                const msg = entry.message;
+                if (!msg || typeof msg !== 'object' || !msg.usage) continue;
+                const usage = msg.usage;
+                const rawModel = msg.model || 'unknown';
+                const model = MODEL_ALIASES[rawModel] || rawModel;
+                sessionHadUsage = true;
+                totalMessages++;
+
+                if (!byModel[model]) byModel[model] = { input: 0, output: 0, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0, messages: 0 };
+                const m = byModel[model];
+                m.input += usage.input_tokens || 0;
+                m.output += usage.output_tokens || 0;
+                m.cache_read += usage.cache_read_input_tokens || 0;
+                // Break down cache write by duration if available
+                const cc = usage.cache_creation;
+                if (cc && typeof cc === 'object') {
+                  m.cache_write_5m += cc.ephemeral_5m_input_tokens || 0;
+                  m.cache_write_1h += cc.ephemeral_1h_input_tokens || 0;
+                } else {
+                  // Older format: all cache creation lumped together, assume 5m
+                  m.cache_write_5m += usage.cache_creation_input_tokens || 0;
+                }
+                m.messages++;
+
+                // Daily aggregation
+                let dateKey = null;
+                if (ts && typeof ts === 'string') {
+                  try { dateKey = ts.slice(0, 10); } catch {}
+                }
+                if (dateKey) {
+                  if (!byDate[dateKey]) byDate[dateKey] = { input: 0, output: 0, cache_write: 0, cache_read: 0, cost: 0 };
+                  const d = byDate[dateKey];
+                  d.input += usage.input_tokens || 0;
+                  d.output += usage.output_tokens || 0;
+                  d.cache_write += usage.cache_creation_input_tokens || 0;
+                  d.cache_read += usage.cache_read_input_tokens || 0;
+
+                  // Compute cost for this message
+                  const pricing = MODEL_PRICING[model] || DEFAULT_PRICING;
+                  const cw5m = cc?.ephemeral_5m_input_tokens || (cc ? 0 : (usage.cache_creation_input_tokens || 0));
+                  const cw1h = cc?.ephemeral_1h_input_tokens || 0;
+                  d.cost += ((usage.input_tokens || 0) * pricing.input
+                    + (usage.output_tokens || 0) * pricing.output
+                    + cw5m * pricing.cache_write_5m
+                    + cw1h * pricing.cache_write_1h
+                    + (usage.cache_read_input_tokens || 0) * pricing.cache_read) / 1_000_000;
+                }
+              } catch {}
+            }
+          }
+        } finally { fs.closeSync(fd); }
+      } catch {}
+      if (sessionHadUsage) totalSessions++;
+    }
+  }
+
+  // Compute costs per model
+  const models = {};
+  let totalCost = 0;
+  let totalTokens = 0;
+  for (const [model, m] of Object.entries(byModel)) {
+    const pricing = MODEL_PRICING[model] || DEFAULT_PRICING;
+    const cost = (m.input * pricing.input + m.output * pricing.output
+      + m.cache_write_5m * pricing.cache_write_5m + m.cache_write_1h * pricing.cache_write_1h
+      + m.cache_read * pricing.cache_read) / 1_000_000;
+    const tokens = m.input + m.output + m.cache_write_5m + m.cache_write_1h + m.cache_read;
+    models[model] = { ...m, cost, tokens };
+    totalCost += cost;
+    totalTokens += tokens;
+  }
+
+  // Daily array sorted by date
+  const daily = Object.entries(byDate)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([date, d]) => ({ date, ...d, tokens: d.input + d.output + d.cache_write + d.cache_read }));
+
+  tokenUsageCache = { models, daily, totalCost, totalTokens, totalMessages, totalSessions };
+  tokenUsageCacheTime = now;
+  return tokenUsageCache;
+}
+
+app.get('/api/token-usage', (req, res) => {
+  try {
+    res.json(computeTokenUsage());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // --- API ---
 
@@ -614,7 +799,7 @@ app.get('/api/recent-sessions', (req, res) => {
             allSessions.push({
               id, agent: 'claude', date: stat.mtime.toISOString(), mtime: stat.mtimeMs,
               preview: info.firstUserMessage, jsonlPath: filePath,
-              summary: summaryCache[id] || null,
+              summary: getSummaryText(id),
               projectPath: decoded, projectName: getProjectName(decoded),
             });
           } catch {}
@@ -629,7 +814,7 @@ app.get('/api/recent-sessions', (req, res) => {
       allSessions.push({
         id: entry.id, agent: 'codex', date: entry.date, mtime: entry.mtime,
         preview: entry.preview,
-        summary: summaryCache[key] || null,
+        summary: getSummaryText(key),
         projectPath: entry.cwd, projectName: getProjectName(entry.cwd),
       });
     }
@@ -709,7 +894,7 @@ function serveSessions(res, projectPath) {
         allSessions.push({
           id, agent: 'claude', date: f.date, mtime: f.mtime,
           preview: info.firstUserMessage, jsonlPath: f.path,
-          summary: summaryCache[id] || null,
+          summary: getSummaryText(id),
         });
       }
     } catch {}
@@ -722,7 +907,7 @@ function serveSessions(res, projectPath) {
     allSessions.push({
       id: entry.id, agent: 'codex', date: entry.date, mtime: entry.mtime,
       preview: entry.preview,
-      summary: summaryCache[key] || null,
+      summary: getSummaryText(key),
     });
   }
 
@@ -1009,7 +1194,7 @@ wss.on('connection', (ws, req) => {
     // Persist live title to summary cache
     const sid = detectSessionId();
     if (sid) {
-      summaryCache[summaryCacheKey(agent, sid)] = title;
+      setSummary(summaryCacheKey(agent, sid), title);
       saveSummaryCache();
       broadcastSummaryUpdate(sid, agent, title);
     }
@@ -1032,12 +1217,12 @@ wss.on('connection', (ws, req) => {
       for (const entry of codexIndex.values()) {
         if (entry.id === resume) { preview = entry.preview; break; }
       }
-      const title = summaryCache[cacheKey] || (preview && preview.slice(0, 60));
+      const title = getSummaryText(cacheKey) || (preview && preview.slice(0, 60));
       if (title) ws.send(JSON.stringify({ type: 'title', title }));
     } else if (encodedDir) {
       const jsonlDir = path.join(PROJECTS_DIR, encodedDir);
       const info = getSessionInfo(path.join(jsonlDir, `${resume}.jsonl`));
-      const title = summaryCache[cacheKey] || (info.firstUserMessage && info.firstUserMessage.slice(0, 60));
+      const title = getSummaryText(cacheKey) || (info.firstUserMessage && info.firstUserMessage.slice(0, 60));
       if (title) ws.send(JSON.stringify({ type: 'title', title }));
     }
   } else {

@@ -1,18 +1,22 @@
 # Herd
 
-Web-based terminal multiplexer for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) sessions.
+Web-based terminal multiplexer for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and [Codex](https://github.com/openai/codex) sessions.
 
-Browse, resume, and manage Claude Code sessions across all your projects from a single browser tab.
+Browse, resume, and manage AI coding sessions across all your projects from a single browser tab.
 
 ## Features
 
-- **Project sidebar** — all projects with Claude Code history, sorted by recency
+- **Project sidebar** — all projects with Claude Code and/or Codex history, merged by directory
+- **Recent sessions** — cross-project "Recent" section showing the 20 most recent sessions
 - **Search/filter** — filter projects by name and sessions by summary/preview text
-- **Session browser** — recent sessions per project with AI-generated summaries
-- **Terminal tabs** — multiple concurrent Claude Code terminals with tab management
-- **Resume sessions** — click any past session to `claude --resume` it
-- **Auto-naming** — tabs named by Haiku from terminal output
+- **Session browser** — sessions per project with AI-generated summaries
+- **Terminal tabs** — multiple concurrent Claude Code / Codex terminals with tab management
+- **Resume sessions** — click any past session to resume it
+- **Auto-naming** — tabs named by Haiku from terminal output, with stale summary re-generation
+- **Live summary updates** — session names update in real-time via SSE as summaries are generated
 - **Double-click rename** — manual tab naming
+- **Token usage dashboard** — 30-day cost and token breakdown by model, with daily cost sparkline
+- **Add project** — native macOS folder picker to add arbitrary project directories
 - **Theme system** — dark, light, and auto (system) themes
 - **Keyboard shortcuts** — Ctrl+W (close tab), Ctrl+T (new session), Ctrl+PageDown/PageUp (cycle tabs)
 - **New tab button** — "+" button in tab bar for quick session creation
@@ -51,24 +55,29 @@ Tests use [Playwright](https://playwright.dev/) for browser-level integration te
 
 ## How it works
 
-- Scans `~/.claude/projects/` for session history (JSONL files)
+- Scans `~/.claude/projects/` for Claude Code session history (JSONL files)
+- Scans `~/.codex/sessions/` for Codex rollout files, merges with Claude projects by working directory
 - Decodes project paths from Claude Code's dash-separated directory naming via a backtracking solver
 - Parses first user message from each session for preview text
-- Uses Claude Haiku to generate 2-4 word session summaries (cached in `summaries.json`)
+- Uses Claude Haiku to generate 2-4 word session summaries (cached in `summaries.json` with timestamps; stale summaries auto-regenerate)
+- Computes 30-day token usage and estimated costs from JSONL usage data, with per-model pricing
+- Pushes summary updates to the frontend in real-time via Server-Sent Events
 - Spawns real PTY via macOS `script` command (no native dependencies)
 - xterm.js in the browser for terminal rendering
 - WebSocket per terminal for real-time I/O
 
 ## Stack
 
-- **Backend**: Node.js, Express, WebSocket (`ws`)
+- **Backend**: Node.js, Express, WebSocket (`ws`), SSE
 - **Frontend**: Vanilla JS, xterm.js (CDN)
 - **PTY**: macOS `script -q /dev/null` (no native dependencies)
+- **Agents**: Claude Code via `claude` CLI, Codex via `codex` CLI
 - **Naming**: Claude Haiku via `claude` CLI (no API key needed)
 - **Tests**: Playwright
 
 ## Limitations
 
-- **macOS only** — the `script -q /dev/null` PTY wrapper is macOS-specific
+- **macOS only** — the `script -q /dev/null` PTY wrapper and `osascript` folder picker are macOS-specific
 - **Terminal resize** — SIGWINCH is sent but underlying PTY size is fixed at initial dimensions (full resize requires node-pty)
 - **No auth** — binds to localhost only; not intended for network exposure
+- **Estimated costs** — token usage costs are computed from JSONL data with hardcoded pricing, not from actual billing

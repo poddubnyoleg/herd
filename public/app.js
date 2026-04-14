@@ -64,6 +64,7 @@ class Herd {
     this.initTheme();
     await this.loadProjects();
     await this.loadRecentSessions();
+    this.loadTokenUsage();
     this.restoreTabState();
     this.setupResize();
     this.setupSearch();
@@ -431,6 +432,115 @@ class Herd {
         e.stopPropagation();
         this.createTab(s.projectPath, s.summary || this.truncate(s.preview || 'New Session', 40), s.id, s.agent || 'claude');
       });
+    });
+  }
+
+  // ── Token usage dashboard ──
+
+  async loadTokenUsage() {
+    try {
+      const res = await fetch('/api/token-usage');
+      if (!res.ok) return;
+      this.tokenUsage = await res.json();
+      this.renderUsageBadge();
+    } catch {}
+  }
+
+  fmtTokens(n) {
+    if (n >= 1_000_000_000) return (n / 1_000_000_000).toFixed(1) + 'B';
+    if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
+    if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K';
+    return n.toString();
+  }
+
+  fmtCost(n) { return '$' + n.toFixed(2); }
+
+  renderUsageBadge() {
+    const data = this.tokenUsage;
+    const el = document.getElementById('usage-badge');
+    if (!data || !el) return;
+    el.textContent = this.fmtCost(data.totalCost) + ' / ' + this.fmtTokens(data.totalTokens);
+    el.onclick = () => this.showUsagePopup();
+  }
+
+  showUsagePopup() {
+    if (document.getElementById('usage-popup')) return;
+    const data = this.tokenUsage;
+    if (!data) return;
+
+    const shortModel = m => {
+      if (m.includes('opus')) return 'Opus';
+      if (m.includes('sonnet')) return 'Sonnet';
+      if (m.includes('haiku')) return 'Haiku';
+      return m.split('-').slice(0, 2).join(' ');
+    };
+
+    const modelEntries = Object.entries(data.models)
+      .filter(([m]) => m !== '<synthetic>' && m !== 'unknown')
+      .sort(([, a], [, b]) => b.cost - a.cost);
+
+    const daily = data.daily.slice(-14);
+    const maxCost = Math.max(...daily.map(d => d.cost), 1);
+    const bars = daily.map(d => {
+      const h = Math.max(2, Math.round((d.cost / maxCost) * 32));
+      const label = d.date.slice(5);
+      return `<div class="spark-bar" style="height:${h}px" title="${label}: ${this.fmtCost(d.cost)}"></div>`;
+    }).join('');
+
+    const overlay = document.createElement('div');
+    overlay.id = 'usage-popup';
+    overlay.className = 'usage-overlay';
+    overlay.innerHTML = `
+      <div class="usage-popup">
+        <div class="usage-header">
+          <span class="usage-title">30-day usage</span>
+          <span class="usage-total-cost">${this.fmtCost(data.totalCost)}<span class="usage-note">API equivalent</span></span>
+        </div>
+        <div class="usage-stats">
+          <div class="usage-stat">
+            <span class="stat-value">${this.fmtTokens(data.totalTokens)}</span>
+            <span class="stat-label">tokens</span>
+          </div>
+          <div class="usage-stat">
+            <span class="stat-value">${data.totalSessions.toLocaleString()}</span>
+            <span class="stat-label">sessions</span>
+          </div>
+          <div class="usage-stat">
+            <span class="stat-value">${data.totalMessages.toLocaleString()}</span>
+            <span class="stat-label">API calls</span>
+          </div>
+        </div>
+        <div class="usage-models">
+          ${modelEntries.map(([model, m]) => {
+            const pct = data.totalCost > 0 ? (m.cost / data.totalCost * 100) : 0;
+            return `<div class="usage-model">
+              <div class="model-row">
+                <span class="model-name">${this.esc(shortModel(model))}</span>
+                <span class="model-cost">${this.fmtCost(m.cost)}</span>
+              </div>
+              <div class="model-bar-track"><div class="model-bar-fill" style="width:${pct}%"></div></div>
+              <div class="model-detail">
+                <span>in: ${this.fmtTokens(m.input)}</span>
+                <span>out: ${this.fmtTokens(m.output)}</span>
+                <span>cache r: ${this.fmtTokens(m.cache_read)}</span>
+                <span>cache w: ${this.fmtTokens(m.cache_write_5m + m.cache_write_1h)}</span>
+              </div>
+            </div>`;
+          }).join('')}
+        </div>
+        <div class="usage-spark">
+          <div class="spark-label">daily cost</div>
+          <div class="spark-bars">${bars}</div>
+        </div>
+      </div>
+    `;
+
+    document.body.appendChild(overlay);
+    overlay.addEventListener('click', e => {
+      if (e.target === overlay) overlay.remove();
+    });
+    document.addEventListener('keydown', function esc(e) {
+      if (e.key === 'Escape') { overlay.remove(); document.removeEventListener('keydown', esc); }
     });
   }
 

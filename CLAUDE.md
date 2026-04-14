@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-Herd is a web-based terminal multiplexer for Claude Code sessions. It lets you browse, resume, and manage Claude Code sessions across all your projects from a single browser tab. It scans `~/.claude/projects/` for session history (JSONL files).
+Herd is a web-based terminal multiplexer for Claude Code and Codex sessions. It lets you browse, resume, and manage sessions across all your projects from a single browser tab. It scans `~/.claude/projects/` for Claude Code history and `~/.codex/sessions/` for OpenAI Codex history (JSONL files), merging them into a unified project view.
 
 ## Commands
 
@@ -20,17 +20,25 @@ No linter or build step configured. Tests use Playwright (devDependency).
 Single-process Node.js server (`server.js`) serving a vanilla JS frontend (`public/`).
 
 **Backend (`server.js`):**
-- Express serves static files from `public/` and two REST endpoints:
-  - `GET /api/projects` — lists projects from `~/.claude/projects/`, sorted by recency. Lazily prunes stale summary cache entries
+- Express serves static files from `public/` and REST endpoints:
+  - `GET /api/projects` — lists projects from `~/.claude/projects/` and `~/.codex/sessions/`, merged by real path, sorted by name. Lazily prunes stale summary cache entries
   - `GET /api/projects/:id/sessions` — returns `{ sessions, total, truncated }` (max 30 sessions). Path traversal is blocked by validating resolved path stays inside `PROJECTS_DIR`
-- WebSocket server (`noServer: true`) only upgrades connections on `/ws` path. Spawns terminal processes via macOS `script -q /dev/null` as a PTY wrapper (no native node-pty dependency). New sessions launch `claude` directly; resumed sessions use `claude --resume <id>`
-- Claude binary is resolved once at startup from common paths or `which claude`
+  - `GET /api/sessions?project=<realPath>` — unified sessions endpoint that works with real paths (also serves Codex sessions for the project)
+  - `GET /api/recent-sessions?limit=N` — most recent sessions across all projects (both Claude and Codex), max 50
+  - `GET /api/token-usage` — 30-day token usage/cost breakdown by model and day, computed from JSONL usage data. Includes model-specific pricing (Opus, Sonnet, Haiku) with cache tier breakdowns. Cached for 5 minutes
+  - `GET /api/summary-events` — SSE stream for real-time summary updates (session names update in-place without re-rendering)
+  - `POST /api/regenerate-summaries` — force re-generation of summaries (single session, per-project, or all)
+  - `GET /api/pick-folder` — triggers native macOS folder picker via `osascript` for adding arbitrary project directories
+- WebSocket server (`noServer: true`) only upgrades connections on `/ws` path. Spawns terminal processes via macOS `script -q /dev/null` as a PTY wrapper (no native node-pty dependency). Supports `agent=claude` and `agent=codex` parameters. New sessions launch `claude`/`codex` directly; resumed sessions use `--resume <id>`
+- Claude and Codex binaries resolved once at startup from common paths or `which`
+- Codex integration: scans `~/.codex/sessions/YYYY/MM/DD/*.jsonl` for Codex rollout files. Parses `session_meta` and `event_msg` entries to extract session IDs, cwds, and previews. Cached by `(filePath, mtimeMs)` for incremental rescans
 - Project paths are encoded/decoded between the filesystem dash-separated format in `~/.claude/projects/` and real paths using a backtracking solver (`decodeProjectPath`) that validates against the actual filesystem. `findEncodedDir()` reverse-lookups the encoded directory name for a given real path
 - Security: binds to `127.0.0.1` by default (configurable via `HOST` env var), sets `X-Content-Type-Options` and `X-Frame-Options` headers, validates `resume` parameter as UUID format
-- Haiku summaries: spawns `claude -p --model haiku` to generate 2-4 word session names (no API key needed), cached in `summaries.json` on disk. Background-generates missing summaries when sessions are fetched. Tracks in-flight requests to prevent duplicate calls
+- Haiku summaries: spawns `claude -p --model haiku` to generate 2-4 word session names (no API key needed), cached in `summaries.json` on disk with timestamps. Background-generates missing summaries when sessions are fetched. Stale summaries (session modified after generation, with 5-min cooldown) are automatically re-generated. Tracks in-flight requests to prevent duplicate calls
 - Auto-naming: buffers terminal output (capped at 2KB) and periodically sends it to Haiku via CLI for tab title generation (max 5 renames over 30 minutes per session). Live titles are persisted to the summary cache on disk
 - Session ID detection: for new (non-resumed) sessions, the server discovers the session ID by scanning the project dir for recently-created JSONL files, then notifies the client via a `ready` message
 - JSONL parsing: reads session files line-by-line with chunked I/O (up to 20 lines, 64KB chunks) instead of a fixed 16KB buffer
+- Token usage computation: scans all JSONL files from last 30 days, extracts `usage` fields from messages, applies per-model pricing with cache tier breakdowns (5m ephemeral, 1h ephemeral, cache reads)
 - Graceful shutdown: SIGINT/SIGTERM kill terminal processes, close WebSocket server, then close HTTP server with a 3s timeout
 
 **Frontend (`public/app.js`, `public/index.html`, `public/style.css`):**
@@ -40,6 +48,10 @@ Single-process Node.js server (`server.js`) serving a vanilla JS frontend (`publ
 - Terminal auto-refit: each terminal uses a `ResizeObserver` on its container to refit on any size change (window resize, sidebar drag, etc.)
 - Smart scroll: output writes preserve scroll position when the user has scrolled up; auto-scrolls only when already at the bottom
 - "+" button in tab bar creates a new session in the most recent active project
+- Recent sessions: "Recent" section at top of sidebar shows 20 most recent sessions across all projects with project labels, supports both Claude and Codex
+- SSE live updates: listens on `/api/summary-events` via EventSource; updates session names in-place in both project and recent sections without full re-render
+- Token usage badge: sidebar header shows 30-day cost/token summary; clicking opens a popup with per-model breakdown, stats (tokens, sessions, API calls), and a 14-day daily cost sparkline chart
+- Add project button: "+" in sidebar header opens native macOS folder picker to add arbitrary project directories
 - Session cache updated in-memory when live titles arrive, so sidebar re-renders show current names
 - Search/filter: sidebar text input filters projects by name and sessions by summary/preview text. Auto-expands projects that match only by session content
 - WebSocket reconnection: auto-reconnects with exponential backoff (up to 30s) for sessions that have a `sessionId`
@@ -57,3 +69,5 @@ Single-process Node.js server (`server.js`) serving a vanilla JS frontend (`publ
 - **No bundler**: vanilla JS served directly, xterm from CDN
 - **Localhost only by default**: no auth, so binds to `127.0.0.1`. Override with `HOST` env var
 - **No API key needed**: Haiku summaries use the `claude` CLI (`claude -p --model haiku`), which handles its own auth
+- **Multi-agent**: Claude Code and Codex sessions are unified under the same project view. Sessions are namespaced by agent (`claude`/`codex`) in the summary cache and WebSocket protocol
+- **Token usage is estimated**: costs are computed from JSONL usage fields using hardcoded model pricing, not from actual billing. Labeled "API equivalent" in the UI
