@@ -830,27 +830,31 @@ class Herd {
                 });
               });
             }
-            if (tabId !== this.activeTabId && tab._inactiveSince && Date.now() - tab._inactiveSince > 5000 && Date.now() >= (tab._suppressUntil || 0)) {
-              tab.outputSinceViewed += this.stripAnsi(msg.data).trim().length;
-              if (tab.outputSinceViewed > 200) {
-                if (tab.finished) {
-                  tab.finished = false;
-                  this.updateSidebarFinished(tabId, false);
+            // Rate-based activity detection. Idle gemini (and similar ink TUIs) emits one
+            // footer repaint every ~2s as a steady heartbeat — cosmetic counter updates
+            // that shouldn't flag the tab. Real model output produces many chunks per
+            // second. Counting chunks per rolling 2s window cleanly separates the two.
+            const _now = Date.now();
+            tab._chunkTimes = (tab._chunkTimes || []).filter(t => _now - t < 2000);
+            tab._chunkTimes.push(_now);
+            if (tabId !== this.activeTabId && tab._inactiveSince && _now - tab._inactiveSince > 5000 && _now >= (tab._suppressUntil || 0) && tab._chunkTimes.length >= 4) {
+              if (tab.finished) {
+                tab.finished = false;
+                this.updateSidebarFinished(tabId, false);
+                this.renderTabs();
+              }
+              if (tab.idleTimer) clearTimeout(tab.idleTimer);
+              tab.idleTimer = setTimeout(() => {
+                if (tabId !== this.activeTabId && !tab.finished) {
+                  tab.finished = true;
+                  tab.unread = false;
                   this.renderTabs();
+                  this.updateSidebarFinished(tabId, true);
                 }
-                if (tab.idleTimer) clearTimeout(tab.idleTimer);
-                tab.idleTimer = setTimeout(() => {
-                  if (tabId !== this.activeTabId && !tab.finished) {
-                    tab.finished = true;
-                    tab.unread = false;
-                    this.renderTabs();
-                    this.updateSidebarFinished(tabId, true);
-                  }
-                }, 5000);
-                if (!tab.unread) {
-                  tab.unread = true;
-                  this.renderTabs();
-                }
+              }, 5000);
+              if (!tab.unread) {
+                tab.unread = true;
+                this.renderTabs();
               }
             }
             break;
@@ -938,6 +942,7 @@ class Herd {
       tab.unread = false;
       tab.finished = false;
       tab.outputSinceViewed = 0;
+      tab._chunkTimes = [];
       if (tab.idleTimer) { clearTimeout(tab.idleTimer); tab.idleTimer = null; }
       this.updateSidebarFinished(tabId, false);
       document.getElementById(`term-${tabId}`).classList.add('active');
@@ -1147,7 +1152,15 @@ class Herd {
     }
   }
 
-  stripAnsi(s) { return s.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '').replace(/\x1b\][^\x07]*\x07/g, '').replace(/[\x00-\x1f]/g, ''); }
+  stripAnsi(s) {
+    return s
+      .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '')     // CSI sequences
+      .replace(/\x1b\][^\x07]*\x07/g, '')         // OSC (BEL-terminated)
+      .replace(/\x1b[PX^_][\s\S]*?\x1b\\/g, '')   // DCS/SOS/PM/APC (ST-terminated)
+      .replace(/\x1b[()][\s\S]/g, '')             // charset designators (e.g. ESC(B)
+      .replace(/\x1b./g, '')                      // remaining 2-byte ESC seqs (7,8,=,>,M,D,c,…)
+      .replace(/[\x00-\x1f]/g, '');               // stray control chars
+  }
   lastName(p) { return p.split('/').filter(Boolean).pop() || p; }
   truncate(s, n) { return s.length > n ? s.slice(0, n) + '...' : s; }
   esc(s) { const d = document.createElement('span'); d.textContent = s; return d.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
