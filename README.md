@@ -4,6 +4,8 @@ Web-based terminal multiplexer for [Claude Code](https://docs.anthropic.com/en/d
 
 Browse, resume, and manage AI coding sessions across all your projects from a single browser tab.
 
+![Herd screenshot](docs/media/herd-screenshot.png)
+
 ## Features
 
 - **Project sidebar** — all projects with Claude Code, Codex, and/or Gemini CLI history, merged by directory
