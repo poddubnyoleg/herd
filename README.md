@@ -1,12 +1,12 @@
 # Herd
 
-Web-based terminal multiplexer for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and [Codex](https://github.com/openai/codex) sessions.
+Web-based terminal multiplexer for [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://github.com/openai/codex), and Gemini CLI sessions.
 
 Browse, resume, and manage AI coding sessions across all your projects from a single browser tab.
 
 ## Features
 
-- **Project sidebar** — all projects with Claude Code and/or Codex history, merged by directory
+- **Project sidebar** — all projects with Claude Code, Codex, and/or Gemini CLI history, merged by directory
 - **Recent sessions** — cross-project "Recent" section showing the 20 most recent sessions
 - **Search/filter** — filter projects by name and sessions by summary/preview text
 - **Session browser** — sessions per project with AI-generated summaries

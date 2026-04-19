@@ -319,6 +319,7 @@ class Herd {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       this.projects = await res.json();
       this.codexAvailable = this.projects.some(p => p.codexAvailable);
+      this.geminiAvailable = this.projects.some(p => p.geminiAvailable);
       this.renderProjects();
       this.loadRecentSessions();
     } catch (err) {
@@ -576,10 +577,13 @@ class Herd {
 
     const projectExists = el.dataset.exists === 'true';
     const codexBtn = this.codexAvailable
-      ? '<button class="new-session-btn new-session-codex" data-agent="codex"><span class="badge-codex"></span> new codex</button>'
+      ? '<button class="new-session-btn new-session-codex" data-agent="codex"><span class="badge-codex"></span> codex</button>'
+      : '';
+    const geminiBtn = this.geminiAvailable
+      ? '<button class="new-session-btn new-session-gemini" data-agent="gemini"><span class="badge-gemini"></span> gemini</button>'
       : '';
     container.innerHTML = `
-      ${projectExists ? `<button class="new-session-btn new-session-claude" data-agent="claude"><span class="badge-claude"></span> new claude</button>${codexBtn}` : ''}
+      ${projectExists ? `<div class="new-session-actions"><button class="new-session-btn new-session-claude" data-agent="claude"><span class="badge-claude"></span> claude</button>${codexBtn}${geminiBtn}</div>` : ''}
       ${sessions.map(s => `
         <div class="session-item" data-sid="${s.id}" data-agent="${s.agent || 'claude'}" title="${this.esc(s.preview || '')}">
           <span class="badge-${s.agent || 'claude'}"></span>
@@ -1081,7 +1085,9 @@ class Herd {
         const dateEl = item.querySelector('.session-date');
         if (dateEl) dateEl.textContent = 'now';
       } else {
+        const agent = item.dataset.agent || 'claude';
         item.innerHTML = `
+          <span class="badge-${agent}"></span>
           ${this.esc(this.truncate(name, 40))}
           <span class="session-date">now</span>
         `;

@@ -2,3 +2,8 @@ node_modules/
 server.log
 summaries.json
 .env
+.gemini
+assessment.md
+test-gemini*.js
+docs/gemini-integration-proposal.md
+test/screenshots/FAIL-*.png

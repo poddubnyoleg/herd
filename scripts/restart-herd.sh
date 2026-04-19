@@ -6,6 +6,10 @@ PORT="${PORT:-3456}"
 LOG_FILE="${LOG_FILE:-/tmp/herd.log}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+if [ -f "$HOME/.gemini/.env" ]; then
+  export $(grep -v '^#' "$HOME/.gemini/.env" | xargs)
+fi
+
 existing_pids="$(lsof -tiTCP:${PORT} 2>/dev/null || true)"
 if [ -n "${existing_pids}" ]; then
   kill -9 ${existing_pids} 2>/dev/null || true

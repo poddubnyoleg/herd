@@ -57,7 +57,19 @@
       "Bash(ls -d ~/.claude/projects/*mia*evals*)",
       "Bash(ls -d ~/.claude/projects/*lightdash*)",
       "Bash(chmod +x:*)",
-      "WebFetch(domain:docs.anthropic.com)"
+      "WebFetch(domain:docs.anthropic.com)",
+      "WebFetch(domain:cursor.com)",
+      "WebFetch(domain:docs.cursor.com)",
+      "Bash(codex debug:*)",
+      "Bash(codex features:*)",
+      "Bash(gh issue:*)",
+      "Bash(gh search:*)",
+      "WebFetch(domain:eu-central-1-1.aws.cloud2.influxdata.com)",
+      "WebFetch(domain:release-assets.githubusercontent.com)"
     ]
+  },
+  "sandbox": {
+    "enabled": true,
+    "autoAllowBashIfSandboxed": true
   }
 }

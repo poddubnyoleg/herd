@@ -6,11 +6,31 @@ const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const { StringDecoder } = require('string_decoder');
+
+// Load ~/.gemini/.env into a scoped object (not process.env) to avoid side-effects
+const geminiEnv = {};
+try {
+  const envPath = path.join(os.homedir(), '.gemini', '.env');
+  if (fs.existsSync(envPath)) {
+    const content = fs.readFileSync(envPath, 'utf8');
+    for (const line of content.split('\n')) {
+      const match = line.match(/^\s*([\w.-]+)\s*=\s*(.*)?\s*$/);
+      if (match) {
+        let value = match[2] || '';
+        if (value.startsWith('"') && value.endsWith('"')) value = value.slice(1, -1);
+        if (value.startsWith("'") && value.endsWith("'")) value = value.slice(1, -1);
+        geminiEnv[match[1]] = value;
+      }
+    }
+  }
+} catch {}
 
 const PORT = process.env.PORT || 3456;
 const CLAUDE_DIR = path.join(os.homedir(), '.claude');
 const PROJECTS_DIR = path.join(CLAUDE_DIR, 'projects');
 const CODEX_SESSIONS_DIR = path.join(os.homedir(), '.codex', 'sessions');
+const GEMINI_TMP_DIR = path.join(os.homedir(), '.gemini', 'tmp');
 
 const app = express();
 const server = http.createServer(app);
@@ -57,6 +77,14 @@ const codexBin = (() => {
   catch { return null; }
 })();
 console.log(`  Codex binary: ${codexBin || '(not installed)'}`);
+
+// Resolve gemini binary once at startup
+const geminiBin = (() => {
+  const { execSync } = require('child_process');
+  try { return execSync('/bin/sh -lc "which gemini"', { encoding: 'utf8' }).trim(); }
+  catch { return null; }
+})();
+console.log(`  Gemini binary: ${geminiBin || '(not installed)'}`);
 
 // --- Codex rollout index ---
 // Scans ~/.codex/sessions/**/*.jsonl, reads line 1 (session_meta) to extract cwd/id.
@@ -174,6 +202,102 @@ function codexFileSessionId(filename) {
 
 // Initial scan
 scanCodexSessions();
+
+// --- Gemini session index ---
+const geminiFileCache = new Map(); // filePath -> { mtime, sessions: [...] }
+const geminiIndex = new Map(); // sessionId -> { id, cwd, mtime, date, preview, logsFile }
+
+function scanGeminiSessions() {
+  if (!geminiBin) return;
+  try { fs.statSync(GEMINI_TMP_DIR); } catch { return; }
+
+  const seenFiles = new Set();
+  const dirs = readdirSafe(GEMINI_TMP_DIR);
+  
+  for (const dirName of dirs) {
+    const projDir = path.join(GEMINI_TMP_DIR, dirName);
+    if (!isDir(projDir)) continue;
+
+    let realCwd = null;
+    try {
+      const rootFile = path.join(projDir, '.project_root');
+      realCwd = fs.readFileSync(rootFile, 'utf8').trim();
+    } catch {}
+    if (!realCwd) continue;
+
+    try { realCwd = fs.realpathSync(realCwd); } catch {}
+
+    const logsFile = path.join(projDir, 'logs.json');
+    if (!fs.existsSync(logsFile)) continue;
+    
+    seenFiles.add(logsFile);
+    try {
+      const stat = fs.statSync(logsFile);
+      const cached = geminiFileCache.get(logsFile);
+      if (cached && cached.mtime === stat.mtimeMs) continue;
+
+      const logs = JSON.parse(fs.readFileSync(logsFile, 'utf8'));
+      if (!Array.isArray(logs)) continue;
+
+      const chatsDir = path.join(projDir, 'chats');
+      const chatSuffixes = new Set();
+      try {
+        for (const f of fs.readdirSync(chatsDir)) {
+          const dash = f.lastIndexOf('-');
+          if (dash !== -1) chatSuffixes.add(f.slice(dash + 1));
+        }
+      } catch {}
+
+      const bySession = new Map();
+      for (const entry of logs) {
+        if (!entry.sessionId) continue;
+        const shortId = entry.sessionId.substring(0, 8);
+        if (!chatSuffixes.has(`${shortId}.json`)) continue;
+
+        if (!bySession.has(entry.sessionId)) {
+          bySession.set(entry.sessionId, {
+            id: entry.sessionId,
+            cwd: realCwd,
+            mtime: new Date(entry.timestamp).getTime() || stat.mtimeMs,
+            date: entry.timestamp || stat.mtime.toISOString(),
+            preview: null,
+            logsFile
+          });
+        }
+        const session = bySession.get(entry.sessionId);
+        if (!session.preview && entry.type === 'user' && entry.message) {
+          session.preview = entry.message.slice(0, 150).replace(/\n/g, ' ').trim();
+        }
+        // update mtime/date to the latest entry
+        const entryTime = new Date(entry.timestamp).getTime();
+        if (entryTime && entryTime > session.mtime) {
+          session.mtime = entryTime;
+          session.date = entry.timestamp;
+        }
+      }
+
+      geminiFileCache.set(logsFile, { mtime: stat.mtimeMs, sessions: Array.from(bySession.values()) });
+    } catch {}
+  }
+
+  // Prune deleted files from cache
+  for (const key of geminiFileCache.keys()) {
+    if (!seenFiles.has(key)) geminiFileCache.delete(key);
+  }
+
+  // Rebuild geminiIndex
+  geminiIndex.clear();
+  for (const cacheEntry of geminiFileCache.values()) {
+    for (const session of cacheEntry.sessions) {
+      if (session.id && session.cwd) {
+        geminiIndex.set(session.id, session);
+      }
+    }
+  }
+}
+
+// Initial scan
+scanGeminiSessions();
 
 // --- Path decoding ---
 
@@ -427,9 +551,11 @@ async function generateLiveTitle(text) {
 // B2: Track in-flight summary generation to prevent duplicate API calls
 const summarizing = new Set();
 
-// Summary cache keys are namespaced as "agent:id" for Codex, plain id for Claude (backward compat)
+// Summary cache keys are namespaced as "agent:id" for Codex and Gemini, plain id for Claude (backward compat)
 function summaryCacheKey(agent, id) {
-  return agent === 'codex' ? `codex:${id}` : id;
+  if (agent === 'codex') return `codex:${id}`;
+  if (agent === 'gemini') return `gemini:${id}`;
+  return id;
 }
 
 // --- SSE for summary updates ---
@@ -456,6 +582,21 @@ function broadcastSummaryUpdate(sessionId, agent, summary) {
 
 // Build richer naming text from all user messages in a JSONL file
 function getNamingText(session) {
+  if (session.agent === 'gemini' && session.logsFile) {
+    try {
+      const logs = JSON.parse(fs.readFileSync(session.logsFile, 'utf8'));
+      const msgs = logs.filter(e => e.sessionId === session.id && e.type === 'user' && e.message && !e.message.startsWith('/'))
+                       .map(e => e.message.slice(0, 300).replace(/\n/g, ' ').trim());
+      if (msgs.length) {
+        let text = '';
+        for (const m of msgs) {
+          if (text.length + m.length > 1500) break;
+          text += (text ? ' | ' : '') + m;
+        }
+        if (text.length >= 10) return text;
+      }
+    } catch {}
+  }
   if (session.jsonlPath) {
     const msgs = getUserMessages(session.jsonlPath);
     if (msgs.length) {
@@ -669,8 +810,9 @@ app.get('/api/token-usage', (req, res) => {
 
 app.get('/api/projects', (req, res) => {
   try {
-    // Rescan Codex sessions for fresh data
+    // Rescan Codex and Gemini sessions for fresh data
     scanCodexSessions();
+    scanGeminiSessions();
 
     const projectMap = new Map(); // realPath -> project info
 
@@ -697,7 +839,7 @@ app.get('/api/projects', (req, res) => {
 
       projectMap.set(decoded, {
         path: decoded, name: getProjectName(decoded), exists,
-        claudeCount: jsonls.length, codexCount: 0, latestMtime,
+        claudeCount: jsonls.length, codexCount: 0, geminiCount: 0, latestMtime,
         claudeEncoded: encoded,
       });
     }
@@ -712,7 +854,23 @@ app.get('/api/projects', (req, res) => {
         const exists = fs.existsSync(entry.cwd);
         projectMap.set(entry.cwd, {
           path: entry.cwd, name: getProjectName(entry.cwd), exists,
-          claudeCount: 0, codexCount: 1, latestMtime: entry.mtime,
+          claudeCount: 0, codexCount: 1, geminiCount: 0, latestMtime: entry.mtime,
+          claudeEncoded: null,
+        });
+      }
+    }
+
+    // Gemini projects grouped by cwd
+    for (const entry of geminiIndex.values()) {
+      const existing = projectMap.get(entry.cwd);
+      if (existing) {
+        existing.geminiCount++;
+        if (entry.mtime > existing.latestMtime) existing.latestMtime = entry.mtime;
+      } else {
+        const exists = fs.existsSync(entry.cwd);
+        projectMap.set(entry.cwd, {
+          path: entry.cwd, name: getProjectName(entry.cwd), exists,
+          claudeCount: 0, codexCount: 0, geminiCount: 1, latestMtime: entry.mtime,
           claudeEncoded: null,
         });
       }
@@ -723,9 +881,10 @@ app.get('/api/projects', (req, res) => {
         path: p.path,
         name: p.name,
         exists: p.exists,
-        sessionCount: p.claudeCount + p.codexCount,
+        sessionCount: p.claudeCount + p.codexCount + p.geminiCount,
         latestMtime: p.latestMtime,
         codexAvailable: !!codexBin,
+        geminiAvailable: !!geminiBin,
         // Keep encoded id for backward compat with session endpoint
         id: p.claudeEncoded || null,
       }))
@@ -748,6 +907,9 @@ app.get('/api/projects', (req, res) => {
     }
     for (const entry of codexIndex.values()) {
       allSessionKeys.add(`codex:${entry.id}`);
+    }
+    for (const entry of geminiIndex.values()) {
+      allSessionKeys.add(`gemini:${entry.id}`);
     }
     let pruned = false;
     for (const key of Object.keys(summaryCache)) {
@@ -819,6 +981,18 @@ app.get('/api/recent-sessions', (req, res) => {
       });
     }
 
+    // Gemini sessions
+    for (const entry of geminiIndex.values()) {
+      const key = summaryCacheKey('gemini', entry.id);
+      if (!entry.preview) continue;
+      allSessions.push({
+        id: entry.id, agent: 'gemini', date: entry.date, mtime: entry.mtime,
+        preview: entry.preview,
+        summary: getSummaryText(key),
+        projectPath: entry.cwd, projectName: getProjectName(entry.cwd),
+      });
+    }
+
     allSessions.sort((a, b) => b.mtime - a.mtime);
     const sessions = allSessions.slice(0, limit);
     res.json(sessions);
@@ -838,6 +1012,8 @@ app.post('/api/regenerate-summaries', (req, res) => {
     if (summaryCache[sessionId]) { delete summaryCache[sessionId]; cleared++; }
     const codexKey = `codex:${sessionId}`;
     if (summaryCache[codexKey]) { delete summaryCache[codexKey]; cleared++; }
+    const geminiKey = `gemini:${sessionId}`;
+    if (summaryCache[geminiKey]) { delete summaryCache[geminiKey]; cleared++; }
   } else if (projectId) {
     // Clear all sessions for a project
     const projectDir = path.join(PROJECTS_DIR, projectId);
@@ -911,6 +1087,17 @@ function serveSessions(res, projectPath) {
     });
   }
 
+  // Gemini sessions
+  for (const entry of geminiIndex.values()) {
+    if (entry.cwd !== projectPath) continue;
+    const key = summaryCacheKey('gemini', entry.id);
+    allSessions.push({
+      id: entry.id, agent: 'gemini', date: entry.date, mtime: entry.mtime,
+      preview: entry.preview,
+      summary: getSummaryText(key),
+    });
+  }
+
   // Sort by recency, filter, truncate
   allSessions.sort((a, b) => b.mtime - a.mtime);
   const totalCount = allSessions.length;
@@ -948,13 +1135,18 @@ wss.on('connection', (ws, req) => {
   const rows = parseInt(params.get('rows')) || 30;
 
   // Validate agent
-  if (agent !== 'claude' && agent !== 'codex') {
+  if (agent !== 'claude' && agent !== 'codex' && agent !== 'gemini') {
     ws.send(JSON.stringify({ type: 'error', message: 'Invalid agent' }));
     ws.close();
     return;
   }
   if (agent === 'codex' && !codexBin) {
     ws.send(JSON.stringify({ type: 'error', message: 'Codex is not installed' }));
+    ws.close();
+    return;
+  }
+  if (agent === 'gemini' && !geminiBin) {
+    ws.send(JSON.stringify({ type: 'error', message: 'Gemini is not installed' }));
     ws.close();
     return;
   }
@@ -999,6 +1191,7 @@ wss.on('connection', (ws, req) => {
       cwd: projectDirExists ? projectPath : os.homedir(),
       env: {
         ...process.env,
+        ...(agent === 'gemini' ? geminiEnv : {}),
         TERM: 'xterm-256color',
         COLUMNS: String(cols),
         LINES: String(rows),
@@ -1027,6 +1220,12 @@ wss.on('connection', (ws, req) => {
       launchCmd = `${setSize}${codexBin} resume -C ${JSON.stringify(resolvedProject)} ${resume}\n`;
     } else {
       launchCmd = `${setSize}${codexBin} -C ${JSON.stringify(resolvedProject)}\n`;
+    }
+  } else if (agent === 'gemini') {
+    if (resume) {
+      launchCmd = `${setSize}${geminiBin} --sandbox --resume ${resume}\n`;
+    } else {
+      launchCmd = `${setSize}${geminiBin} --sandbox\n`;
     }
   } else {
     const sandboxFlag = `--settings '{"sandbox":{"enabled":true}}'`;
@@ -1111,6 +1310,19 @@ wss.on('connection', (ws, req) => {
           try { ws.send(JSON.stringify({ type: 'ready', termId, sessionId })); } catch {}
         }
       } catch {}
+    } else if (agent === 'gemini') {
+      try {
+        scanGeminiSessions();
+        const session = Array.from(geminiIndex.values())
+          .filter(s => s.cwd === resolvedProject && s.mtime >= sessionStart - 5000)
+          .sort((a, b) => b.mtime - a.mtime)[0];
+        if (session) {
+          sessionId = session.id;
+          const entry = terminals.get(termId);
+          if (entry) entry.sessionId = sessionId;
+          try { ws.send(JSON.stringify({ type: 'ready', termId, sessionId })); } catch {}
+        }
+      } catch {}
     } else {
       if (!encodedDir) return null;
       try {
@@ -1135,6 +1347,29 @@ wss.on('connection', (ws, req) => {
   function getJsonlNamingText() {
     const sid = detectSessionId();
     if (!sid) return null;
+
+    if (agent === 'gemini') {
+      let logsFile = null;
+      for (const entry of geminiIndex.values()) {
+        if (entry.id === sid) { logsFile = entry.logsFile; break; }
+      }
+      if (!logsFile) return null;
+      try {
+        const logs = JSON.parse(fs.readFileSync(logsFile, 'utf8'));
+        const msgs = logs.filter(e => e.sessionId === sid && e.type === 'user' && e.message && !e.message.startsWith('/'))
+                         .map(e => e.message.slice(0, 300).replace(/\n/g, ' ').trim());
+        if (!msgs.length) return null;
+        let text = '';
+        for (const m of msgs) {
+          if (text.length + m.length > 1500) break;
+          text += (text ? ' | ' : '') + m;
+        }
+        return text;
+      } catch {
+        return null;
+      }
+    }
+
     let jsonlPath = null;
     if (agent === 'codex') {
       // Find Codex session file from index
@@ -1219,6 +1454,13 @@ wss.on('connection', (ws, req) => {
       }
       const title = getSummaryText(cacheKey) || (preview && preview.slice(0, 60));
       if (title) ws.send(JSON.stringify({ type: 'title', title }));
+    } else if (agent === 'gemini') {
+      let preview = null;
+      for (const entry of geminiIndex.values()) {
+        if (entry.id === resume) { preview = entry.preview; break; }
+      }
+      const title = getSummaryText(cacheKey) || (preview && preview.slice(0, 60));
+      if (title) ws.send(JSON.stringify({ type: 'title', title }));
     } else if (encodedDir) {
       const jsonlDir = path.join(PROJECTS_DIR, encodedDir);
       const info = getSessionInfo(path.join(jsonlDir, `${resume}.jsonl`));
@@ -1234,6 +1476,10 @@ wss.on('connection', (ws, req) => {
   // Coalesce rapid output chunks into fewer, larger WebSocket frames
   let wsSendBuf = '';
   let wsSendTimer = null;
+  // StringDecoder buffers incomplete multi-byte UTF-8 sequences between chunks,
+  // preventing replacement characters (�) when characters like ▀ are split.
+  const stdoutDecoder = new StringDecoder('utf8');
+  const stderrDecoder = new StringDecoder('utf8');
   const flushWsBuf = () => {
     wsSendTimer = null;
     if (wsSendBuf) {
@@ -1244,7 +1490,8 @@ wss.on('connection', (ws, req) => {
   };
 
   proc.stdout.on('data', data => {
-    const str = data.toString();
+    const str = stdoutDecoder.write(data);
+    if (!str) return; // decoder is buffering an incomplete sequence
     outputBuffer += str;
     if (outputBuffer.length > 2048) outputBuffer = outputBuffer.slice(-2048);
     charsSinceLastRename += str.length;
@@ -1253,14 +1500,20 @@ wss.on('connection', (ws, req) => {
   });
 
   proc.stderr.on('data', data => {
-    wsSendBuf += data.toString();
-    if (!wsSendTimer) wsSendTimer = setTimeout(flushWsBuf, 8);
+    const str = stderrDecoder.write(data);
+    if (str) {
+      wsSendBuf += str;
+      if (!wsSendTimer) wsSendTimer = setTimeout(flushWsBuf, 8);
+    }
   });
 
   proc.on('exit', (code) => {
     sessionEnded = true;
     if (renameTimer) clearTimeout(renameTimer);
-    if (wsSendTimer) { clearTimeout(wsSendTimer); flushWsBuf(); }
+    // Flush any remaining bytes buffered by the StringDecoders
+    const trailing = stdoutDecoder.end() + stderrDecoder.end();
+    if (trailing) wsSendBuf += trailing;
+    if (wsSendTimer) { clearTimeout(wsSendTimer); flushWsBuf(); } else if (wsSendBuf) { flushWsBuf(); }
     try { ws.send(JSON.stringify({ type: 'exit', code: code || 0 })); } catch {}
     terminals.delete(termId);
   });
