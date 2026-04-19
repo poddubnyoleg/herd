@@ -10,7 +10,7 @@ Browse, resume, and manage AI coding sessions across all your projects from a si
 - **Recent sessions** — cross-project "Recent" section showing the 20 most recent sessions
 - **Search/filter** — filter projects by name and sessions by summary/preview text
 - **Session browser** — sessions per project with AI-generated summaries
-- **Terminal tabs** — multiple concurrent Claude Code / Codex terminals with tab management
+- **Terminal tabs** — multiple concurrent Claude Code / Codex / Gemini CLI terminals with tab management
 - **Resume sessions** — click any past session to resume it
 - **Auto-naming** — tabs named by Haiku from terminal output, with stale summary re-generation
 - **Live summary updates** — session names update in real-time via SSE as summaries are generated
@@ -57,6 +57,7 @@ Tests use [Playwright](https://playwright.dev/) for browser-level integration te
 
 - Scans `~/.claude/projects/` for Claude Code session history (JSONL files)
 - Scans `~/.codex/sessions/` for Codex rollout files, merges with Claude projects by working directory
+- Scans `~/.gemini/tmp/` for Gemini CLI logs, merged into the same unified project view
 - Decodes project paths from Claude Code's dash-separated directory naming via a backtracking solver
 - Parses first user message from each session for preview text
 - Uses Claude Haiku to generate 2-4 word session summaries (cached in `summaries.json` with timestamps; stale summaries auto-regenerate)
@@ -71,7 +72,7 @@ Tests use [Playwright](https://playwright.dev/) for browser-level integration te
 - **Backend**: Node.js, Express, WebSocket (`ws`), SSE
 - **Frontend**: Vanilla JS, xterm.js (CDN)
 - **PTY**: macOS `script -q /dev/null` (no native dependencies)
-- **Agents**: Claude Code via `claude` CLI, Codex via `codex` CLI
+- **Agents**: Claude Code via `claude` CLI, Codex via `codex` CLI, Gemini via `gemini` CLI
 - **Naming**: Claude Haiku via `claude` CLI (no API key needed)
 - **Tests**: Playwright
 

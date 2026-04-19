@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-Herd is a web-based terminal multiplexer for Claude Code and Codex sessions. It lets you browse, resume, and manage sessions across all your projects from a single browser tab. It scans `~/.claude/projects/` for Claude Code history and `~/.codex/sessions/` for OpenAI Codex history (JSONL files), merging them into a unified project view.
+Herd is a web-based terminal multiplexer for Claude Code, Codex, and Gemini CLI sessions. It lets you browse, resume, and manage sessions across all your projects from a single browser tab. It scans `~/.claude/projects/` for Claude Code history, `~/.codex/sessions/` for OpenAI Codex history, and `~/.gemini/tmp/` for Gemini CLI logs (JSONL files), merging them into a unified project view.
 
 ## Commands
 
@@ -21,17 +21,18 @@ Single-process Node.js server (`server.js`) serving a vanilla JS frontend (`publ
 
 **Backend (`server.js`):**
 - Express serves static files from `public/` and REST endpoints:
-  - `GET /api/projects` — lists projects from `~/.claude/projects/` and `~/.codex/sessions/`, merged by real path, sorted by name. Lazily prunes stale summary cache entries
+  - `GET /api/projects` — lists projects from `~/.claude/projects/`, `~/.codex/sessions/`, and `~/.gemini/tmp/`, merged by real path, sorted by name. Lazily prunes stale summary cache entries
   - `GET /api/projects/:id/sessions` — returns `{ sessions, total, truncated }` (max 30 sessions). Path traversal is blocked by validating resolved path stays inside `PROJECTS_DIR`
-  - `GET /api/sessions?project=<realPath>` — unified sessions endpoint that works with real paths (also serves Codex sessions for the project)
-  - `GET /api/recent-sessions?limit=N` — most recent sessions across all projects (both Claude and Codex), max 50
+  - `GET /api/sessions?project=<realPath>` — unified sessions endpoint that works with real paths (also serves Codex and Gemini sessions for the project)
+  - `GET /api/recent-sessions?limit=N` — most recent sessions across all projects (Claude, Codex, and Gemini), max 50
   - `GET /api/token-usage` — 30-day token usage/cost breakdown by model and day, computed from JSONL usage data. Includes model-specific pricing (Opus, Sonnet, Haiku) with cache tier breakdowns. Cached for 5 minutes
   - `GET /api/summary-events` — SSE stream for real-time summary updates (session names update in-place without re-rendering)
   - `POST /api/regenerate-summaries` — force re-generation of summaries (single session, per-project, or all)
   - `GET /api/pick-folder` — triggers native macOS folder picker via `osascript` for adding arbitrary project directories
-- WebSocket server (`noServer: true`) only upgrades connections on `/ws` path. Spawns terminal processes via macOS `script -q /dev/null` as a PTY wrapper (no native node-pty dependency). Supports `agent=claude` and `agent=codex` parameters. New sessions launch `claude`/`codex` directly; resumed sessions use `--resume <id>`
-- Claude and Codex binaries resolved once at startup from common paths or `which`
+- WebSocket server (`noServer: true`) only upgrades connections on `/ws` path. Spawns terminal processes via macOS `script -q /dev/null` as a PTY wrapper (no native node-pty dependency). Supports `agent=claude`, `agent=codex`, and `agent=gemini` parameters. New sessions launch `claude`/`codex`/`gemini` directly; resumed sessions use `--resume <id>`
+- Claude, Codex, and Gemini binaries resolved once at startup from common paths or `which`
 - Codex integration: scans `~/.codex/sessions/YYYY/MM/DD/*.jsonl` for Codex rollout files. Parses `session_meta` and `event_msg` entries to extract session IDs, cwds, and previews. Cached by `(filePath, mtimeMs)` for incremental rescans
+- Gemini integration: scans `~/.gemini/tmp/<project-hash>/logs.json` files. Groups entries by session ID, extracts cwd and preview from message history. Cached by `(filePath, mtimeMs)`. Loads `~/.gemini/.env` into a scoped object (not `process.env`) to avoid side-effects
 - Project paths are encoded/decoded between the filesystem dash-separated format in `~/.claude/projects/` and real paths using a backtracking solver (`decodeProjectPath`) that validates against the actual filesystem. `findEncodedDir()` reverse-lookups the encoded directory name for a given real path
 - Security: binds to `127.0.0.1` by default (configurable via `HOST` env var), sets `X-Content-Type-Options` and `X-Frame-Options` headers, validates `resume` parameter as UUID format
 - Haiku summaries: spawns `claude -p --model haiku` to generate 2-4 word session names (no API key needed), cached in `summaries.json` on disk with timestamps. Background-generates missing summaries when sessions are fetched. Stale summaries (session modified after generation, with 5-min cooldown) are automatically re-generated. Tracks in-flight requests to prevent duplicate calls
@@ -48,7 +49,7 @@ Single-process Node.js server (`server.js`) serving a vanilla JS frontend (`publ
 - Terminal auto-refit: each terminal uses a `ResizeObserver` on its container to refit on any size change (window resize, sidebar drag, etc.)
 - Smart scroll: output writes preserve scroll position when the user has scrolled up; auto-scrolls only when already at the bottom
 - "+" button in tab bar creates a new session in the most recent active project
-- Recent sessions: "Recent" section at top of sidebar shows 20 most recent sessions across all projects with project labels, supports both Claude and Codex
+- Recent sessions: "Recent" section at top of sidebar shows 20 most recent sessions across all projects with project labels, supports Claude, Codex, and Gemini
 - SSE live updates: listens on `/api/summary-events` via EventSource; updates session names in-place in both project and recent sections without full re-render
 - Token usage badge: sidebar header shows 30-day cost/token summary; clicking opens a popup with per-model breakdown, stats (tokens, sessions, API calls), and a 14-day daily cost sparkline chart
 - Add project button: "+" in sidebar header opens native macOS folder picker to add arbitrary project directories
@@ -69,5 +70,5 @@ Single-process Node.js server (`server.js`) serving a vanilla JS frontend (`publ
 - **No bundler**: vanilla JS served directly, xterm from CDN
 - **Localhost only by default**: no auth, so binds to `127.0.0.1`. Override with `HOST` env var
 - **No API key needed**: Haiku summaries use the `claude` CLI (`claude -p --model haiku`), which handles its own auth
-- **Multi-agent**: Claude Code and Codex sessions are unified under the same project view. Sessions are namespaced by agent (`claude`/`codex`) in the summary cache and WebSocket protocol
+- **Multi-agent**: Claude Code, Codex, and Gemini CLI sessions are unified under the same project view. Sessions are namespaced by agent (`claude`/`codex`/`gemini`) in the summary cache and WebSocket protocol (Claude uses plain IDs for backward compat)
 - **Token usage is estimated**: costs are computed from JSONL usage fields using hardcoded model pricing, not from actual billing. Labeled "API equivalent" in the UI
