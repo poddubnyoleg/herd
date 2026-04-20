@@ -304,7 +304,7 @@ class Herd {
       if (btn.disabled) return;
       btn.disabled = true;
       try {
-        const res = await fetch('/api/pick-folder');
+        const res = await fetch('/api/pick-folder', { method: 'POST' });
         const data = await res.json();
         if (data.cancelled || !data.path) return;
         this.createTab(data.path, data.name);

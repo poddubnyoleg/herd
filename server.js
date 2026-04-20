@@ -38,9 +38,29 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 
-// B4: Only upgrade WebSocket on /ws path
+// C1/C1b: Origin allowlist. Browsers attach an Origin header on cross-origin
+// requests; non-browser clients (curl, local scripts) do not. Since Herd binds
+// to 127.0.0.1 by default, missing/null Origin is accepted — browser attackers
+// cannot suppress Origin, so this is not a bypass. For reverse-proxy / HTTPS
+// deployments, operators set ALLOWED_ORIGINS (comma-separated) explicitly.
+function allowedOriginList() {
+  if (process.env.ALLOWED_ORIGINS) {
+    return process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim()).filter(Boolean);
+  }
+  return [`http://localhost:${PORT}`, `http://127.0.0.1:${PORT}`];
+}
+function originAllowed(origin) {
+  if (!origin || origin === 'null') return true; // non-browser / file:// clients
+  return allowedOriginList().some(a => origin === a); // exact match, not startsWith
+}
+
+// B4 + C1: Only upgrade WebSocket on /ws path, and reject disallowed origins.
 server.on('upgrade', (req, socket, head) => {
   if (new URL(req.url, 'http://localhost').pathname !== '/ws') {
+    socket.destroy();
+    return;
+  }
+  if (!originAllowed(req.headers.origin)) {
     socket.destroy();
     return;
   }
@@ -51,6 +71,18 @@ server.on('upgrade', (req, socket, head) => {
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
+  next();
+});
+
+// C1b: Origin-check state-changing or expensive/side-effectful routes.
+// Also covers expensive idempotent GETs that would otherwise be
+// cross-origin DoS/UX-abuse vectors (token-usage scans all JSONL).
+const GUARDED_GET_PATHS = new Set(['/api/token-usage']);
+app.use((req, res, next) => {
+  const guarded = req.method !== 'GET' || GUARDED_GET_PATHS.has(req.path);
+  if (guarded && !originAllowed(req.headers.origin)) {
+    return res.status(403).end();
+  }
   next();
 });
 
@@ -1383,7 +1415,9 @@ function serveSessions(res, projectPath) {
   generateMissingSummaries(sessions).catch(() => {});
 }
 
-app.get('/api/pick-folder', (req, res) => {
+// C1b: POST (state-changing: invokes osascript to pop a native dialog).
+// The generic middleware above origin-checks all non-GET requests.
+app.post('/api/pick-folder', (req, res) => {
   execFile('osascript', ['-e', 'POSIX path of (choose folder)'], { timeout: 60000 }, (err, stdout) => {
     if (err) {
       // User cancelled the dialog
