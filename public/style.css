@@ -280,7 +280,7 @@ body {
 }
 
 /* Provider badges */
-.badge-claude, .badge-codex, .badge-gemini {
+.badge-claude, .badge-codex, .badge-gemini, .badge-pi {
   display: inline-block;
   flex-shrink: 0;
   vertical-align: middle;
@@ -289,13 +289,13 @@ body {
 .badge-claude {
   width: 6px;
   height: 6px;
-  border-radius: 50%;
+  border-radius: 1px;
 }
 
 .badge-codex {
   width: 6px;
   height: 6px;
-  border-radius: 1px;
+  border-radius: 50%;
 }
 
 .badge-gemini {
@@ -320,6 +320,22 @@ body {
 
 .badge-claude { background: #d97706; }
 .badge-codex { background: #3b82f6; }
+.badge-pi {
+  display: inline-block;
+  flex-shrink: 0;
+  vertical-align: middle;
+  color: #000000;
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 6px;
+  text-align: center;
+  width: 6px;
+  height: 6px;
+}
+
+.badge-pi::before {
+  content: "π";
+}
 
 .new-session-actions {
   display: flex;

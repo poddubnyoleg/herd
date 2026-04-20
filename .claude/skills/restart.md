@@ -5,10 +5,21 @@ user_invocable: true
 
 # Restart Herd
 
-Kill any running Herd server and start a fresh instance using a single command:
+Use the repo's restart script:
 
-```
-lsof -ti:3456 | xargs kill -9 2>/dev/null; node /Users/pd/Documents/herd/server.js &
+```bash
+bash ./scripts/restart-herd.sh
 ```
 
-Run this via Bash with `run_in_background: true`, then after 2 seconds verify with `lsof -i:3456 -sTCP:LISTEN` and report the result.
+Then verify the restart:
+
+```bash
+lsof -iTCP:3456 -sTCP:LISTEN
+tail -n 20 /tmp/herd.log
+```
+
+Rules:
+
+- Prefer the repo script over ad hoc restart snippets.
+- Run the restart as a single foreground Bash call. NEVER use `run_in_background` — it kills child processes on cleanup.
+- Report whether port `3456` is listening and point the user to `/tmp/herd.log` for server output.

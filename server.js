@@ -31,6 +31,8 @@ const CLAUDE_DIR = path.join(os.homedir(), '.claude');
 const PROJECTS_DIR = path.join(CLAUDE_DIR, 'projects');
 const CODEX_SESSIONS_DIR = path.join(os.homedir(), '.codex', 'sessions');
 const GEMINI_TMP_DIR = path.join(os.homedir(), '.gemini', 'tmp');
+const PI_DIR = path.join(os.homedir(), '.pi', 'agent');
+const PI_SESSIONS_DIR = path.join(PI_DIR, 'sessions');
 
 const app = express();
 const server = http.createServer(app);
@@ -85,6 +87,14 @@ const geminiBin = (() => {
   catch { return null; }
 })();
 console.log(`  Gemini binary: ${geminiBin || '(not installed)'}`);
+
+// Resolve pi binary once at startup
+const piBin = (() => {
+  const { execSync } = require('child_process');
+  try { return execSync('/bin/sh -lc "which pi"', { encoding: 'utf8' }).trim(); }
+  catch { return null; }
+})();
+console.log(`  Pi binary: ${piBin || '(not installed)'}`);
 
 // --- Codex rollout index ---
 // Scans ~/.codex/sessions/**/*.jsonl, reads line 1 (session_meta) to extract cwd/id.
@@ -298,6 +308,128 @@ function scanGeminiSessions() {
 
 // Initial scan
 scanGeminiSessions();
+
+// --- Pi session index ---
+const piIndex = new Map(); // filePath -> { id, cwd, mtime, date, preview, jsonlPath }
+
+function scanPiSessions() {
+  if (!piBin) return;
+  try { fs.statSync(PI_SESSIONS_DIR); } catch { return; }
+
+  const seen = new Set();
+  const dirs = readdirSafe(PI_SESSIONS_DIR);
+
+  for (const dirName of dirs) {
+    const projDir = path.join(PI_SESSIONS_DIR, dirName);
+    if (!isDir(projDir)) continue;
+
+    for (const file of readdirSafe(projDir)) {
+      if (!file.endsWith('.jsonl')) continue;
+      const filePath = path.join(projDir, file);
+      seen.add(filePath);
+      try {
+        const stat = fs.statSync(filePath);
+        const cached = piIndex.get(filePath);
+        if (cached && cached.mtime === stat.mtimeMs) continue;
+        const info = parsePiSession(filePath, stat);
+        if (info) piIndex.set(filePath, info);
+      } catch {}
+    }
+  }
+
+  // Prune deleted files
+  for (const key of piIndex.keys()) {
+    if (!seen.has(key)) piIndex.delete(key);
+  }
+}
+
+function parsePiSession(filePath, stat) {
+  const fd = fs.openSync(filePath, 'r');
+  try {
+    const CHUNK_SIZE = 65536;
+    const MAX_LINES = 25;
+    const lines = [];
+    let remainder = '';
+    let offset = 0;
+    while (lines.length < MAX_LINES) {
+      const buf = Buffer.alloc(CHUNK_SIZE);
+      const bytesRead = fs.readSync(fd, buf, 0, CHUNK_SIZE, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+      const chunk = remainder + buf.toString('utf8', 0, bytesRead);
+      const parts = chunk.split('\n');
+      remainder = parts.pop();
+      for (const part of parts) {
+        if (part.trim()) lines.push(part);
+        if (lines.length >= MAX_LINES) break;
+      }
+    }
+
+    let id = null, cwd = null, preview = null, sessionName = null;
+
+    for (const line of lines) {
+      try {
+        const entry = JSON.parse(line);
+
+        // Session header: extract ID and CWD
+        if (entry.type === 'session') {
+          id = entry.id;
+          cwd = entry.cwd;
+        }
+
+        // User-set session name (takes priority over preview)
+        if (entry.type === 'session_info' && entry.name) {
+          sessionName = entry.name;
+        }
+
+        // First user message for preview
+        if (!preview && entry.type === 'message' && entry.message?.role === 'user') {
+          const content = entry.message.content;
+          let text = '';
+          if (typeof content === 'string') text = content;
+          else if (Array.isArray(content)) {
+            text = content
+              .filter(c => c.type === 'text')
+              .map(c => c.text)
+              .join(' ');
+          }
+          if (text && text.length > 3) {
+            preview = text.slice(0, 150).replace(/\n/g, ' ').trim();
+          }
+        }
+      } catch {}
+    }
+
+    if (!id || !cwd) return null;
+
+    let realCwd = cwd;
+    try { realCwd = fs.realpathSync(cwd); } catch {}
+
+    return {
+      id,
+      cwd: realCwd,
+      mtime: stat.mtimeMs,
+      date: stat.mtime.toISOString(),
+      preview: sessionName || preview,
+      jsonlPath: filePath,
+    };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// Decode pi's --<dashed-path>-- encoding to a real filesystem path.
+// Pi uses double-dash prefix AND suffix around the encoded path.
+function decodePiProjectPath(encoded) {
+  let raw = encoded;
+  if (raw.startsWith('--')) raw = raw.slice(2);
+  if (raw.endsWith('--')) raw = raw.slice(0, -2);
+  // Reuse Claude's backtracking decoder on the stripped path
+  return decodeProjectPath(raw);
+}
+
+// Initial scan
+scanPiSessions();
 
 // --- Path decoding ---
 
@@ -555,6 +687,7 @@ const summarizing = new Set();
 function summaryCacheKey(agent, id) {
   if (agent === 'codex') return `codex:${id}`;
   if (agent === 'gemini') return `gemini:${id}`;
+  if (agent === 'pi') return `pi:${id}`;
   return id;
 }
 
@@ -581,6 +714,51 @@ function broadcastSummaryUpdate(sessionId, agent, summary) {
 }
 
 // Build richer naming text from all user messages in a JSONL file
+
+// Extract user messages from a pi session JSONL file.
+// Pi's entry wrapping ({type:"message", message:{role, content}}) differs from Claude's
+// format, so a dedicated parser is cleaner than branching inside getUserMessages.
+function getPiUserMessages(jsonlPath, maxBytes = 256 * 1024) {
+  const messages = [];
+  try {
+    const fd = fs.openSync(jsonlPath, 'r');
+    try {
+      const buf = Buffer.alloc(Math.min(65536, maxBytes));
+      let remainder = '';
+      let offset = 0;
+      let totalRead = 0;
+      while (totalRead < maxBytes) {
+        const bytesRead = fs.readSync(fd, buf, 0, buf.length, offset);
+        if (bytesRead === 0) break;
+        offset += bytesRead;
+        totalRead += bytesRead;
+        const chunk = remainder + buf.toString('utf8', 0, bytesRead);
+        const parts = chunk.split('\n');
+        remainder = parts.pop();
+        for (const part of parts) {
+          if (!part.trim()) continue;
+          try {
+            const entry = JSON.parse(part);
+            if (entry.type !== 'message' || entry.message?.role !== 'user') continue;
+            const content = entry.message.content;
+            let text = '';
+            if (typeof content === 'string') text = content;
+            else if (Array.isArray(content)) {
+              text = content.filter(c => c.type === 'text').map(c => c.text).join(' ');
+            }
+            if (text && text.length > 3 && !text.startsWith('You are a')) {
+              messages.push(text.slice(0, 300).replace(/\n/g, ' ').trim());
+            }
+          } catch {}
+        }
+      }
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {}
+  return messages;
+}
+
 function getNamingText(session) {
   if (session.agent === 'gemini' && session.logsFile) {
     try {
@@ -596,6 +774,18 @@ function getNamingText(session) {
         if (text.length >= 10) return text;
       }
     } catch {}
+  }
+  if (session.agent === 'pi' && session.jsonlPath) {
+    const msgs = getPiUserMessages(session.jsonlPath);
+    if (msgs.length) {
+      let text = '';
+      for (const m of msgs) {
+        if (text.length + m.length > 1500) break;
+        text += (text ? ' | ' : '') + m;
+      }
+      if (text.length >= 10) return text;
+    }
+    return session.preview;
   }
   if (session.jsonlPath) {
     const msgs = getUserMessages(session.jsonlPath);
@@ -813,6 +1003,7 @@ app.get('/api/projects', (req, res) => {
     // Rescan Codex and Gemini sessions for fresh data
     scanCodexSessions();
     scanGeminiSessions();
+    scanPiSessions();
 
     const projectMap = new Map(); // realPath -> project info
 
@@ -853,7 +1044,7 @@ app.get('/api/projects', (req, res) => {
       } else {
         projectMap.set(key, {
           path: key, name: getProjectName(key), exists,
-          claudeCount: jsonls.length, codexCount: 0, geminiCount: 0, latestMtime,
+          claudeCount: jsonls.length, codexCount: 0, geminiCount: 0, piCount: 0, latestMtime,
           claudeEncoded: encoded,
         });
       }
@@ -870,7 +1061,7 @@ app.get('/api/projects', (req, res) => {
         const exists = fs.existsSync(key);
         projectMap.set(key, {
           path: key, name: getProjectName(key), exists,
-          claudeCount: 0, codexCount: 1, geminiCount: 0, latestMtime: entry.mtime,
+          claudeCount: 0, codexCount: 1, geminiCount: 0, piCount: 0, latestMtime: entry.mtime,
           claudeEncoded: null,
         });
       }
@@ -887,7 +1078,24 @@ app.get('/api/projects', (req, res) => {
         const exists = fs.existsSync(key);
         projectMap.set(key, {
           path: key, name: getProjectName(key), exists,
-          claudeCount: 0, codexCount: 0, geminiCount: 1, latestMtime: entry.mtime,
+          claudeCount: 0, codexCount: 0, geminiCount: 1, piCount: 0, latestMtime: entry.mtime,
+          claudeEncoded: null,
+        });
+      }
+    }
+
+    // Pi projects grouped by cwd
+    for (const entry of piIndex.values()) {
+      const key = canon(entry.cwd);
+      const existing = projectMap.get(key);
+      if (existing) {
+        existing.piCount++;
+        if (entry.mtime > existing.latestMtime) existing.latestMtime = entry.mtime;
+      } else {
+        const exists = fs.existsSync(key);
+        projectMap.set(key, {
+          path: key, name: getProjectName(key), exists,
+          claudeCount: 0, codexCount: 0, geminiCount: 0, piCount: 1, latestMtime: entry.mtime,
           claudeEncoded: null,
         });
       }
@@ -898,10 +1106,11 @@ app.get('/api/projects', (req, res) => {
         path: p.path,
         name: p.name,
         exists: p.exists,
-        sessionCount: p.claudeCount + p.codexCount + p.geminiCount,
+        sessionCount: p.claudeCount + p.codexCount + p.geminiCount + p.piCount,
         latestMtime: p.latestMtime,
         codexAvailable: !!codexBin,
         geminiAvailable: !!geminiBin,
+        piAvailable: !!piBin,
         // Keep encoded id for backward compat with session endpoint
         id: p.claudeEncoded || null,
       }))
@@ -927,6 +1136,9 @@ app.get('/api/projects', (req, res) => {
     }
     for (const entry of geminiIndex.values()) {
       allSessionKeys.add(`gemini:${entry.id}`);
+    }
+    for (const entry of piIndex.values()) {
+      allSessionKeys.add(`pi:${entry.id}`);
     }
     let pruned = false;
     for (const key of Object.keys(summaryCache)) {
@@ -955,6 +1167,7 @@ app.get('/api/sessions', (req, res) => {
 app.get('/api/recent-sessions', (req, res) => {
   try {
     scanCodexSessions();
+    scanPiSessions();
     const limit = Math.min(parseInt(req.query.limit) || 20, 50);
     const allSessions = [];
 
@@ -1015,6 +1228,19 @@ app.get('/api/recent-sessions', (req, res) => {
       });
     }
 
+    // Pi sessions
+    for (const entry of piIndex.values()) {
+      const key = summaryCacheKey('pi', entry.id);
+      if (!entry.preview) continue;
+      const canonical = canon(entry.cwd);
+      allSessions.push({
+        id: entry.id, agent: 'pi', date: entry.date, mtime: entry.mtime,
+        preview: entry.preview,
+        summary: getSummaryText(key),
+        projectPath: canonical, projectName: getProjectName(canonical),
+      });
+    }
+
     allSessions.sort((a, b) => b.mtime - a.mtime);
     const sessions = allSessions.slice(0, limit);
     res.json(sessions);
@@ -1036,6 +1262,8 @@ app.post('/api/regenerate-summaries', (req, res) => {
     if (summaryCache[codexKey]) { delete summaryCache[codexKey]; cleared++; }
     const geminiKey = `gemini:${sessionId}`;
     if (summaryCache[geminiKey]) { delete summaryCache[geminiKey]; cleared++; }
+    const piKey = `pi:${sessionId}`;
+    if (summaryCache[piKey]) { delete summaryCache[piKey]; cleared++; }
   } else if (projectId) {
     // Clear all sessions for a project
     const projectDir = path.join(PROJECTS_DIR, projectId);
@@ -1132,6 +1360,18 @@ function serveSessions(res, projectPath) {
     });
   }
 
+  // Pi sessions
+  for (const entry of piIndex.values()) {
+    if (entry.cwd !== projectPath && canonOf(entry.cwd) !== canonQuery) continue;
+    const key = summaryCacheKey('pi', entry.id);
+    allSessions.push({
+      id: entry.id, agent: 'pi', date: entry.date, mtime: entry.mtime,
+      preview: entry.preview,
+      summary: getSummaryText(key),
+      jsonlPath: entry.jsonlPath,
+    });
+  }
+
   // Sort by recency, filter, truncate
   allSessions.sort((a, b) => b.mtime - a.mtime);
   const totalCount = allSessions.length;
@@ -1169,7 +1409,7 @@ wss.on('connection', (ws, req) => {
   const rows = parseInt(params.get('rows')) || 30;
 
   // Validate agent
-  if (agent !== 'claude' && agent !== 'codex' && agent !== 'gemini') {
+  if (agent !== 'claude' && agent !== 'codex' && agent !== 'gemini' && agent !== 'pi') {
     ws.send(JSON.stringify({ type: 'error', message: 'Invalid agent' }));
     ws.close();
     return;
@@ -1181,6 +1421,11 @@ wss.on('connection', (ws, req) => {
   }
   if (agent === 'gemini' && !geminiBin) {
     ws.send(JSON.stringify({ type: 'error', message: 'Gemini is not installed' }));
+    ws.close();
+    return;
+  }
+  if (agent === 'pi' && !piBin) {
+    ws.send(JSON.stringify({ type: 'error', message: 'Pi is not installed' }));
     ws.close();
     return;
   }
@@ -1259,6 +1504,12 @@ wss.on('connection', (ws, req) => {
       launchCmd = `${setSize}${geminiBin} --sandbox --resume ${resume}\n`;
     } else {
       launchCmd = `${setSize}${geminiBin} --sandbox\n`;
+    }
+  } else if (agent === 'pi') {
+    if (resume) {
+      launchCmd = `${setSize}${piBin} --session ${resume}\n`;
+    } else {
+      launchCmd = `${setSize}${piBin}\n`;
     }
   } else {
     const sandboxFlag = `--settings '{"sandbox":{"enabled":true}}'`;
@@ -1356,6 +1607,42 @@ wss.on('connection', (ws, req) => {
           try { ws.send(JSON.stringify({ type: 'ready', termId, sessionId })); } catch {}
         }
       } catch {}
+    } else if (agent === 'pi') {
+      try {
+        scanPiSessions();
+        const piDirs = readdirSafe(PI_SESSIONS_DIR);
+        for (const dirName of piDirs) {
+          let decoded;
+          try { decoded = decodePiProjectPath(dirName); } catch { continue; }
+          if (decoded !== resolvedProject) continue;
+          const projDir = path.join(PI_SESSIONS_DIR, dirName);
+          const files = readdirSafe(projDir)
+            .filter(f => f.endsWith('.jsonl'))
+            .map(f => {
+              const filePath = path.join(projDir, f);
+              try {
+                const stat = fs.statSync(filePath);
+                return { name: f, path: filePath, mtime: stat.mtimeMs };
+              } catch { return null; }
+            })
+            .filter(f => f && f.mtime >= sessionStart - 5000)
+            .sort((a, b) => b.mtime - a.mtime);
+          if (files.length > 0) {
+            // Read first line to get session ID
+            try {
+              const headerLine = fs.readFileSync(files[0].path, 'utf8').split('\n')[0];
+              const header = JSON.parse(headerLine);
+              if (header.type === 'session' && header.id) {
+                sessionId = header.id;
+                const entry = terminals.get(termId);
+                if (entry) entry.sessionId = sessionId;
+                try { ws.send(JSON.stringify({ type: 'ready', termId, sessionId })); } catch {}
+              }
+            } catch {}
+          }
+          break; // Found the matching project dir
+        }
+      } catch {}
     } else {
       if (!encodedDir) return null;
       try {
@@ -1409,11 +1696,16 @@ wss.on('connection', (ws, req) => {
       for (const [fp, entry] of codexIndex.entries()) {
         if (entry.id === sid) { jsonlPath = fp; break; }
       }
+    } else if (agent === 'pi') {
+      // Find Pi session file from index
+      for (const [fp, entry] of piIndex.entries()) {
+        if (entry.id === sid) { jsonlPath = fp; break; }
+      }
     } else if (encodedDir) {
       jsonlPath = path.join(PROJECTS_DIR, encodedDir, `${sid}.jsonl`);
     }
     if (!jsonlPath) return null;
-    const msgs = getUserMessages(jsonlPath);
+    const msgs = agent === 'pi' ? getPiUserMessages(jsonlPath) : getUserMessages(jsonlPath);
     if (!msgs.length) return null;
     // Include all user messages, truncated to ~1500 chars total
     let text = '';
@@ -1490,6 +1782,13 @@ wss.on('connection', (ws, req) => {
     } else if (agent === 'gemini') {
       let preview = null;
       for (const entry of geminiIndex.values()) {
+        if (entry.id === resume) { preview = entry.preview; break; }
+      }
+      const title = getSummaryText(cacheKey) || (preview && preview.slice(0, 60));
+      if (title) ws.send(JSON.stringify({ type: 'title', title }));
+    } else if (agent === 'pi') {
+      let preview = null;
+      for (const entry of piIndex.values()) {
         if (entry.id === resume) { preview = entry.preview; break; }
       }
       const title = getSummaryText(cacheKey) || (preview && preview.slice(0, 60));

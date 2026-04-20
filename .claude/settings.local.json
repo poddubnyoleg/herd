@@ -3,7 +3,7 @@
     "allow": [
       "Bash(node -c public/app.js)",
       "Bash(xargs kill:*)",
-      "Bash(node /Users/pd/Documents/claude-hub/server.js)",
+      "Bash(node /Users/pd/Documents/Personal/herd/server.js)",
       "Bash(sed -n '39,98p' server.js)",
       "Bash(node -e ':*)",
       "Bash(node:*)",
@@ -68,7 +68,8 @@
       "WebFetch(domain:release-assets.githubusercontent.com)",
       "Bash(file node_modules/node-pty/build/Release/*.node node_modules/node-pty/build/Release/spawn-helper)",
       "Bash(xattr node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper)",
-      "Bash(codesign -dv node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper)"
+      "Bash(codesign -dv node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper)",
+      "WebFetch(domain:openrouter.ai)"
     ]
   },
   "sandbox": {

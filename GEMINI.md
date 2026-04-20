@@ -8,10 +8,10 @@ Herd is a web-based terminal multiplexer for Claude Code, OpenAI Codex, and Gemi
 ## Core tasks & behaviors
 - **Restart server from Gemini CLI**: The server runs on port 3456. To restart it correctly, run `lsof -ti:3456 | xargs kill -9 2>/dev/null; while lsof -ti:3456 >/dev/null 2>&1; do sleep 0.3; done; nohup node server.js > /tmp/herd.log 2>&1 &` — must be a single foreground Bash call.
 - **NEVER use `npm restart`** — the package.json script uses kill, but we need the loop + nohup to avoid the web session being killed.
-- **Do not introduce a native `node-pty` dependency** — Herd intentionally uses macOS `script -q /dev/null` as a PTY wrapper to avoid native build issues.
+- **`node-pty` is used for PTY** — Herd migrated from macOS `script` to `node-pty` for real PTY support with proper resize (`TIOCSWINSZ`). macOS 26 tightened `script` so it errors when stdin isn't a TTY.
 
 ## File structure
-- `server.js` — Node.js Express/WebSocket backend. Serves the web UI, scans CLI session directories, handles WebSocket upgrades, and spawns terminal processes via `script`.
+- `server.js` — Node.js Express/WebSocket backend. Serves the web UI, scans CLI session directories, handles WebSocket upgrades, and spawns terminal processes via `node-pty`.
 - `public/` — Frontend vanilla JS (`app.js`), CSS (`style.css`), and HTML (`index.html`). No build step.
 - `scripts/` — Helper bash scripts.
 - `summaries.json` — Local cache for Haiku-generated session summaries. Never edit manually.

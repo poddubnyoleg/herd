@@ -57,6 +57,8 @@ class Herd {
     this.searchQuery = '';
     this.sessionCache = new Map(); // projectPath -> sessions array
     this.codexAvailable = false;
+    this.geminiAvailable = false;
+    this.piAvailable = false;
     this.init();
   }
 
@@ -320,6 +322,7 @@ class Herd {
       this.projects = await res.json();
       this.codexAvailable = this.projects.some(p => p.codexAvailable);
       this.geminiAvailable = this.projects.some(p => p.geminiAvailable);
+      this.piAvailable = this.projects.some(p => p.piAvailable);
       this.renderProjects();
       this.loadRecentSessions();
     } catch (err) {
@@ -582,8 +585,11 @@ class Herd {
     const geminiBtn = this.geminiAvailable
       ? '<button class="new-session-btn new-session-gemini" data-agent="gemini"><span class="badge-gemini"></span> gemini</button>'
       : '';
+    const piBtn = this.piAvailable
+      ? '<button class="new-session-btn new-session-pi" data-agent="pi"><span class="badge-pi"></span> pi</button>'
+      : '';
     container.innerHTML = `
-      ${projectExists ? `<div class="new-session-actions"><button class="new-session-btn new-session-claude" data-agent="claude"><span class="badge-claude"></span> claude</button>${codexBtn}${geminiBtn}</div>` : ''}
+      ${projectExists ? `<div class="new-session-actions"><button class="new-session-btn new-session-claude" data-agent="claude"><span class="badge-claude"></span> claude</button>${codexBtn}${geminiBtn}${piBtn}</div>` : ''}
       ${sessions.map(s => `
         <div class="session-item" data-sid="${s.id}" data-agent="${s.agent || 'claude'}" title="${this.esc(s.preview || '')}">
           <span class="badge-${s.agent || 'claude'}"></span>
