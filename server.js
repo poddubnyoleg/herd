@@ -1,12 +1,12 @@
 const express = require('express');
 const http = require('http');
 const { WebSocketServer } = require('ws');
-const { spawn, execFile } = require('child_process');
+const { execFile } = require('child_process');
 const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
-const { StringDecoder } = require('string_decoder');
+const pty = require('node-pty');
 
 // Load ~/.gemini/.env into a scoped object (not process.env) to avoid side-effects
 const geminiEnv = {};
@@ -816,6 +816,12 @@ app.get('/api/projects', (req, res) => {
 
     const projectMap = new Map(); // realPath -> project info
 
+    // Normalize to canonical real path so symlinked aliases (e.g.
+    // ~/Documents/herd → ~/Documents/Personal/herd) collapse into one entry.
+    const canon = p => {
+      try { return fs.realpathSync(p); } catch { return p; }
+    };
+
     // Claude projects from ~/.claude/projects/
     const dirs = fs.readdirSync(PROJECTS_DIR).filter(d => {
       try { return fs.statSync(path.join(PROJECTS_DIR, d)).isDirectory(); }
@@ -825,6 +831,7 @@ app.get('/api/projects', (req, res) => {
     for (const encoded of dirs) {
       const decoded = decodeProjectPath(encoded);
       const exists = fs.existsSync(decoded);
+      const key = exists ? canon(decoded) : decoded;
       const projDir = path.join(PROJECTS_DIR, encoded);
       const jsonls = fs.readdirSync(projDir).filter(f => f.endsWith('.jsonl'));
       if (jsonls.length === 0) continue;
@@ -837,23 +844,32 @@ app.get('/api/projects', (req, res) => {
         } catch {}
       }
 
-      projectMap.set(decoded, {
-        path: decoded, name: getProjectName(decoded), exists,
-        claudeCount: jsonls.length, codexCount: 0, geminiCount: 0, latestMtime,
-        claudeEncoded: encoded,
-      });
+      const existing = projectMap.get(key);
+      if (existing) {
+        existing.claudeCount += jsonls.length;
+        if (latestMtime > existing.latestMtime) existing.latestMtime = latestMtime;
+        // Prefer an encoded dir whose decoded path matches the canonical key
+        if (!existing.claudeEncoded || decoded === key) existing.claudeEncoded = encoded;
+      } else {
+        projectMap.set(key, {
+          path: key, name: getProjectName(key), exists,
+          claudeCount: jsonls.length, codexCount: 0, geminiCount: 0, latestMtime,
+          claudeEncoded: encoded,
+        });
+      }
     }
 
     // Codex projects grouped by cwd
     for (const entry of codexIndex.values()) {
-      const existing = projectMap.get(entry.cwd);
+      const key = canon(entry.cwd);
+      const existing = projectMap.get(key);
       if (existing) {
         existing.codexCount++;
         if (entry.mtime > existing.latestMtime) existing.latestMtime = entry.mtime;
       } else {
-        const exists = fs.existsSync(entry.cwd);
-        projectMap.set(entry.cwd, {
-          path: entry.cwd, name: getProjectName(entry.cwd), exists,
+        const exists = fs.existsSync(key);
+        projectMap.set(key, {
+          path: key, name: getProjectName(key), exists,
           claudeCount: 0, codexCount: 1, geminiCount: 0, latestMtime: entry.mtime,
           claudeEncoded: null,
         });
@@ -862,14 +878,15 @@ app.get('/api/projects', (req, res) => {
 
     // Gemini projects grouped by cwd
     for (const entry of geminiIndex.values()) {
-      const existing = projectMap.get(entry.cwd);
+      const key = canon(entry.cwd);
+      const existing = projectMap.get(key);
       if (existing) {
         existing.geminiCount++;
         if (entry.mtime > existing.latestMtime) existing.latestMtime = entry.mtime;
       } else {
-        const exists = fs.existsSync(entry.cwd);
-        projectMap.set(entry.cwd, {
-          path: entry.cwd, name: getProjectName(entry.cwd), exists,
+        const exists = fs.existsSync(key);
+        projectMap.set(key, {
+          path: key, name: getProjectName(key), exists,
           claudeCount: 0, codexCount: 0, geminiCount: 1, latestMtime: entry.mtime,
           claudeEncoded: null,
         });
@@ -946,8 +963,11 @@ app.get('/api/recent-sessions', (req, res) => {
     try { dirs = fs.readdirSync(PROJECTS_DIR).filter(d => { try { return fs.statSync(path.join(PROJECTS_DIR, d)).isDirectory(); } catch { return false; } }); }
     catch { dirs = []; }
 
+    const canon = p => { try { return fs.realpathSync(p); } catch { return p; } };
+
     for (const encoded of dirs) {
       const decoded = decodeProjectPath(encoded);
+      const canonical = canon(decoded);
       const projDir = path.join(PROJECTS_DIR, encoded);
       try {
         const files = fs.readdirSync(projDir).filter(f => f.endsWith('.jsonl'));
@@ -962,7 +982,7 @@ app.get('/api/recent-sessions', (req, res) => {
               id, agent: 'claude', date: stat.mtime.toISOString(), mtime: stat.mtimeMs,
               preview: info.firstUserMessage, jsonlPath: filePath,
               summary: getSummaryText(id),
-              projectPath: decoded, projectName: getProjectName(decoded),
+              projectPath: canonical, projectName: getProjectName(canonical),
             });
           } catch {}
         }
@@ -973,11 +993,12 @@ app.get('/api/recent-sessions', (req, res) => {
     for (const entry of codexIndex.values()) {
       const key = summaryCacheKey('codex', entry.id);
       if (!entry.preview) continue;
+      const canonical = canon(entry.cwd);
       allSessions.push({
         id: entry.id, agent: 'codex', date: entry.date, mtime: entry.mtime,
         preview: entry.preview,
         summary: getSummaryText(key),
-        projectPath: entry.cwd, projectName: getProjectName(entry.cwd),
+        projectPath: canonical, projectName: getProjectName(canonical),
       });
     }
 
@@ -985,11 +1006,12 @@ app.get('/api/recent-sessions', (req, res) => {
     for (const entry of geminiIndex.values()) {
       const key = summaryCacheKey('gemini', entry.id);
       if (!entry.preview) continue;
+      const canonical = canon(entry.cwd);
       allSessions.push({
         id: entry.id, agent: 'gemini', date: entry.date, mtime: entry.mtime,
         preview: entry.preview,
         summary: getSummaryText(key),
-        projectPath: entry.cwd, projectName: getProjectName(entry.cwd),
+        projectPath: canonical, projectName: getProjectName(canonical),
       });
     }
 
@@ -1052,33 +1074,45 @@ function serveSessions(res, projectPath) {
   const MAX_SESSIONS = 30;
   const allSessions = [];
 
-  // Claude sessions
-  const encodedDir = findEncodedDir(projectPath);
-  if (encodedDir) {
-    const projectDir = path.join(PROJECTS_DIR, encodedDir);
-    try {
-      const files = fs.readdirSync(projectDir)
-        .filter(f => f.endsWith('.jsonl'))
-        .map(f => {
-          const filePath = path.join(projectDir, f);
-          const stat = fs.statSync(filePath);
-          return { file: f, path: filePath, mtime: stat.mtimeMs, date: stat.mtime.toISOString() };
-        });
-      for (const f of files) {
-        const info = getSessionInfo(f.path);
-        const id = f.file.replace('.jsonl', '');
-        allSessions.push({
-          id, agent: 'claude', date: f.date, mtime: f.mtime,
-          preview: info.firstUserMessage, jsonlPath: f.path,
-          summary: getSummaryText(id),
-        });
-      }
-    } catch {}
-  }
+  // Canonicalize so a query for one alias (e.g. ~/Documents/herd) also picks
+  // up sessions recorded under the real path (~/Documents/Personal/herd).
+  let canonQuery = projectPath;
+  try { canonQuery = fs.realpathSync(projectPath); } catch {}
+  const canonOf = p => { try { return fs.realpathSync(p); } catch { return p; } };
+
+  // Claude sessions — match every encoded dir whose decoded path resolves to
+  // the same canonical directory as the query.
+  try {
+    const dirs = fs.readdirSync(PROJECTS_DIR);
+    for (const encoded of dirs) {
+      let decoded;
+      try { decoded = decodeProjectPath(encoded); } catch { continue; }
+      if (decoded !== projectPath && canonOf(decoded) !== canonQuery) continue;
+      const projectDir = path.join(PROJECTS_DIR, encoded);
+      try {
+        const files = fs.readdirSync(projectDir)
+          .filter(f => f.endsWith('.jsonl'))
+          .map(f => {
+            const filePath = path.join(projectDir, f);
+            const stat = fs.statSync(filePath);
+            return { file: f, path: filePath, mtime: stat.mtimeMs, date: stat.mtime.toISOString() };
+          });
+        for (const f of files) {
+          const info = getSessionInfo(f.path);
+          const id = f.file.replace('.jsonl', '');
+          allSessions.push({
+            id, agent: 'claude', date: f.date, mtime: f.mtime,
+            preview: info.firstUserMessage, jsonlPath: f.path,
+            summary: getSummaryText(id),
+          });
+        }
+      } catch {}
+    }
+  } catch {}
 
   // Codex sessions
   for (const entry of codexIndex.values()) {
-    if (entry.cwd !== projectPath) continue;
+    if (entry.cwd !== projectPath && canonOf(entry.cwd) !== canonQuery) continue;
     const key = summaryCacheKey('codex', entry.id);
     allSessions.push({
       id: entry.id, agent: 'codex', date: entry.date, mtime: entry.mtime,
@@ -1089,7 +1123,7 @@ function serveSessions(res, projectPath) {
 
   // Gemini sessions
   for (const entry of geminiIndex.values()) {
-    if (entry.cwd !== projectPath) continue;
+    if (entry.cwd !== projectPath && canonOf(entry.cwd) !== canonQuery) continue;
     const key = summaryCacheKey('gemini', entry.id);
     allSessions.push({
       id: entry.id, agent: 'gemini', date: entry.date, mtime: entry.mtime,
@@ -1177,24 +1211,23 @@ wss.on('connection', (ws, req) => {
     return;
   }
 
-  // Spawn an interactive shell wrapped in `script` for PTY.
+  // Spawn an interactive shell in a real PTY via node-pty.
   // The agent is launched as a command inside the shell so that when it exits,
   // the user drops back to a live shell prompt in the same tab.
   const shell = process.env.SHELL || '/bin/zsh';
   let sessionId = resume || null;
-  const scriptArgs = ['-q', '/dev/null', shell, '-li'];
 
   let proc;
   try {
-    proc = spawn('script', scriptArgs, {
-      stdio: ['pipe', 'pipe', 'pipe'],
+    proc = pty.spawn(shell, ['-li'], {
+      name: 'xterm-256color',
+      cols: cols || 80,
+      rows: rows || 24,
       cwd: projectDirExists ? projectPath : os.homedir(),
       env: {
         ...process.env,
         ...(agent === 'gemini' ? geminiEnv : {}),
         TERM: 'xterm-256color',
-        COLUMNS: String(cols),
-        LINES: String(rows),
       },
     });
   } catch (err) {
@@ -1235,7 +1268,7 @@ wss.on('connection', (ws, req) => {
       launchCmd = `${setSize}${claudeBin} ${sandboxFlag}\n`;
     }
   }
-  proc.stdin.write(launchCmd);
+  proc.write(launchCmd);
 
   // --- Auto-naming ---
   let outputBuffer = '';
@@ -1472,14 +1505,12 @@ wss.on('connection', (ws, req) => {
     renameTimer = setTimeout(generateTitle, INITIAL_DELAY);
   }
 
-  // stdout → WebSocket + buffer for auto-naming
-  // Coalesce rapid output chunks into fewer, larger WebSocket frames
+  // PTY output → WebSocket + buffer for auto-naming
+  // Coalesce rapid output chunks into fewer, larger WebSocket frames.
+  // node-pty emits already-decoded utf8 strings and handles multi-byte
+  // boundaries internally, so no StringDecoder is needed here.
   let wsSendBuf = '';
   let wsSendTimer = null;
-  // StringDecoder buffers incomplete multi-byte UTF-8 sequences between chunks,
-  // preventing replacement characters (�) when characters like ▀ are split.
-  const stdoutDecoder = new StringDecoder('utf8');
-  const stderrDecoder = new StringDecoder('utf8');
   const flushWsBuf = () => {
     wsSendTimer = null;
     if (wsSendBuf) {
@@ -1489,9 +1520,7 @@ wss.on('connection', (ws, req) => {
     }
   };
 
-  proc.stdout.on('data', data => {
-    const str = stdoutDecoder.write(data);
-    if (!str) return; // decoder is buffering an incomplete sequence
+  proc.onData(str => {
     outputBuffer += str;
     if (outputBuffer.length > 2048) outputBuffer = outputBuffer.slice(-2048);
     charsSinceLastRename += str.length;
@@ -1499,22 +1528,11 @@ wss.on('connection', (ws, req) => {
     if (!wsSendTimer) wsSendTimer = setTimeout(flushWsBuf, 8);
   });
 
-  proc.stderr.on('data', data => {
-    const str = stderrDecoder.write(data);
-    if (str) {
-      wsSendBuf += str;
-      if (!wsSendTimer) wsSendTimer = setTimeout(flushWsBuf, 8);
-    }
-  });
-
-  proc.on('exit', (code) => {
+  proc.onExit(({ exitCode }) => {
     sessionEnded = true;
     if (renameTimer) clearTimeout(renameTimer);
-    // Flush any remaining bytes buffered by the StringDecoders
-    const trailing = stdoutDecoder.end() + stderrDecoder.end();
-    if (trailing) wsSendBuf += trailing;
     if (wsSendTimer) { clearTimeout(wsSendTimer); flushWsBuf(); } else if (wsSendBuf) { flushWsBuf(); }
-    try { ws.send(JSON.stringify({ type: 'exit', code: code || 0 })); } catch {}
+    try { ws.send(JSON.stringify({ type: 'exit', code: exitCode || 0 })); } catch {}
     terminals.delete(termId);
   });
 
@@ -1523,13 +1541,9 @@ wss.on('connection', (ws, req) => {
     try {
       const msg = JSON.parse(raw.toString());
       if (msg.type === 'input') {
-        try { proc.stdin.write(msg.data); } catch {}
+        try { proc.write(msg.data); } catch {}
       } else if (msg.type === 'resize' && msg.cols && msg.rows) {
-        // Note: script-based PTY has limited resize support since we
-        // can't ioctl the PTY fd directly. SIGWINCH signals child apps
-        // to re-check dimensions, but the underlying PTY size is fixed
-        // at initial cols/rows. Full resize requires node-pty.
-        try { proc.kill('SIGWINCH'); } catch {}
+        try { proc.resize(msg.cols, msg.rows); } catch {}
       }
     } catch {}
   });

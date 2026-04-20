@@ -65,7 +65,10 @@
       "Bash(gh issue:*)",
       "Bash(gh search:*)",
       "WebFetch(domain:eu-central-1-1.aws.cloud2.influxdata.com)",
-      "WebFetch(domain:release-assets.githubusercontent.com)"
+      "WebFetch(domain:release-assets.githubusercontent.com)",
+      "Bash(file node_modules/node-pty/build/Release/*.node node_modules/node-pty/build/Release/spawn-helper)",
+      "Bash(xattr node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper)",
+      "Bash(codesign -dv node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper)"
     ]
   },
   "sandbox": {

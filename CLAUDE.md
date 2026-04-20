@@ -29,7 +29,7 @@ Single-process Node.js server (`server.js`) serving a vanilla JS frontend (`publ
   - `GET /api/summary-events` — SSE stream for real-time summary updates (session names update in-place without re-rendering)
   - `POST /api/regenerate-summaries` — force re-generation of summaries (single session, per-project, or all)
   - `GET /api/pick-folder` — triggers native macOS folder picker via `osascript` for adding arbitrary project directories
-- WebSocket server (`noServer: true`) only upgrades connections on `/ws` path. Spawns terminal processes via macOS `script -q /dev/null` as a PTY wrapper (no native node-pty dependency). Supports `agent=claude`, `agent=codex`, and `agent=gemini` parameters. New sessions launch `claude`/`codex`/`gemini` directly; resumed sessions use `--resume <id>`
+- WebSocket server (`noServer: true`) only upgrades connections on `/ws` path. Spawns terminal processes through `node-pty` for a real PTY with full resize (`ioctl TIOCSWINSZ`) support. Supports `agent=claude`, `agent=codex`, and `agent=gemini` parameters. New sessions launch `claude`/`codex`/`gemini` directly; resumed sessions use `--resume <id>`
 - Claude, Codex, and Gemini binaries resolved once at startup from common paths or `which`
 - Codex integration: scans `~/.codex/sessions/YYYY/MM/DD/*.jsonl` for Codex rollout files. Parses `session_meta` and `event_msg` entries to extract session IDs, cwds, and previews. Cached by `(filePath, mtimeMs)` for incremental rescans
 - Gemini integration: scans `~/.gemini/tmp/<project-hash>/logs.json` files. Groups entries by session ID, extracts cwd and preview from message history. Cached by `(filePath, mtimeMs)`. Loads `~/.gemini/.env` into a scoped object (not `process.env`) to avoid side-effects
@@ -65,8 +65,8 @@ Single-process Node.js server (`server.js`) serving a vanilla JS frontend (`publ
 
 ## Key Design Decisions
 
-- **No native dependencies for PTY**: uses macOS `script` command instead of node-pty, which means terminal resize is limited (SIGWINCH is sent but underlying PTY size is fixed at initial dimensions)
-- **macOS only**: the `script` invocation (`script -q /dev/null`) is macOS-specific
+- **Real PTY via node-pty**: previously used macOS `script -q /dev/null` to avoid native deps, but macOS 26 (Darwin 25) tightened `script` so it now errors with `tcgetattr/ioctl: Operation not supported on socket` when stdin isn't a TTY. Migrated to `node-pty`, which also gives us real `resize()` support
+- **macOS-focused but portable**: no longer depends on `script`, so node-pty's platform support (macOS/Linux/Windows) applies — still only tested on macOS
 - **No bundler**: vanilla JS served directly, xterm from CDN
 - **Localhost only by default**: no auth, so binds to `127.0.0.1`. Override with `HOST` env var
 - **No API key needed**: Haiku summaries use the `claude` CLI (`claude -p --model haiku`), which handles its own auth
