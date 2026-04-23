@@ -26,6 +26,38 @@ try {
   }
 } catch {}
 
+// C2: Credential isolation for PTY children.
+// Blacklist known-dangerous credential patterns (whitelist would break login
+// shells that read NVM_DIR, CONDA_SHLVL, SSH_AUTH_SOCK, etc. from parent env).
+// Then inject only the API key the specific agent needs, so a compromised
+// Codex session cannot read the Anthropic key, and vice versa.
+const DANGEROUS_ENV_PATTERNS = [
+  'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN', 'AWS_SECURITY_TOKEN',
+  'GITHUB_TOKEN', 'GH_TOKEN',
+  'HEROKU_API_KEY',
+  'DIGITALOCEAN_TOKEN',
+  'AZURE_CLIENT_SECRET',
+  'TF_VAR_', 'VAULT_TOKEN',
+];
+const AGENT_API_KEYS = ['OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GEMINI_API_KEY'];
+function stripDangerousEnv(env) {
+  const safe = { ...env };
+  for (const key of Object.keys(safe)) {
+    if (DANGEROUS_ENV_PATTERNS.some(p => key === p || key.startsWith(p + '_') || key.startsWith(p))) {
+      delete safe[key];
+    }
+  }
+  return safe;
+}
+function agentEnv(agent) {
+  const base = stripDangerousEnv(process.env);
+  for (const k of AGENT_API_KEYS) delete base[k];
+  if (agent === 'codex'  && process.env.OPENAI_API_KEY)    base.OPENAI_API_KEY    = process.env.OPENAI_API_KEY;
+  if (agent === 'claude' && process.env.ANTHROPIC_API_KEY) base.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+  if (agent === 'gemini') Object.assign(base, geminiEnv); // Gemini key lives in ~/.gemini/.env
+  return base;
+}
+
 const PORT = process.env.PORT || 3456;
 const CLAUDE_DIR = path.join(os.homedir(), '.claude');
 const PROJECTS_DIR = path.join(CLAUDE_DIR, 'projects');
@@ -37,6 +69,28 @@ const PI_SESSIONS_DIR = path.join(PI_DIR, 'sessions');
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
+
+// Heartbeat: browsers don't always deliver a clean close frame (sleep/wake,
+// crash, network drop, fast refresh). Without pings, the server keeps the PTY
+// alive until TCP keepalive (~2h) notices the dead socket — meanwhile the
+// client's reconnect logic spawns a second PTY for the same session. Result:
+// orphaned zsh/claude processes pile up. 30s pings + one missed pong →
+// terminate → the connection's `close` handler kills the PTY.
+wss.on('connection', ws => {
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
+});
+const wsHeartbeat = setInterval(() => {
+  for (const ws of wss.clients) {
+    if (ws.isAlive === false) {
+      try { ws.terminate(); } catch {}
+      continue;
+    }
+    ws.isAlive = false;
+    try { ws.ping(); } catch {}
+  }
+}, 30_000);
+wss.on('close', () => clearInterval(wsHeartbeat));
 
 // C1/C1b: Origin allowlist. Browsers attach an Origin header on cross-origin
 // requests; non-browser clients (curl, local scripts) do not. Since Herd binds
@@ -655,7 +709,38 @@ const SUMMARY_CACHE_PATH = path.join(__dirname, 'summaries.json');
 let summaryCache = {};
 try { summaryCache = JSON.parse(fs.readFileSync(SUMMARY_CACHE_PATH, 'utf8')); } catch {}
 
-function saveSummaryCache() {
+// H5: Debounced async writes. Rapid live-title updates or batch summary
+// completions used to trigger multiple synchronous full-file writes within
+// milliseconds — this coalesces them and keeps I/O off the event loop.
+// Three call patterns:
+//   - scheduleSaveSummary(): coalescing, fire-and-forget (live titles, prunes)
+//   - flushSaveSummary():    promptly await a write (batch completion, regen)
+//   - flushSaveSummarySync(): only on graceful shutdown, where the event loop
+//                             is about to exit and async writes would be dropped
+let saveSummaryTimer = null;
+let saveSummaryInflight = null;
+async function doSaveSummary() {
+  if (saveSummaryInflight) { try { await saveSummaryInflight; } catch {} }
+  saveSummaryInflight = fs.promises.writeFile(
+    SUMMARY_CACHE_PATH,
+    JSON.stringify(summaryCache, null, 2)
+  ).catch(err => console.error('Failed to save summaries:', err.message))
+   .finally(() => { saveSummaryInflight = null; });
+  return saveSummaryInflight;
+}
+function scheduleSaveSummary() {
+  if (saveSummaryTimer) return;
+  saveSummaryTimer = setTimeout(() => {
+    saveSummaryTimer = null;
+    doSaveSummary();
+  }, 500);
+}
+async function flushSaveSummary() {
+  if (saveSummaryTimer) { clearTimeout(saveSummaryTimer); saveSummaryTimer = null; }
+  await doSaveSummary();
+}
+function flushSaveSummarySync() {
+  if (saveSummaryTimer) { clearTimeout(saveSummaryTimer); saveSummaryTimer = null; }
   try { fs.writeFileSync(SUMMARY_CACHE_PATH, JSON.stringify(summaryCache, null, 2)); } catch {}
 }
 
@@ -865,7 +950,7 @@ async function generateMissingSummaries(sessions) {
         summarizing.delete(key);
       }
     }));
-    saveSummaryCache();
+    await flushSaveSummary();
   }
 }
 
@@ -1176,7 +1261,7 @@ app.get('/api/projects', (req, res) => {
     for (const key of Object.keys(summaryCache)) {
       if (!allSessionKeys.has(key)) { delete summaryCache[key]; pruned = true; }
     }
-    if (pruned) saveSummaryCache();
+    if (pruned) scheduleSaveSummary();
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1284,7 +1369,7 @@ app.get('/api/recent-sessions', (req, res) => {
 });
 
 // Force-regenerate summaries for a session or all sessions in a project
-app.post('/api/regenerate-summaries', (req, res) => {
+app.post('/api/regenerate-summaries', async (req, res) => {
   const { sessionId, projectId } = req.query;
   let cleared = 0;
   if (sessionId) {
@@ -1313,7 +1398,7 @@ app.post('/api/regenerate-summaries', (req, res) => {
     cleared = Object.keys(summaryCache).length;
     summaryCache = {};
   }
-  saveSummaryCache();
+  await flushSaveSummary();
   res.json({ cleared, message: 'Summaries will regenerate on next load' });
 });
 
@@ -1490,6 +1575,22 @@ wss.on('connection', (ws, req) => {
     return;
   }
 
+  // Dedup: if an existing terminal is still registered for this (agent, sessionId),
+  // its old WebSocket is likely a ghost (sleep/wake, crash) that we haven't reaped
+  // yet. Kill it before spawning a replacement, otherwise both run in parallel.
+  if (resume) {
+    for (const [oldId, oldTerm] of terminals) {
+      if (oldTerm.sessionId === resume && oldTerm.agent === agent) {
+        // SIGHUP, not SIGTERM: interactive zsh ignores SIGTERM but honors SIGHUP
+        // (terminal-hangup), which also propagates to the foreground process group
+        // (claude/codex/gemini) via the tty.
+        try { oldTerm.proc.kill('SIGHUP'); } catch {}
+        try { oldTerm.ws.terminate(); } catch {}
+        terminals.delete(oldId);
+      }
+    }
+  }
+
   // Spawn an interactive shell in a real PTY via node-pty.
   // The agent is launched as a command inside the shell so that when it exits,
   // the user drops back to a live shell prompt in the same tab.
@@ -1504,8 +1605,7 @@ wss.on('connection', (ws, req) => {
       rows: rows || 24,
       cwd: projectDirExists ? projectPath : os.homedir(),
       env: {
-        ...process.env,
-        ...(agent === 'gemini' ? geminiEnv : {}),
+        ...agentEnv(agent),
         TERM: 'xterm-256color',
       },
     });
@@ -1520,11 +1620,15 @@ wss.on('connection', (ws, req) => {
 
   ws.send(JSON.stringify({ type: 'ready', termId, sessionId }));
 
-  // Launch agent inside the shell.
-  // `stty cols` issues TIOCSWINSZ on the PTY slave so the agent picks up the
-  // new width at startup. 96 = 80 × 1.2.
-  const targetCols = 96;
-  const setSize = `stty cols ${targetCols} rows ${rows} 2>/dev/null; clear; `;
+  // Launch agent inside the shell. `node-pty` already applied cols/rows via
+  // TIOCSWINSZ at spawn and `proc.resize()` handles later client resizes, so
+  // `stty` isn't needed for sizing. We do cap width at 96 cols for readability
+  // on wide terminals (narrow ones keep their actual width — no forced wrap).
+  const MAX_COLS = 96;
+  const effectiveCols = Math.min(cols || 80, MAX_COLS);
+  const setSize = effectiveCols < (cols || 80)
+    ? `stty cols ${effectiveCols} 2>/dev/null; clear; `
+    : 'clear; ';
 
   let launchCmd;
   if (agent === 'codex') {
@@ -1789,7 +1893,7 @@ wss.on('connection', (ws, req) => {
     const sid = detectSessionId();
     if (sid) {
       setSummary(summaryCacheKey(agent, sid), title);
-      saveSummaryCache();
+      scheduleSaveSummary();
       broadcastSummaryUpdate(sid, agent, title);
     }
   }
@@ -1844,6 +1948,18 @@ wss.on('connection', (ws, req) => {
   // boundaries internally, so no StringDecoder is needed here.
   let wsSendBuf = '';
   let wsSendTimer = null;
+  // H7: Backpressure. A stalled browser tab can let ws.bufferedAmount grow
+  // without bound, OOMing the server and taking every other terminal down.
+  // Pause the PTY when the queue exceeds HIGH_WATER; resume under LOW_WATER.
+  const HIGH_WATER = 1 << 20;  // 1 MB queued to client
+  const LOW_WATER  = 1 << 17;  // 128 KB
+  let ptyPaused = false;
+  const maybeResume = () => {
+    if (ptyPaused && ws.bufferedAmount < LOW_WATER) {
+      try { proc.resume(); } catch {}
+      ptyPaused = false;
+    }
+  };
   const flushWsBuf = () => {
     wsSendTimer = null;
     if (wsSendBuf) {
@@ -1851,6 +1967,7 @@ wss.on('connection', (ws, req) => {
       wsSendBuf = '';
       try { ws.send(JSON.stringify({ type: 'output', data: chunk })); } catch {}
     }
+    maybeResume();
   };
 
   proc.onData(str => {
@@ -1858,6 +1975,10 @@ wss.on('connection', (ws, req) => {
     if (outputBuffer.length > 2048) outputBuffer = outputBuffer.slice(-2048);
     charsSinceLastRename += str.length;
     wsSendBuf += str;
+    if (!ptyPaused && ws.bufferedAmount > HIGH_WATER) {
+      try { proc.pause(); } catch {}
+      ptyPaused = true;
+    }
     if (!wsSendTimer) wsSendTimer = setTimeout(flushWsBuf, 8);
   });
 
@@ -1884,15 +2005,18 @@ wss.on('connection', (ws, req) => {
   ws.on('close', () => {
     sessionEnded = true;
     if (renameTimer) clearTimeout(renameTimer);
-    try { proc.kill('SIGTERM'); } catch {}
+    // SIGHUP, not SIGTERM: interactive zsh ignores SIGTERM.
+    try { proc.kill('SIGHUP'); } catch {}
     terminals.delete(termId);
   });
 });
 
 // P7: Graceful shutdown
 function cleanup() {
+  // H5: flush any pending summary writes before the event loop exits
+  flushSaveSummarySync();
   for (const [, term] of terminals) {
-    try { term.proc.kill('SIGTERM'); } catch {}
+    try { term.proc.kill('SIGHUP'); } catch {}
   }
   wss.close();
   server.close(() => process.exit());

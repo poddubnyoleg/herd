@@ -69,7 +69,8 @@
       "Bash(file node_modules/node-pty/build/Release/*.node node_modules/node-pty/build/Release/spawn-helper)",
       "Bash(xattr node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper)",
       "Bash(codesign -dv node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper)",
-      "WebFetch(domain:openrouter.ai)"
+      "WebFetch(domain:openrouter.ai)",
+      "Bash(ps -eo pid,ppid,etime,command)"
     ]
   },
   "sandbox": {
