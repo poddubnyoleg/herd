@@ -236,6 +236,24 @@ body {
   flex-shrink: 0;
 }
 
+.project-finder-btn {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 0 4px;
+  margin-right: -4px;
+  font-size: 13px;
+  line-height: 1;
+  border-radius: 3px;
+  flex-shrink: 0;
+  opacity: 0;
+  transition: opacity 0.1s, color 0.1s, background 0.1s;
+}
+
+.project-header:hover .project-finder-btn { opacity: 1; }
+.project-finder-btn:hover { color: var(--accent); background: var(--bg-hover); }
+
 .project-sessions { display: none; }
 .project-item.expanded .project-sessions { display: block; }
 

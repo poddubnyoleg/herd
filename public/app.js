@@ -340,6 +340,7 @@ class Herd {
           <span class="project-chevron">&#x25B8;</span>
           <span class="project-name" title="${this.esc(p.path)}">${this.esc(this.lastName(p.path))}</span>
           <span class="project-count">${p.sessionCount}</span>
+          ${p.exists ? `<button class="project-finder-btn" title="Reveal in Finder" aria-label="Reveal in Finder">&#x29C9;</button>` : ''}
         </div>
         <div class="project-sessions"></div>
       </div>
@@ -374,6 +375,21 @@ class Herd {
 
     el.querySelectorAll('.project-header').forEach(h => {
       h.addEventListener('click', () => this.toggleProject(h.parentElement));
+    });
+
+    el.querySelectorAll('.project-finder-btn').forEach(btn => {
+      btn.addEventListener('click', async e => {
+        e.stopPropagation();
+        const p = btn.closest('.project-item').dataset.path;
+        if (!p) return;
+        try {
+          await fetch('/api/open-in-finder', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: p }),
+          });
+        } catch {}
+      });
     });
 
     this.filterProjects();

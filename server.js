@@ -1515,6 +1515,22 @@ app.post('/api/pick-folder', (req, res) => {
   });
 });
 
+// C1b: POST + origin-checked. Opens a project directory in Finder via `open`.
+// Path is resolved and must be an existing directory; execFile (no shell) avoids
+// any injection risk from the path argument.
+app.post('/api/open-in-finder', express.json(), (req, res) => {
+  const dirPath = req.body && typeof req.body.path === 'string' ? req.body.path : '';
+  if (!dirPath) return res.status(400).json({ error: 'path required' });
+  const resolved = path.resolve(dirPath);
+  let stat;
+  try { stat = fs.statSync(resolved); } catch { return res.status(404).json({ error: 'not found' }); }
+  if (!stat.isDirectory()) return res.status(400).json({ error: 'not a directory' });
+  execFile('open', [resolved], { timeout: 5000 }, err => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json({ ok: true });
+  });
+});
+
 // --- WebSocket terminal (using `script` as PTY wrapper) ---
 
 const terminals = new Map();
