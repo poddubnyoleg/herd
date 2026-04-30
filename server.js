@@ -647,7 +647,21 @@ function getUserMessages(jsonlPath, maxBytes = 256 * 1024) {
   return messages;
 }
 
+// Cache parsed metadata by (path, mtime) so /api/projects can count
+// resumable sessions without re-reading every JSONL on each request.
+const sessionInfoCache = new Map(); // path -> { mtime, info }
+
 function getSessionInfo(jsonlPath) {
+  let mtime = 0;
+  try { mtime = fs.statSync(jsonlPath).mtimeMs; } catch {}
+  const cached = sessionInfoCache.get(jsonlPath);
+  if (cached && cached.mtime === mtime) return cached.info;
+  const info = readSessionInfo(jsonlPath);
+  if (mtime) sessionInfoCache.set(jsonlPath, { mtime, info });
+  return info;
+}
+
+function readSessionInfo(jsonlPath) {
   try {
     const fd = fs.openSync(jsonlPath, 'r');
     const lines = [];
@@ -1144,31 +1158,40 @@ app.get('/api/projects', (req, res) => {
       const jsonls = fs.readdirSync(projDir).filter(f => f.endsWith('.jsonl'));
       if (jsonls.length === 0) continue;
 
+      // Only count sessions that have a first user message — stubs without one
+      // can't be resumed (`claude --resume <id>` errors out), so listing them
+      // would show the user a count that doesn't match what they can open.
+      let resumableCount = 0;
       let latestMtime = 0;
       for (const f of jsonls) {
+        const filePath = path.join(projDir, f);
         try {
-          const mt = fs.statSync(path.join(projDir, f)).mtimeMs;
+          const mt = fs.statSync(filePath).mtimeMs;
           if (mt > latestMtime) latestMtime = mt;
         } catch {}
+        if (getSessionInfo(filePath).firstUserMessage) resumableCount++;
       }
+      if (resumableCount === 0) continue;
 
       const existing = projectMap.get(key);
       if (existing) {
-        existing.claudeCount += jsonls.length;
+        existing.claudeCount += resumableCount;
         if (latestMtime > existing.latestMtime) existing.latestMtime = latestMtime;
         // Prefer an encoded dir whose decoded path matches the canonical key
         if (!existing.claudeEncoded || decoded === key) existing.claudeEncoded = encoded;
       } else {
         projectMap.set(key, {
           path: key, name: getProjectName(key), exists,
-          claudeCount: jsonls.length, codexCount: 0, geminiCount: 0, piCount: 0, latestMtime,
+          claudeCount: resumableCount, codexCount: 0, geminiCount: 0, piCount: 0, latestMtime,
           claudeEncoded: encoded,
         });
       }
     }
 
-    // Codex projects grouped by cwd
+    // Codex projects grouped by cwd. Skip entries without a preview — they're
+    // empty rollout stubs that codex --resume won't recognize.
     for (const entry of codexIndex.values()) {
+      if (!entry.preview) continue;
       const key = canon(entry.cwd);
       const existing = projectMap.get(key);
       if (existing) {
@@ -1186,6 +1209,7 @@ app.get('/api/projects', (req, res) => {
 
     // Gemini projects grouped by cwd
     for (const entry of geminiIndex.values()) {
+      if (!entry.preview) continue;
       const key = canon(entry.cwd);
       const existing = projectMap.get(key);
       if (existing) {
@@ -1203,6 +1227,7 @@ app.get('/api/projects', (req, res) => {
 
     // Pi projects grouped by cwd
     for (const entry of piIndex.values()) {
+      if (!entry.preview) continue;
       const key = canon(entry.cwd);
       const existing = projectMap.get(key);
       if (existing) {
