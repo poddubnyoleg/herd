@@ -92,11 +92,13 @@ const wsHeartbeat = setInterval(() => {
 }, 30_000);
 wss.on('close', () => clearInterval(wsHeartbeat));
 
-// C1/C1b: Origin allowlist. Browsers attach an Origin header on cross-origin
-// requests; non-browser clients (curl, local scripts) do not. Since Herd binds
-// to 127.0.0.1 by default, missing/null Origin is accepted — browser attackers
-// cannot suppress Origin, so this is not a bypass. For reverse-proxy / HTTPS
-// deployments, operators set ALLOWED_ORIGINS (comma-separated) explicitly.
+// C1/C1b: Origin allowlist. Browsers always attach Origin on cross-origin
+// requests (incl. WebSocket handshakes) and cannot suppress it; non-browser
+// clients (curl, local scripts) send none. A missing Origin is accepted
+// (loopback CLI use); 'null' is NOT — browsers send the literal "null" for
+// opaque-origin contexts (sandboxed iframes, data:), so allowlisting it is a
+// cross-site WebSocket-hijack -> RCE bypass. Reverse-proxy / HTTPS deployments
+// set ALLOWED_ORIGINS (comma-separated) explicitly.
 function allowedOriginList() {
   if (process.env.ALLOWED_ORIGINS) {
     return process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim()).filter(Boolean);
@@ -104,7 +106,7 @@ function allowedOriginList() {
   return [`http://localhost:${PORT}`, `http://127.0.0.1:${PORT}`];
 }
 function originAllowed(origin) {
-  if (!origin || origin === 'null') return true; // non-browser / file:// clients
+  if (!origin) return true; // curl/CLI send no Origin; 'null' is attacker-reachable (opaque origin) — never allowlist
   return allowedOriginList().some(a => origin === a); // exact match, not startsWith
 }
 
