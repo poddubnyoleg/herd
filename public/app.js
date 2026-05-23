@@ -146,6 +146,21 @@ class Herd {
     window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
       if (this.theme === 'auto') this.updateTerminalThemes();
     });
+
+    // DPR changes (browser zoom, dragging window between monitors) corrupt
+    // the WebGL glyph atlas — old-DPR bitmaps get stretched into the new
+    // grid. Rebind on each change since the media query references the
+    // current devicePixelRatio.
+    const watchDpr = () => {
+      window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`)
+        .addEventListener('change', () => {
+          for (const [, tab] of this.tabs) {
+            try { tab.terminal.clearTextureAtlas?.(); } catch {}
+          }
+          watchDpr();
+        }, { once: true });
+    };
+    watchDpr();
   }
 
   setTheme(theme) {
@@ -174,6 +189,10 @@ class Herd {
     const xtermTheme = this.getEffectiveXtermTheme();
     for (const [, tab] of this.tabs) {
       tab.terminal.options.theme = xtermTheme;
+      // Old-theme glyphs remain cached in the WebGL texture atlas otherwise,
+      // producing the mangled-character artifact when composited under the
+      // new theme.
+      try { tab.terminal.clearTextureAtlas?.(); } catch {}
     }
   }
 
@@ -757,12 +776,21 @@ class Herd {
     requestAnimationFrame(() => {
       terminal.open(wrapper);
 
-      // GPU-accelerated rendering via WebGL (major FPS improvement)
-      try {
-        const webglAddon = new WebglAddon.WebglAddon();
-        webglAddon.onContextLoss(() => { webglAddon.dispose(); });
-        terminal.loadAddon(webglAddon);
-      } catch {}
+      // GPU-accelerated rendering via WebGL (major FPS improvement).
+      // On context loss, re-install on the next frame — otherwise the
+      // terminal silently falls back to the DOM renderer for the rest of
+      // the session.
+      const installWebgl = () => {
+        try {
+          const webglAddon = new WebglAddon.WebglAddon();
+          webglAddon.onContextLoss(() => {
+            webglAddon.dispose();
+            requestAnimationFrame(installWebgl);
+          });
+          terminal.loadAddon(webglAddon);
+        } catch {}
+      };
+      installWebgl();
 
       // Snap to exact buffer bottom when user drags the scrollbar all the way down.
       // With lineHeight 1.25 the per-row pixel height is fractional, so xterm's
