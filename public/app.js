@@ -105,6 +105,16 @@ class Herd {
         e.returnValue = '';
       }
     });
+
+    // xterm WebGL atlas LRU eviction can corrupt individual glyph slots in
+    // long sessions — scattered wrong characters appear mid-word. A periodic
+    // full clear keeps the atlas fresh; re-rasterization on next render is
+    // microseconds per glyph and imperceptible.
+    setInterval(() => {
+      for (const [, tab] of this.tabs) {
+        try { tab.terminal.clearTextureAtlas?.(); } catch {}
+      }
+    }, 90 * 1000);
   }
 
   // ── Tab cycling (B3) ──
