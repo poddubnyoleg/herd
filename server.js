@@ -8,23 +8,29 @@ const fs = require('fs');
 const os = require('os');
 const pty = require('node-pty');
 
-// Load ~/.gemini/.env into a scoped object (not process.env) to avoid side-effects
-const geminiEnv = {};
-try {
-  const envPath = path.join(os.homedir(), '.gemini', '.env');
-  if (fs.existsSync(envPath)) {
-    const content = fs.readFileSync(envPath, 'utf8');
-    for (const line of content.split('\n')) {
-      const match = line.match(/^\s*([\w.-]+)\s*=\s*(.*)?\s*$/);
-      if (match) {
-        let value = match[2] || '';
-        if (value.startsWith('"') && value.endsWith('"')) value = value.slice(1, -1);
-        if (value.startsWith("'") && value.endsWith("'")) value = value.slice(1, -1);
-        geminiEnv[match[1]] = value;
+// Parse a .env file into a scoped object (never mutates process.env).
+function loadEnvFile(envPath) {
+  const out = {};
+  try {
+    if (fs.existsSync(envPath)) {
+      const content = fs.readFileSync(envPath, 'utf8');
+      for (const line of content.split('\n')) {
+        const match = line.match(/^\s*([\w.-]+)\s*=\s*(.*)?\s*$/);
+        if (match) {
+          let value = match[2] || '';
+          if (value.startsWith('"') && value.endsWith('"')) value = value.slice(1, -1);
+          if (value.startsWith("'") && value.endsWith("'")) value = value.slice(1, -1);
+          out[match[1]] = value;
+        }
       }
     }
-  }
-} catch {}
+  } catch {}
+  return out;
+}
+// Gemini key lives in ~/.gemini/.env; pi's OpenRouter key in the project-local
+// .env. Both scoped, never leaked into process.env or other agents' environments.
+const geminiEnv = loadEnvFile(path.join(os.homedir(), '.gemini', '.env'));
+const localEnv = loadEnvFile(path.join(__dirname, '.env'));
 
 // C2: Credential isolation for PTY children.
 // Blacklist known-dangerous credential patterns (whitelist would break login
@@ -39,7 +45,7 @@ const DANGEROUS_ENV_PATTERNS = [
   'AZURE_CLIENT_SECRET',
   'TF_VAR_', 'VAULT_TOKEN',
 ];
-const AGENT_API_KEYS = ['OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GEMINI_API_KEY'];
+const AGENT_API_KEYS = ['OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'OPENROUTER_API_KEY'];
 function stripDangerousEnv(env) {
   const safe = { ...env };
   for (const key of Object.keys(safe)) {
@@ -55,6 +61,10 @@ function agentEnv(agent) {
   if (agent === 'codex'  && process.env.OPENAI_API_KEY)    base.OPENAI_API_KEY    = process.env.OPENAI_API_KEY;
   if (agent === 'claude' && process.env.ANTHROPIC_API_KEY) base.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
   if (agent === 'gemini') Object.assign(base, geminiEnv); // Gemini key lives in ~/.gemini/.env
+  if (agent === 'pi') { // pi's openrouter provider reads OPENROUTER_API_KEY from env
+    const orKey = localEnv.OPENROUTER_API_KEY || process.env.OPENROUTER_API_KEY;
+    if (orKey) base.OPENROUTER_API_KEY = orKey;
+  }
   return base;
 }
 
