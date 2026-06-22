@@ -55,8 +55,26 @@ function stripDangerousEnv(env) {
   }
   return safe;
 }
+// Claude Code (and the other agent CLIs) export markers identifying the
+// *current* session into the environment. When the herd server is itself
+// started from inside a Claude Code session — the documented "restart server
+// from Claude Code" flow — these markers leak into every agent we spawn. A
+// child Claude that sees CLAUDECODE / CLAUDE_CODE_SESSION_ID /
+// CLAUDE_CODE_ENTRYPOINT / CLAUDE_CODE_CHILD_SESSION treats itself as a nested
+// session and never writes its own transcript JSONL to ~/.claude/projects, so
+// the session can't be listed in history or resumed and its tab vanishes on
+// reload. Strip them so each spawned agent starts a clean top-level session.
+// CLAUDE_CONFIG_DIR is kept — it points at the user's config, not a session.
+function stripAgentSessionEnv(env) {
+  for (const key of Object.keys(env)) {
+    if (key === 'CLAUDE_CONFIG_DIR') continue;
+    if (/^CLAUDE/.test(key) || key === 'AI_AGENT') delete env[key];
+  }
+  return env;
+}
+
 function agentEnv(agent) {
-  const base = stripDangerousEnv(process.env);
+  const base = stripAgentSessionEnv(stripDangerousEnv(process.env));
   for (const k of AGENT_API_KEYS) delete base[k];
   if (agent === 'codex'  && process.env.OPENAI_API_KEY)    base.OPENAI_API_KEY    = process.env.OPENAI_API_KEY;
   if (agent === 'claude' && process.env.ANTHROPIC_API_KEY) base.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
@@ -1609,9 +1627,11 @@ wss.on('connection', (ws, req) => {
     return;
   }
 
-  // B8: Validate project path and capture encoded directory name
+  // B8: Validate project path and capture encoded directory name.
+  // `let`, not `const`: for a brand-new project the encoded dir doesn't exist
+  // until the agent creates it, so the session-id poller below re-resolves it.
   const resolvedProject = projectPath && path.resolve(projectPath);
-  const encodedDir = resolvedProject ? findEncodedDir(resolvedProject) : null;
+  let encodedDir = resolvedProject ? findEncodedDir(resolvedProject) : null;
 
   // For Claude resume, we need the encoded dir to find the session file
   if (resume && agent === 'claude' && !encodedDir) {
@@ -1649,6 +1669,48 @@ wss.on('connection', (ws, req) => {
   // the user drops back to a live shell prompt in the same tab.
   const shell = process.env.SHELL || '/bin/zsh';
   let sessionId = resume || null;
+
+  // Snapshot the sessions that already exist in this project BEFORE launching the
+  // agent. detectSessionId() picks the most-recently-written session file in the
+  // project, but a session that is merely *active* (not new) also has a fresh
+  // mtime — so in a project with another running session (or the herd dev session
+  // itself, which writes on every tool call) the "newest" file is that OTHER
+  // session, and the brand-new tab gets bound to the wrong session ID. On reload
+  // it then resumes the wrong session and the real new session's tab vanishes.
+  // Excluding everything that existed at connect time makes detection consider
+  // only the file this PTY actually creates. Filenames identify Claude/Codex/Pi
+  // sessions; Gemini groups multiple sessions inside one shared logs.json, so it
+  // is keyed by session id instead.
+  const preexistingSessions = new Set();
+  if (!resume) {
+    try {
+      if (agent === 'claude' && encodedDir) {
+        for (const f of readdirSafe(path.join(PROJECTS_DIR, encodedDir)))
+          if (f.endsWith('.jsonl')) preexistingSessions.add(f);
+      } else if (agent === 'codex') {
+        const now = new Date();
+        const dayDir = path.join(CODEX_SESSIONS_DIR,
+          String(now.getFullYear()),
+          String(now.getMonth() + 1).padStart(2, '0'),
+          String(now.getDate()).padStart(2, '0'));
+        for (const f of readdirSafe(dayDir))
+          if (f.endsWith('.jsonl')) preexistingSessions.add(f);
+      } else if (agent === 'gemini') {
+        scanGeminiSessions();
+        for (const s of geminiIndex.values())
+          if (s.cwd === resolvedProject) preexistingSessions.add(s.id);
+      } else if (agent === 'pi') {
+        for (const dirName of readdirSafe(PI_SESSIONS_DIR)) {
+          let decoded;
+          try { decoded = decodePiProjectPath(dirName); } catch { continue; }
+          if (decoded !== resolvedProject) continue;
+          for (const f of readdirSafe(path.join(PI_SESSIONS_DIR, dirName)))
+            if (f.endsWith('.jsonl')) preexistingSessions.add(f);
+          break;
+        }
+      }
+    } catch {}
+  }
 
   let proc;
   try {
@@ -1771,7 +1833,7 @@ wss.on('connection', (ws, req) => {
           String(now.getMonth() + 1).padStart(2, '0'),
           String(now.getDate()).padStart(2, '0'));
         const files = readdirSafe(dayDir)
-          .filter(f => f.endsWith('.jsonl'))
+          .filter(f => f.endsWith('.jsonl') && !preexistingSessions.has(f))
           .map(f => {
             const fp = path.join(dayDir, f);
             return { name: codexFileSessionId(f), mtime: fs.statSync(fp).mtimeMs, path: fp };
@@ -1789,7 +1851,7 @@ wss.on('connection', (ws, req) => {
       try {
         scanGeminiSessions();
         const session = Array.from(geminiIndex.values())
-          .filter(s => s.cwd === resolvedProject && s.mtime >= sessionStart - 5000)
+          .filter(s => s.cwd === resolvedProject && s.mtime >= sessionStart - 5000 && !preexistingSessions.has(s.id))
           .sort((a, b) => b.mtime - a.mtime)[0];
         if (session) {
           sessionId = session.id;
@@ -1808,7 +1870,7 @@ wss.on('connection', (ws, req) => {
           if (decoded !== resolvedProject) continue;
           const projDir = path.join(PI_SESSIONS_DIR, dirName);
           const files = readdirSafe(projDir)
-            .filter(f => f.endsWith('.jsonl'))
+            .filter(f => f.endsWith('.jsonl') && !preexistingSessions.has(f))
             .map(f => {
               const filePath = path.join(projDir, f);
               try {
@@ -1839,7 +1901,7 @@ wss.on('connection', (ws, req) => {
       try {
         const projDir = path.join(PROJECTS_DIR, encodedDir);
         const files = fs.readdirSync(projDir)
-          .filter(f => f.endsWith('.jsonl'))
+          .filter(f => f.endsWith('.jsonl') && !preexistingSessions.has(f))
           .map(f => ({ name: f.replace('.jsonl', ''), mtime: fs.statSync(path.join(projDir, f)).mtimeMs }))
           .filter(f => f.mtime >= sessionStart - 5000)
           .sort((a, b) => b.mtime - a.mtime);
@@ -1995,6 +2057,32 @@ wss.on('connection', (ws, req) => {
     renameTimer = setTimeout(generateTitle, INITIAL_DELAY);
   }
 
+  // Detect the session ID as soon as the agent writes its JSONL, independent of
+  // the title-generation cadence. Without this, detectSessionId() first runs at
+  // INITIAL_DELAY (90s) inside generateTitle(); a browser reload before then
+  // never receives a `ready` with the real sessionId, so the client can't
+  // persist the tab (saveTabState filters on sessionId) and the session vanishes
+  // on reload. Poll until found, then stop.
+  let sessionDetectTimer = null;
+  if (!resume) {
+    const SESSION_DETECT_INTERVAL = 1000;
+    const SESSION_DETECT_DEADLINE = 5 * 60_000;
+    const pollSessionId = () => {
+      sessionDetectTimer = null;
+      if (sessionEnded || sessionId) return;
+      if (Date.now() - sessionStart > SESSION_DETECT_DEADLINE) return;
+      // Brand-new project: its encoded dir didn't exist at connect time but the
+      // agent creates it on launch, so re-resolve before scanning.
+      if (agent === 'claude' && !encodedDir && resolvedProject) {
+        encodedDir = findEncodedDir(resolvedProject);
+      }
+      if (!detectSessionId()) {
+        sessionDetectTimer = setTimeout(pollSessionId, SESSION_DETECT_INTERVAL);
+      }
+    };
+    sessionDetectTimer = setTimeout(pollSessionId, SESSION_DETECT_INTERVAL);
+  }
+
   // PTY output → WebSocket + buffer for auto-naming
   // Coalesce rapid output chunks into fewer, larger WebSocket frames.
   // node-pty emits already-decoded utf8 strings and handles multi-byte
@@ -2038,6 +2126,7 @@ wss.on('connection', (ws, req) => {
   proc.onExit(({ exitCode }) => {
     sessionEnded = true;
     if (renameTimer) clearTimeout(renameTimer);
+    if (sessionDetectTimer) clearTimeout(sessionDetectTimer);
     if (wsSendTimer) { clearTimeout(wsSendTimer); flushWsBuf(); } else if (wsSendBuf) { flushWsBuf(); }
     try { ws.send(JSON.stringify({ type: 'exit', code: exitCode || 0 })); } catch {}
     terminals.delete(termId);
@@ -2058,6 +2147,7 @@ wss.on('connection', (ws, req) => {
   ws.on('close', () => {
     sessionEnded = true;
     if (renameTimer) clearTimeout(renameTimer);
+    if (sessionDetectTimer) clearTimeout(sessionDetectTimer);
     // SIGHUP, not SIGTERM: interactive zsh ignores SIGTERM.
     try { proc.kill('SIGHUP'); } catch {}
     terminals.delete(termId);
