@@ -816,6 +816,38 @@ class Herd {
         }, { passive: true });
       }
 
+      // Option/Alt+click to reposition the input cursor (iTerm2-style). A
+      // terminal exposes no editable buffer to the browser, so we emulate it:
+      // translate the click into the matching number of Left/Right arrow
+      // keystrokes sent to the PTY. Only correct on the cursor's own visual
+      // row (a single unwrapped line — shell prompt or single-line input);
+      // vertical moves would map to history nav, so we bail off-row. Capture
+      // phase + stopPropagation so xterm's own selection doesn't also fire.
+      const screenEl = wrapper.querySelector('.xterm-screen');
+      if (terminal.element && screenEl) {
+        terminal.element.addEventListener('mousedown', e => {
+          if (!e.altKey || e.button !== 0) return;
+          const buf = terminal.buffer.active;
+          const rect = screenEl.getBoundingClientRect();
+          const cellW = rect.width / terminal.cols;
+          const cellH = rect.height / terminal.rows;
+          if (!cellW || !cellH) return;
+          const clickRow = Math.floor((e.clientY - rect.top) / cellH);
+          const clickCol = Math.floor((e.clientX - rect.left) / cellW);
+          // cursorY is relative to baseY; map it into the visible viewport.
+          const cursorRow = buf.baseY + buf.cursorY - buf.viewportY;
+          if (clickRow !== cursorRow) return;
+          const delta = clickCol - buf.cursorX;
+          if (delta !== 0 && tab.ws?.readyState === WebSocket.OPEN) {
+            const seq = delta > 0 ? '\x1b[C' : '\x1b[D';
+            tab.ws.send(JSON.stringify({ type: 'input', data: seq.repeat(Math.abs(delta)) }));
+          }
+          e.preventDefault();
+          e.stopPropagation();
+          terminal.focus();
+        }, { capture: true });
+      }
+
       // Auto-refit terminal when container resizes (window resize, sidebar drag, etc.)
       const resizeObserver = new ResizeObserver(() => {
         requestAnimationFrame(() => {
