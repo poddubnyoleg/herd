@@ -879,6 +879,7 @@ class Herd {
     tab.alive = true;
 
     ws.onopen = () => {
+      tab._reconnectAttempt = 0;
       // Suppress finished/unread tracking for 15s after (re)connect. On page
       // refresh or WS reconnect, `claude --resume` replays session history as
       // a burst of output — indistinguishable from a real completed run
@@ -969,6 +970,14 @@ class Herd {
             }
             this.saveTabState();
             break;
+          case 'takenover':
+            // This session was resumed elsewhere (another window/browser); the
+            // server killed our PTY. alive=false stops onclose from
+            // auto-reconnecting, which would kill the new window's PTY in turn.
+            tab.alive = false;
+            terminal.write('\r\n\x1b[38;5;240m[session opened in another window]\x1b[0m\r\n');
+            this.renderTabs();
+            break;
           case 'exit':
             tab.alive = false;
             terminal.write('\r\n\x1b[38;5;240m[shell exited]\x1b[0m\r\n');
@@ -1002,21 +1011,21 @@ class Herd {
 
   }
 
-  // F2: Reconnection with exponential backoff
-  scheduleReconnect(tab, attempt = 0) {
+  // F2: Reconnection with exponential backoff. The attempt counter lives on
+  // the tab (reset in ws.onopen) — passing it positionally meant every onclose
+  // restarted the sequence at attempt 0, i.e. a permanent ~1s retry loop while
+  // the server was down. Each failed attempt fires its own onclose, which
+  // calls back into here, so no separate "still disconnected?" poll is needed.
+  scheduleReconnect(tab) {
     if (tab._destroyed) return;
     if (tab._reconnectTimer) clearTimeout(tab._reconnectTimer);
+    const attempt = tab._reconnectAttempt || 0;
+    tab._reconnectAttempt = attempt + 1;
     const delay = Math.min(1000 * Math.pow(2, attempt), 30000);
     tab._reconnectTimer = setTimeout(() => {
       if (tab._destroyed) return;
       tab.terminal.write(`\r\n\x1b[38;5;240m[reconnecting...]\x1b[0m\r\n`);
       this.connectWebSocket(tab);
-      // If still disconnected after 5s, retry
-      setTimeout(() => {
-        if (tab.ws?.readyState !== WebSocket.OPEN && !tab._destroyed) {
-          this.scheduleReconnect(tab, attempt + 1);
-        }
-      }, 5000);
     }, delay);
   }
 
@@ -1161,7 +1170,7 @@ class Herd {
       if (this.tabs.has(tabId)) {
         this.switchTab(tabId);
       } else if (item.dataset.sid) {
-        this.createTab(projectPath, item.textContent.trim(), item.dataset.sid);
+        this.createTab(projectPath, item.textContent.trim(), item.dataset.sid, item.dataset.agent || 'claude');
       }
     });
 

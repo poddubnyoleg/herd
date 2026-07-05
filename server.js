@@ -1,7 +1,7 @@
 const express = require('express');
 const http = require('http');
 const { WebSocketServer } = require('ws');
-const { execFile } = require('child_process');
+const { execFile, execSync } = require('child_process');
 const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
@@ -172,44 +172,25 @@ app.use((req, res, next) => {
 
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Resolve claude binary once at startup
-const claudeBin = (() => {
-  const candidates = [
-    path.join(os.homedir(), '.local', 'bin', 'claude'),
-    '/usr/local/bin/claude',
-    '/opt/homebrew/bin/claude',
-  ];
+// Resolve agent binaries once at startup
+function resolveBin(name, candidates = []) {
   for (const c of candidates) {
     if (fs.existsSync(c)) return c;
   }
-  const { execSync } = require('child_process');
-  try { return execSync('/bin/sh -lc "which claude"', { encoding: 'utf8' }).trim(); }
-  catch { return 'claude'; }
-})();
+  try { return execSync(`/bin/sh -lc "which ${name}"`, { encoding: 'utf8' }).trim() || null; }
+  catch { return null; }
+}
+const claudeBin = resolveBin('claude', [
+  path.join(os.homedir(), '.local', 'bin', 'claude'),
+  '/usr/local/bin/claude',
+  '/opt/homebrew/bin/claude',
+]) || 'claude'; // last-resort PATH lookup at spawn time
+const codexBin = resolveBin('codex');
+const geminiBin = resolveBin('gemini');
+const piBin = resolveBin('pi');
 console.log(`  Claude binary: ${claudeBin}`);
-
-// Resolve codex binary once at startup
-const codexBin = (() => {
-  const { execSync } = require('child_process');
-  try { return execSync('/bin/sh -lc "which codex"', { encoding: 'utf8' }).trim(); }
-  catch { return null; }
-})();
 console.log(`  Codex binary: ${codexBin || '(not installed)'}`);
-
-// Resolve gemini binary once at startup
-const geminiBin = (() => {
-  const { execSync } = require('child_process');
-  try { return execSync('/bin/sh -lc "which gemini"', { encoding: 'utf8' }).trim(); }
-  catch { return null; }
-})();
 console.log(`  Gemini binary: ${geminiBin || '(not installed)'}`);
-
-// Resolve pi binary once at startup
-const piBin = (() => {
-  const { execSync } = require('child_process');
-  try { return execSync('/bin/sh -lc "which pi"', { encoding: 'utf8' }).trim(); }
-  catch { return null; }
-})();
 console.log(`  Pi binary: ${piBin || '(not installed)'}`);
 
 // --- Codex rollout index ---
@@ -260,64 +241,93 @@ function readdirSafe(dir) {
 function isDir(p) {
   try { return fs.statSync(p).isDirectory(); } catch { return false; }
 }
+function statMtimeSafe(p) {
+  try { return fs.statSync(p).mtimeMs; } catch { return 0; }
+}
 
-function parseCodexRollout(filePath, stat) {
-  // Use chunked line reading — session_meta can be 15KB+ due to base_instructions
+// Shared chunked JSONL reader. Streams the file from the start in 64KB chunks,
+// JSON.parses each non-empty line and calls onEntry(entry); unparsable lines
+// are skipped but still count toward maxLines (matching the historical
+// behavior of the per-format parsers this replaces). Stops after maxLines
+// lines, after maxBytes bytes, or when onEntry returns false. A final
+// unterminated line (file without trailing newline) is included. Throws only
+// if the file can't be opened — callers that must not throw wrap the call.
+function forEachJsonlEntry(filePath, { maxLines = Infinity, maxBytes = Infinity } = {}, onEntry) {
   const fd = fs.openSync(filePath, 'r');
   try {
-    const CHUNK_SIZE = 65536;
-    const MAX_LINES = 15;
-    const lines = [];
+    const buf = Buffer.alloc(Math.min(65536, maxBytes));
     let remainder = '';
     let offset = 0;
-    while (lines.length < MAX_LINES) {
-      const buf = Buffer.alloc(CHUNK_SIZE);
-      const bytesRead = fs.readSync(fd, buf, 0, CHUNK_SIZE, offset);
+    let count = 0;
+    const emit = line => {
+      if (!line.trim()) return true;
+      count++;
+      let entry;
+      try { entry = JSON.parse(line); } catch { return true; }
+      return onEntry(entry) !== false;
+    };
+    while (count < maxLines && offset < maxBytes) {
+      const bytesRead = fs.readSync(fd, buf, 0, buf.length, offset);
       if (bytesRead === 0) break;
       offset += bytesRead;
       const chunk = remainder + buf.toString('utf8', 0, bytesRead);
       const parts = chunk.split('\n');
       remainder = parts.pop();
       for (const part of parts) {
-        if (part.trim()) lines.push(part);
-        if (lines.length >= MAX_LINES) break;
+        if (!emit(part)) return;
+        if (count >= maxLines) return;
       }
     }
-    if (lines.length < MAX_LINES && remainder.trim()) lines.push(remainder);
-    if (lines.length === 0) return null;
-
-    let id = null, cwd = null, timestamp = null, preview = null;
-
-    for (const line of lines) {
-      try {
-        const entry = JSON.parse(line);
-        if (entry.type === 'session_meta' && entry.payload) {
-          id = entry.payload.id;
-          cwd = entry.payload.cwd;
-          timestamp = entry.payload.timestamp || entry.timestamp;
-        }
-        if (!preview && entry.type === 'event_msg' && entry.payload?.type === 'user_message' && entry.payload.message) {
-          preview = entry.payload.message.slice(0, 150).replace(/\n/g, ' ').trim();
-        }
-        if (id && preview) break;
-      } catch {}
-    }
-    if (!id || !cwd) return null;
-
-    // Canonicalize cwd for reliable merging with Claude projects
-    let realCwd = cwd;
-    try { realCwd = fs.realpathSync(cwd); } catch {}
-
-    return {
-      id, cwd: realCwd, rawCwd: cwd,
-      mtime: stat.mtimeMs,
-      date: stat.mtime.toISOString(),
-      preview,
-      filePath,
-    };
+    if (count < maxLines && remainder.trim()) emit(remainder);
   } finally {
     fs.closeSync(fd);
   }
+}
+
+// First text block of a Claude-format message content (string or block array).
+function claudeTextContent(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) return content.find(c => c.type === 'text')?.text || '';
+  return '';
+}
+// All text blocks of a pi-format message content, joined.
+function piTextContent(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) return content.filter(c => c.type === 'text').map(c => c.text).join(' ');
+  return '';
+}
+// A user message worth naming a session after (not injected scaffolding).
+function isNamableUserText(text) {
+  return !!text && text.length > 3 && !text.startsWith('You are a')
+    && !text.includes('<local-command-caveat>') && !text.includes('<command-name>');
+}
+
+function parseCodexRollout(filePath, stat) {
+  // session_meta can be 15KB+ due to base_instructions, hence the line cap
+  let id = null, cwd = null, preview = null;
+  forEachJsonlEntry(filePath, { maxLines: 15 }, entry => {
+    if (entry.type === 'session_meta' && entry.payload) {
+      id = entry.payload.id;
+      cwd = entry.payload.cwd;
+    }
+    if (!preview && entry.type === 'event_msg' && entry.payload?.type === 'user_message' && entry.payload.message) {
+      preview = entry.payload.message.slice(0, 150).replace(/\n/g, ' ').trim();
+    }
+    if (id && preview) return false;
+  });
+  if (!id || !cwd) return null;
+
+  // Canonicalize cwd for reliable merging with Claude projects
+  let realCwd = cwd;
+  try { realCwd = fs.realpathSync(cwd); } catch {}
+
+  return {
+    id, cwd: realCwd, rawCwd: cwd,
+    mtime: stat.mtimeMs,
+    date: stat.mtime.toISOString(),
+    preview,
+    filePath,
+  };
 }
 
 // Extract UUID from codex rollout filename: rollout-YYYY-MM-DDThh-mm-ss-<UUID>.jsonl
@@ -460,78 +470,39 @@ function scanPiSessions() {
 }
 
 function parsePiSession(filePath, stat) {
-  const fd = fs.openSync(filePath, 'r');
-  try {
-    const CHUNK_SIZE = 65536;
-    const MAX_LINES = 25;
-    const lines = [];
-    let remainder = '';
-    let offset = 0;
-    while (lines.length < MAX_LINES) {
-      const buf = Buffer.alloc(CHUNK_SIZE);
-      const bytesRead = fs.readSync(fd, buf, 0, CHUNK_SIZE, offset);
-      if (bytesRead === 0) break;
-      offset += bytesRead;
-      const chunk = remainder + buf.toString('utf8', 0, bytesRead);
-      const parts = chunk.split('\n');
-      remainder = parts.pop();
-      for (const part of parts) {
-        if (part.trim()) lines.push(part);
-        if (lines.length >= MAX_LINES) break;
+  let id = null, cwd = null, preview = null, sessionName = null;
+  forEachJsonlEntry(filePath, { maxLines: 25 }, entry => {
+    // Session header: extract ID and CWD
+    if (entry.type === 'session') {
+      id = entry.id;
+      cwd = entry.cwd;
+    }
+    // User-set session name (takes priority over preview)
+    if (entry.type === 'session_info' && entry.name) {
+      sessionName = entry.name;
+    }
+    // First user message for preview
+    if (!preview && entry.type === 'message' && entry.message?.role === 'user') {
+      const text = piTextContent(entry.message.content);
+      if (text && text.length > 3) {
+        preview = text.slice(0, 150).replace(/\n/g, ' ').trim();
       }
     }
+  });
 
-    let id = null, cwd = null, preview = null, sessionName = null;
+  if (!id || !cwd) return null;
 
-    for (const line of lines) {
-      try {
-        const entry = JSON.parse(line);
+  let realCwd = cwd;
+  try { realCwd = fs.realpathSync(cwd); } catch {}
 
-        // Session header: extract ID and CWD
-        if (entry.type === 'session') {
-          id = entry.id;
-          cwd = entry.cwd;
-        }
-
-        // User-set session name (takes priority over preview)
-        if (entry.type === 'session_info' && entry.name) {
-          sessionName = entry.name;
-        }
-
-        // First user message for preview
-        if (!preview && entry.type === 'message' && entry.message?.role === 'user') {
-          const content = entry.message.content;
-          let text = '';
-          if (typeof content === 'string') text = content;
-          else if (Array.isArray(content)) {
-            text = content
-              .filter(c => c.type === 'text')
-              .map(c => c.text)
-              .join(' ');
-          }
-          if (text && text.length > 3) {
-            preview = text.slice(0, 150).replace(/\n/g, ' ').trim();
-          }
-        }
-      } catch {}
-    }
-
-    if (!id || !cwd) return null;
-
-    let realCwd = cwd;
-    try { realCwd = fs.realpathSync(cwd); } catch {}
-
-    return {
-      id,
-      cwd: realCwd,
-      mtime: stat.mtimeMs,
-      date: stat.mtime.toISOString(),
-      preview: sessionName || preview,
-      jsonlPath: filePath,
-    };
-  } finally {
-    fs.closeSync(fd);
-  }
+  return {
+    id,
+    cwd: realCwd,
+    mtime: stat.mtimeMs,
+    date: stat.mtime.toISOString(),
+    preview: sessionName || preview,
+    jsonlPath: filePath,
+  };
 }
 
 // Decode pi's --<dashed-path>-- encoding to a real filesystem path.
@@ -546,6 +517,155 @@ function decodePiProjectPath(encoded) {
 
 // Initial scan
 scanPiSessions();
+
+// --- Agent registry ---
+// Everything agent-specific lives here: binary, session index + rescan,
+// summary-cache key namespacing, launch command, and new-session detection
+// (snapshotKeys lists what exists before launch; detect finds what the PTY
+// created). Claude's transcript store (~/.claude/projects encoded dirs) is
+// structurally different from the flat per-agent indexes, so endpoints handle
+// claude's project grouping explicitly; EXTERNAL_AGENTS covers the
+// index-backed agents generically. Adding an agent = one entry here plus a
+// scanner/index pair above.
+
+// Codex groups rollouts under YYYY/MM/DD; a session launched before midnight
+// lives in the launch day's dir even when we look for it the next day.
+function codexDayDirs(sessionStart) {
+  const dirs = new Set();
+  for (const t of [sessionStart, Date.now()]) {
+    const d = new Date(t);
+    dirs.add(path.join(CODEX_SESSIONS_DIR,
+      String(d.getFullYear()),
+      String(d.getMonth() + 1).padStart(2, '0'),
+      String(d.getDate()).padStart(2, '0')));
+  }
+  return [...dirs];
+}
+
+function piProjectDir(project) {
+  for (const dirName of readdirSafe(PI_SESSIONS_DIR)) {
+    try { if (decodePiProjectPath(dirName) === project) return path.join(PI_SESSIONS_DIR, dirName); } catch {}
+  }
+  return null;
+}
+
+const AGENTS = {
+  claude: {
+    bin: claudeBin,
+    summaryKey: id => id, // plain id for backward compat with old caches
+    launch(resume) {
+      const flags = `--settings '{"sandbox":{"enabled":true}}'`;
+      return resume ? `${claudeBin} ${flags} --resume ${resume}` : `${claudeBin} ${flags}`;
+    },
+    snapshotKeys({ encodedDir }) {
+      if (!encodedDir) return [];
+      return readdirSafe(path.join(PROJECTS_DIR, encodedDir)).filter(f => f.endsWith('.jsonl'));
+    },
+    detect({ encodedDir, preexisting, sessionStart }) {
+      if (!encodedDir) return null;
+      const projDir = path.join(PROJECTS_DIR, encodedDir);
+      const files = readdirSafe(projDir)
+        .filter(f => f.endsWith('.jsonl') && !preexisting.has(f))
+        .map(f => ({ name: f.replace('.jsonl', ''), mtime: statMtimeSafe(path.join(projDir, f)) }))
+        .filter(f => f.mtime >= sessionStart - 5000)
+        .sort((a, b) => b.mtime - a.mtime);
+      return files[0]?.name || null;
+    },
+  },
+  codex: {
+    bin: codexBin,
+    scan: scanCodexSessions,
+    sessions: () => codexIndex.values(),
+    summaryKey: id => `codex:${id}`,
+    launch(resume, project) {
+      return resume
+        ? `${codexBin} resume -C ${JSON.stringify(project)} ${resume}`
+        : `${codexBin} -C ${JSON.stringify(project)}`;
+    },
+    snapshotKeys({ sessionStart }) {
+      return codexDayDirs(sessionStart).flatMap(d => readdirSafe(d).filter(f => f.endsWith('.jsonl')));
+    },
+    detect({ preexisting, sessionStart }) {
+      for (const dayDir of codexDayDirs(sessionStart)) {
+        const files = readdirSafe(dayDir)
+          .filter(f => f.endsWith('.jsonl') && !preexisting.has(f))
+          .map(f => ({ name: codexFileSessionId(f), mtime: statMtimeSafe(path.join(dayDir, f)) }))
+          .filter(f => f.name && f.mtime >= sessionStart - 5000)
+          .sort((a, b) => b.mtime - a.mtime);
+        if (files.length) return files[0].name;
+      }
+      return null;
+    },
+  },
+  gemini: {
+    bin: geminiBin,
+    scan: scanGeminiSessions,
+    sessions: () => geminiIndex.values(),
+    summaryKey: id => `gemini:${id}`,
+    launch(resume) {
+      return resume ? `${geminiBin} --sandbox --resume ${resume}` : `${geminiBin} --sandbox`;
+    },
+    // Gemini multiplexes sessions inside a shared logs.json, so snapshots and
+    // detection key on session ids rather than filenames.
+    snapshotKeys({ project }) {
+      scanGeminiSessions();
+      const ids = [];
+      for (const s of geminiIndex.values()) if (s.cwd === project) ids.push(s.id);
+      return ids;
+    },
+    detect({ project, preexisting, sessionStart }) {
+      scanGeminiSessions();
+      const session = [...geminiIndex.values()]
+        .filter(s => s.cwd === project && s.mtime >= sessionStart - 5000 && !preexisting.has(s.id))
+        .sort((a, b) => b.mtime - a.mtime)[0];
+      return session ? session.id : null;
+    },
+  },
+  pi: {
+    bin: piBin,
+    scan: scanPiSessions,
+    sessions: () => piIndex.values(),
+    summaryKey: id => `pi:${id}`,
+    launch(resume) {
+      return resume ? `${piBin} --session ${resume}` : `${piBin}`;
+    },
+    snapshotKeys({ project }) {
+      const dir = piProjectDir(project);
+      return dir ? readdirSafe(dir).filter(f => f.endsWith('.jsonl')) : [];
+    },
+    detect({ project, preexisting, sessionStart }) {
+      scanPiSessions();
+      const dir = piProjectDir(project);
+      if (!dir) return null;
+      const files = readdirSafe(dir)
+        .filter(f => f.endsWith('.jsonl') && !preexisting.has(f))
+        .map(f => ({ path: path.join(dir, f), mtime: statMtimeSafe(path.join(dir, f)) }))
+        .filter(f => f.mtime >= sessionStart - 5000)
+        .sort((a, b) => b.mtime - a.mtime);
+      if (!files.length) return null;
+      // Pi filenames aren't the session id — read it from the header line.
+      let id = null;
+      try {
+        forEachJsonlEntry(files[0].path, { maxLines: 1 }, entry => {
+          if (entry.type === 'session' && entry.id) id = entry.id;
+          return false;
+        });
+      } catch {}
+      return id;
+    },
+  },
+};
+// Index-backed agents (everything except claude's encoded-dir store)
+const EXTERNAL_AGENTS = Object.keys(AGENTS).filter(a => a !== 'claude');
+function scanExternalSessions() {
+  for (const a of EXTERNAL_AGENTS) AGENTS[a].scan();
+}
+function findAgentSession(agent, id) {
+  for (const entry of AGENTS[agent].sessions()) {
+    if (entry.id === id) return entry;
+  }
+  return null;
+}
 
 // --- Path decoding ---
 
@@ -639,40 +759,13 @@ function getProjectName(p) {
 function getUserMessages(jsonlPath, maxBytes = 256 * 1024) {
   const messages = [];
   try {
-    const fd = fs.openSync(jsonlPath, 'r');
-    try {
-      const buf = Buffer.alloc(Math.min(65536, maxBytes));
-      let remainder = '';
-      let offset = 0;
-      let totalRead = 0;
-      while (totalRead < maxBytes) {
-        const bytesRead = fs.readSync(fd, buf, 0, buf.length, offset);
-        if (bytesRead === 0) break;
-        offset += bytesRead;
-        totalRead += bytesRead;
-        const chunk = remainder + buf.toString('utf8', 0, bytesRead);
-        const parts = chunk.split('\n');
-        remainder = parts.pop();
-        for (const part of parts) {
-          if (!part.trim()) continue;
-          try {
-            const entry = JSON.parse(part);
-            if (entry.type === 'user' && entry.message?.content) {
-              const text = typeof entry.message.content === 'string'
-                ? entry.message.content
-                : Array.isArray(entry.message.content)
-                  ? (entry.message.content.find(c => c.type === 'text')?.text || '')
-                  : '';
-              if (text && text.length > 3 && !text.startsWith('You are a') && !text.includes('<local-command-caveat>') && !text.includes('<command-name>')) {
-                messages.push(text.slice(0, 300).replace(/\n/g, ' ').trim());
-              }
-            }
-          } catch {}
-        }
+    forEachJsonlEntry(jsonlPath, { maxBytes }, entry => {
+      if (entry.type !== 'user' || !entry.message?.content) return;
+      const text = claudeTextContent(entry.message.content);
+      if (isNamableUserText(text)) {
+        messages.push(text.slice(0, 300).replace(/\n/g, ' ').trim());
       }
-    } finally {
-      fs.closeSync(fd);
-    }
+    });
   } catch {}
   return messages;
 }
@@ -692,59 +785,23 @@ function getSessionInfo(jsonlPath) {
 }
 
 function readSessionInfo(jsonlPath) {
+  let firstUserMessage = null;
+  let timestamp = null;
+  let slug = null;
   try {
-    const fd = fs.openSync(jsonlPath, 'r');
-    const lines = [];
-    try {
-      const MAX_LINES = 20;
-      const CHUNK_SIZE = 65536;
-      let remainder = '';
-      let offset = 0;
-      while (lines.length < MAX_LINES) {
-        const buffer = Buffer.alloc(CHUNK_SIZE);
-        const bytesRead = fs.readSync(fd, buffer, 0, CHUNK_SIZE, offset);
-        if (bytesRead === 0) break;
-        offset += bytesRead;
-        const chunk = remainder + buffer.toString('utf8', 0, bytesRead);
-        const parts = chunk.split('\n');
-        remainder = parts.pop();
-        for (const part of parts) {
-          if (part.trim()) lines.push(part);
-          if (lines.length >= MAX_LINES) break;
+    forEachJsonlEntry(jsonlPath, { maxLines: 20 }, entry => {
+      if (!timestamp && entry.timestamp) timestamp = entry.timestamp;
+      if (!slug && entry.slug) slug = entry.slug;
+      if (entry.type === 'user' && entry.message?.content) {
+        const text = claudeTextContent(entry.message.content);
+        if (isNamableUserText(text)) {
+          firstUserMessage = text.slice(0, 150).replace(/\n/g, ' ').trim();
+          return false;
         }
       }
-      if (lines.length < MAX_LINES && remainder.trim()) lines.push(remainder);
-    } finally {
-      fs.closeSync(fd);
-    }
-
-    let firstUserMessage = null;
-    let timestamp = null;
-    let slug = null;
-
-    for (const line of lines) {
-      try {
-        const entry = JSON.parse(line);
-        if (!timestamp && entry.timestamp) timestamp = entry.timestamp;
-        if (!slug && entry.slug) slug = entry.slug;
-        if (entry.type === 'user' && entry.message?.content) {
-          const text = typeof entry.message.content === 'string'
-            ? entry.message.content
-            : Array.isArray(entry.message.content)
-              ? (entry.message.content.find(c => c.type === 'text')?.text || '')
-              : '';
-          if (text && text.length > 3 && !text.startsWith('You are a') && !text.includes('<local-command-caveat>') && !text.includes('<command-name>')) {
-            firstUserMessage = text.slice(0, 150).replace(/\n/g, ' ').trim();
-            break;
-          }
-        }
-      } catch {}
-    }
-
-    return { firstUserMessage, timestamp, slug };
-  } catch {
-    return { firstUserMessage: null, timestamp: null, slug: null };
-  }
+    });
+  } catch {}
+  return { firstUserMessage, timestamp, slug };
 }
 
 // --- Haiku summaries ---
@@ -844,12 +901,9 @@ async function generateLiveTitle(text) {
 // B2: Track in-flight summary generation to prevent duplicate API calls
 const summarizing = new Set();
 
-// Summary cache keys are namespaced as "agent:id" for Codex and Gemini, plain id for Claude (backward compat)
+// Summary cache keys are namespaced as "agent:id" for external agents, plain id for Claude (backward compat)
 function summaryCacheKey(agent, id) {
-  if (agent === 'codex') return `codex:${id}`;
-  if (agent === 'gemini') return `gemini:${id}`;
-  if (agent === 'pi') return `pi:${id}`;
-  return id;
+  return AGENTS[agent] ? AGENTS[agent].summaryKey(id) : id;
 }
 
 // --- SSE for summary updates ---
@@ -882,42 +936,25 @@ function broadcastSummaryUpdate(sessionId, agent, summary) {
 function getPiUserMessages(jsonlPath, maxBytes = 256 * 1024) {
   const messages = [];
   try {
-    const fd = fs.openSync(jsonlPath, 'r');
-    try {
-      const buf = Buffer.alloc(Math.min(65536, maxBytes));
-      let remainder = '';
-      let offset = 0;
-      let totalRead = 0;
-      while (totalRead < maxBytes) {
-        const bytesRead = fs.readSync(fd, buf, 0, buf.length, offset);
-        if (bytesRead === 0) break;
-        offset += bytesRead;
-        totalRead += bytesRead;
-        const chunk = remainder + buf.toString('utf8', 0, bytesRead);
-        const parts = chunk.split('\n');
-        remainder = parts.pop();
-        for (const part of parts) {
-          if (!part.trim()) continue;
-          try {
-            const entry = JSON.parse(part);
-            if (entry.type !== 'message' || entry.message?.role !== 'user') continue;
-            const content = entry.message.content;
-            let text = '';
-            if (typeof content === 'string') text = content;
-            else if (Array.isArray(content)) {
-              text = content.filter(c => c.type === 'text').map(c => c.text).join(' ');
-            }
-            if (text && text.length > 3 && !text.startsWith('You are a')) {
-              messages.push(text.slice(0, 300).replace(/\n/g, ' ').trim());
-            }
-          } catch {}
-        }
+    forEachJsonlEntry(jsonlPath, { maxBytes }, entry => {
+      if (entry.type !== 'message' || entry.message?.role !== 'user') return;
+      const text = piTextContent(entry.message.content);
+      if (text && text.length > 3 && !text.startsWith('You are a')) {
+        messages.push(text.slice(0, 300).replace(/\n/g, ' ').trim());
       }
-    } finally {
-      fs.closeSync(fd);
-    }
+    });
   } catch {}
   return messages;
+}
+
+// Concatenate messages with ' | ' up to a total length budget.
+function joinUpTo(msgs, limit = 1500) {
+  let text = '';
+  for (const m of msgs) {
+    if (text.length + m.length > limit) break;
+    text += (text ? ' | ' : '') + m;
+  }
+  return text;
 }
 
 function getNamingText(session) {
@@ -926,38 +963,18 @@ function getNamingText(session) {
       const logs = JSON.parse(fs.readFileSync(session.logsFile, 'utf8'));
       const msgs = logs.filter(e => e.sessionId === session.id && e.type === 'user' && e.message && !e.message.startsWith('/'))
                        .map(e => e.message.slice(0, 300).replace(/\n/g, ' ').trim());
-      if (msgs.length) {
-        let text = '';
-        for (const m of msgs) {
-          if (text.length + m.length > 1500) break;
-          text += (text ? ' | ' : '') + m;
-        }
-        if (text.length >= 10) return text;
-      }
+      const text = joinUpTo(msgs);
+      if (text.length >= 10) return text;
     } catch {}
   }
   if (session.agent === 'pi' && session.jsonlPath) {
-    const msgs = getPiUserMessages(session.jsonlPath);
-    if (msgs.length) {
-      let text = '';
-      for (const m of msgs) {
-        if (text.length + m.length > 1500) break;
-        text += (text ? ' | ' : '') + m;
-      }
-      if (text.length >= 10) return text;
-    }
+    const text = joinUpTo(getPiUserMessages(session.jsonlPath));
+    if (text.length >= 10) return text;
     return session.preview;
   }
   if (session.jsonlPath) {
-    const msgs = getUserMessages(session.jsonlPath);
-    if (msgs.length) {
-      let text = '';
-      for (const m of msgs) {
-        if (text.length + m.length > 1500) break;
-        text += (text ? ' | ' : '') + m;
-      }
-      if (text.length >= 10) return text;
-    }
+    const text = joinUpTo(getUserMessages(session.jsonlPath));
+    if (text.length >= 10) return text;
   }
   return session.preview;
 }
@@ -1045,80 +1062,60 @@ function computeTokenUsage() {
 
       let sessionHadUsage = false;
       try {
-        const fd = fs.openSync(filePath, 'r');
-        try {
-          const CHUNK = 65536;
-          let remainder = '';
-          let offset = 0;
-          let reading = true;
-          while (reading) {
-            const buf = Buffer.alloc(CHUNK);
-            const bytesRead = fs.readSync(fd, buf, 0, CHUNK, offset);
-            if (bytesRead === 0) break;
-            offset += bytesRead;
-            const chunk = remainder + buf.toString('utf8', 0, bytesRead);
-            const parts = chunk.split('\n');
-            remainder = parts.pop();
-            for (const part of parts) {
-              if (!part.trim()) continue;
-              try {
-                const entry = JSON.parse(part);
-                // Check timestamp
-                const ts = entry.timestamp;
-                if (ts && typeof ts === 'string') {
-                  try { if (new Date(ts) < cutoff) continue; } catch {}
-                }
-                const msg = entry.message;
-                if (!msg || typeof msg !== 'object' || !msg.usage) continue;
-                const usage = msg.usage;
-                const rawModel = msg.model || 'unknown';
-                const model = MODEL_ALIASES[rawModel] || rawModel;
-                sessionHadUsage = true;
-                totalMessages++;
-
-                if (!byModel[model]) byModel[model] = { input: 0, output: 0, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0, messages: 0 };
-                const m = byModel[model];
-                m.input += usage.input_tokens || 0;
-                m.output += usage.output_tokens || 0;
-                m.cache_read += usage.cache_read_input_tokens || 0;
-                // Break down cache write by duration if available
-                const cc = usage.cache_creation;
-                if (cc && typeof cc === 'object') {
-                  m.cache_write_5m += cc.ephemeral_5m_input_tokens || 0;
-                  m.cache_write_1h += cc.ephemeral_1h_input_tokens || 0;
-                } else {
-                  // Older format: all cache creation lumped together, assume 5m
-                  m.cache_write_5m += usage.cache_creation_input_tokens || 0;
-                }
-                m.messages++;
-
-                // Daily aggregation
-                let dateKey = null;
-                if (ts && typeof ts === 'string') {
-                  try { dateKey = ts.slice(0, 10); } catch {}
-                }
-                if (dateKey) {
-                  if (!byDate[dateKey]) byDate[dateKey] = { input: 0, output: 0, cache_write: 0, cache_read: 0, cost: 0 };
-                  const d = byDate[dateKey];
-                  d.input += usage.input_tokens || 0;
-                  d.output += usage.output_tokens || 0;
-                  d.cache_write += usage.cache_creation_input_tokens || 0;
-                  d.cache_read += usage.cache_read_input_tokens || 0;
-
-                  // Compute cost for this message
-                  const pricing = MODEL_PRICING[model] || DEFAULT_PRICING;
-                  const cw5m = cc?.ephemeral_5m_input_tokens || (cc ? 0 : (usage.cache_creation_input_tokens || 0));
-                  const cw1h = cc?.ephemeral_1h_input_tokens || 0;
-                  d.cost += ((usage.input_tokens || 0) * pricing.input
-                    + (usage.output_tokens || 0) * pricing.output
-                    + cw5m * pricing.cache_write_5m
-                    + cw1h * pricing.cache_write_1h
-                    + (usage.cache_read_input_tokens || 0) * pricing.cache_read) / 1_000_000;
-                }
-              } catch {}
-            }
+        forEachJsonlEntry(filePath, {}, entry => {
+          // Check timestamp
+          const ts = entry.timestamp;
+          if (ts && typeof ts === 'string') {
+            try { if (new Date(ts) < cutoff) return; } catch {}
           }
-        } finally { fs.closeSync(fd); }
+          const msg = entry.message;
+          if (!msg || typeof msg !== 'object' || !msg.usage) return;
+          const usage = msg.usage;
+          const rawModel = msg.model || 'unknown';
+          const model = MODEL_ALIASES[rawModel] || rawModel;
+          sessionHadUsage = true;
+          totalMessages++;
+
+          if (!byModel[model]) byModel[model] = { input: 0, output: 0, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0, messages: 0 };
+          const m = byModel[model];
+          m.input += usage.input_tokens || 0;
+          m.output += usage.output_tokens || 0;
+          m.cache_read += usage.cache_read_input_tokens || 0;
+          // Break down cache write by duration if available
+          const cc = usage.cache_creation;
+          if (cc && typeof cc === 'object') {
+            m.cache_write_5m += cc.ephemeral_5m_input_tokens || 0;
+            m.cache_write_1h += cc.ephemeral_1h_input_tokens || 0;
+          } else {
+            // Older format: all cache creation lumped together, assume 5m
+            m.cache_write_5m += usage.cache_creation_input_tokens || 0;
+          }
+          m.messages++;
+
+          // Daily aggregation
+          let dateKey = null;
+          if (ts && typeof ts === 'string') {
+            try { dateKey = ts.slice(0, 10); } catch {}
+          }
+          if (dateKey) {
+            if (!byDate[dateKey]) byDate[dateKey] = { input: 0, output: 0, cache_write: 0, cache_read: 0, cost: 0 };
+            const d = byDate[dateKey];
+            d.input += usage.input_tokens || 0;
+            d.output += usage.output_tokens || 0;
+            d.cache_write += usage.cache_creation_input_tokens || 0;
+            d.cache_read += usage.cache_read_input_tokens || 0;
+
+            // Compute cost for this message
+            const pricing = MODEL_PRICING[model] || DEFAULT_PRICING;
+            const cw5m = cc?.ephemeral_5m_input_tokens || (cc ? 0 : (usage.cache_creation_input_tokens || 0));
+            const cw1h = cc?.ephemeral_1h_input_tokens || 0;
+            d.cost += ((usage.input_tokens || 0) * pricing.input
+              + (usage.output_tokens || 0) * pricing.output
+              + cw5m * pricing.cache_write_5m
+              + cw1h * pricing.cache_write_1h
+              + (usage.cache_read_input_tokens || 0) * pricing.cache_read) / 1_000_000;
+          }
+        });
       } catch {}
       if (sessionHadUsage) totalSessions++;
     }
@@ -1161,10 +1158,8 @@ app.get('/api/token-usage', (req, res) => {
 
 app.get('/api/projects', (req, res) => {
   try {
-    // Rescan Codex and Gemini sessions for fresh data
-    scanCodexSessions();
-    scanGeminiSessions();
-    scanPiSessions();
+    // Rescan external agent sessions for fresh data
+    scanExternalSessions();
 
     const projectMap = new Map(); // realPath -> project info
 
@@ -1173,6 +1168,13 @@ app.get('/api/projects', (req, res) => {
     const canon = p => {
       try { return fs.realpathSync(p); } catch { return p; }
     };
+
+    // B5: universe of live session cache keys, for pruning stale summaries
+    // after the response. Built in the SAME pass as the project list — deriving
+    // it later from projectMap.claudeEncoded missed sessions whenever two
+    // encoded dirs merged into one project (symlinked paths), so their
+    // summaries were pruned and re-generated (real Haiku calls) on every load.
+    const allSessionKeys = new Set();
 
     // Claude projects from ~/.claude/projects/
     const dirs = fs.readdirSync(PROJECTS_DIR).filter(d => {
@@ -1186,6 +1188,7 @@ app.get('/api/projects', (req, res) => {
       const key = exists ? canon(decoded) : decoded;
       const projDir = path.join(PROJECTS_DIR, encoded);
       const jsonls = fs.readdirSync(projDir).filter(f => f.endsWith('.jsonl'));
+      for (const f of jsonls) allSessionKeys.add(f.replace('.jsonl', ''));
       if (jsonls.length === 0) continue;
 
       // Only count sessions that have a first user message — stubs without one
@@ -1205,71 +1208,36 @@ app.get('/api/projects', (req, res) => {
 
       const existing = projectMap.get(key);
       if (existing) {
-        existing.claudeCount += resumableCount;
+        existing.sessionCount += resumableCount;
         if (latestMtime > existing.latestMtime) existing.latestMtime = latestMtime;
         // Prefer an encoded dir whose decoded path matches the canonical key
         if (!existing.claudeEncoded || decoded === key) existing.claudeEncoded = encoded;
       } else {
         projectMap.set(key, {
           path: key, name: getProjectName(key), exists,
-          claudeCount: resumableCount, codexCount: 0, geminiCount: 0, piCount: 0, latestMtime,
+          sessionCount: resumableCount, latestMtime,
           claudeEncoded: encoded,
         });
       }
     }
 
-    // Codex projects grouped by cwd. Skip entries without a preview — they're
-    // empty rollout stubs that codex --resume won't recognize.
-    for (const entry of codexIndex.values()) {
-      if (!entry.preview) continue;
-      const key = canon(entry.cwd);
-      const existing = projectMap.get(key);
-      if (existing) {
-        existing.codexCount++;
-        if (entry.mtime > existing.latestMtime) existing.latestMtime = entry.mtime;
-      } else {
-        const exists = fs.existsSync(key);
-        projectMap.set(key, {
-          path: key, name: getProjectName(key), exists,
-          claudeCount: 0, codexCount: 1, geminiCount: 0, piCount: 0, latestMtime: entry.mtime,
-          claudeEncoded: null,
-        });
-      }
-    }
-
-    // Gemini projects grouped by cwd
-    for (const entry of geminiIndex.values()) {
-      if (!entry.preview) continue;
-      const key = canon(entry.cwd);
-      const existing = projectMap.get(key);
-      if (existing) {
-        existing.geminiCount++;
-        if (entry.mtime > existing.latestMtime) existing.latestMtime = entry.mtime;
-      } else {
-        const exists = fs.existsSync(key);
-        projectMap.set(key, {
-          path: key, name: getProjectName(key), exists,
-          claudeCount: 0, codexCount: 0, geminiCount: 1, piCount: 0, latestMtime: entry.mtime,
-          claudeEncoded: null,
-        });
-      }
-    }
-
-    // Pi projects grouped by cwd
-    for (const entry of piIndex.values()) {
-      if (!entry.preview) continue;
-      const key = canon(entry.cwd);
-      const existing = projectMap.get(key);
-      if (existing) {
-        existing.piCount++;
-        if (entry.mtime > existing.latestMtime) existing.latestMtime = entry.mtime;
-      } else {
-        const exists = fs.existsSync(key);
-        projectMap.set(key, {
-          path: key, name: getProjectName(key), exists,
-          claudeCount: 0, codexCount: 0, geminiCount: 0, piCount: 1, latestMtime: entry.mtime,
-          claudeEncoded: null,
-        });
+    // External-agent projects grouped by cwd. Skip entries without a preview —
+    // they're empty stubs that `--resume` won't recognize.
+    for (const a of EXTERNAL_AGENTS) {
+      for (const entry of AGENTS[a].sessions()) {
+        if (!entry.preview) continue;
+        const key = canon(entry.cwd);
+        const existing = projectMap.get(key);
+        if (existing) {
+          existing.sessionCount++;
+          if (entry.mtime > existing.latestMtime) existing.latestMtime = entry.mtime;
+        } else {
+          projectMap.set(key, {
+            path: key, name: getProjectName(key), exists: fs.existsSync(key),
+            sessionCount: 1, latestMtime: entry.mtime,
+            claudeEncoded: null,
+          });
+        }
       }
     }
 
@@ -1278,7 +1246,7 @@ app.get('/api/projects', (req, res) => {
         path: p.path,
         name: p.name,
         exists: p.exists,
-        sessionCount: p.claudeCount + p.codexCount + p.geminiCount + p.piCount,
+        sessionCount: p.sessionCount,
         latestMtime: p.latestMtime,
         codexAvailable: !!codexBin,
         geminiAvailable: !!geminiBin,
@@ -1291,26 +1259,11 @@ app.get('/api/projects', (req, res) => {
 
     res.json(projects);
 
-    // B5: Lazily prune stale summaries
-    const allSessionKeys = new Set();
-    for (const p of projectMap.values()) {
-      if (p.claudeEncoded) {
-        try {
-          const projDir = path.join(PROJECTS_DIR, p.claudeEncoded);
-          for (const f of fs.readdirSync(projDir)) {
-            if (f.endsWith('.jsonl')) allSessionKeys.add(f.replace('.jsonl', ''));
-          }
-        } catch {}
+    // B5: Lazily prune stale summaries (claude keys were collected above)
+    for (const a of EXTERNAL_AGENTS) {
+      for (const entry of AGENTS[a].sessions()) {
+        allSessionKeys.add(AGENTS[a].summaryKey(entry.id));
       }
-    }
-    for (const entry of codexIndex.values()) {
-      allSessionKeys.add(`codex:${entry.id}`);
-    }
-    for (const entry of geminiIndex.values()) {
-      allSessionKeys.add(`gemini:${entry.id}`);
-    }
-    for (const entry of piIndex.values()) {
-      allSessionKeys.add(`pi:${entry.id}`);
     }
     let pruned = false;
     for (const key of Object.keys(summaryCache)) {
@@ -1338,8 +1291,7 @@ app.get('/api/sessions', (req, res) => {
 // Recent sessions across all projects (must be before :id route)
 app.get('/api/recent-sessions', (req, res) => {
   try {
-    scanCodexSessions();
-    scanPiSessions();
+    scanExternalSessions();
     const limit = Math.min(parseInt(req.query.limit) || 20, 50);
     const allSessions = [];
 
@@ -1374,43 +1326,19 @@ app.get('/api/recent-sessions', (req, res) => {
       } catch {}
     }
 
-    // Codex sessions
-    for (const entry of codexIndex.values()) {
-      const key = summaryCacheKey('codex', entry.id);
-      if (!entry.preview) continue;
-      const canonical = canon(entry.cwd);
-      allSessions.push({
-        id: entry.id, agent: 'codex', date: entry.date, mtime: entry.mtime,
-        preview: entry.preview,
-        summary: getSummaryText(key),
-        projectPath: canonical, projectName: getProjectName(canonical),
-      });
-    }
-
-    // Gemini sessions
-    for (const entry of geminiIndex.values()) {
-      const key = summaryCacheKey('gemini', entry.id);
-      if (!entry.preview) continue;
-      const canonical = canon(entry.cwd);
-      allSessions.push({
-        id: entry.id, agent: 'gemini', date: entry.date, mtime: entry.mtime,
-        preview: entry.preview,
-        summary: getSummaryText(key),
-        projectPath: canonical, projectName: getProjectName(canonical),
-      });
-    }
-
-    // Pi sessions
-    for (const entry of piIndex.values()) {
-      const key = summaryCacheKey('pi', entry.id);
-      if (!entry.preview) continue;
-      const canonical = canon(entry.cwd);
-      allSessions.push({
-        id: entry.id, agent: 'pi', date: entry.date, mtime: entry.mtime,
-        preview: entry.preview,
-        summary: getSummaryText(key),
-        projectPath: canonical, projectName: getProjectName(canonical),
-      });
+    // External agent sessions
+    for (const a of EXTERNAL_AGENTS) {
+      for (const entry of AGENTS[a].sessions()) {
+        if (!entry.preview) continue;
+        const canonical = canon(entry.cwd);
+        allSessions.push({
+          id: entry.id, agent: a, date: entry.date, mtime: entry.mtime,
+          preview: entry.preview,
+          summary: getSummaryText(summaryCacheKey(a, entry.id)),
+          jsonlPath: entry.jsonlPath, logsFile: entry.logsFile,
+          projectPath: canonical, projectName: getProjectName(canonical),
+        });
+      }
     }
 
     allSessions.sort((a, b) => b.mtime - a.mtime);
@@ -1428,14 +1356,11 @@ app.post('/api/regenerate-summaries', async (req, res) => {
   const { sessionId, projectId } = req.query;
   let cleared = 0;
   if (sessionId) {
-    // Clear one specific session
-    if (summaryCache[sessionId]) { delete summaryCache[sessionId]; cleared++; }
-    const codexKey = `codex:${sessionId}`;
-    if (summaryCache[codexKey]) { delete summaryCache[codexKey]; cleared++; }
-    const geminiKey = `gemini:${sessionId}`;
-    if (summaryCache[geminiKey]) { delete summaryCache[geminiKey]; cleared++; }
-    const piKey = `pi:${sessionId}`;
-    if (summaryCache[piKey]) { delete summaryCache[piKey]; cleared++; }
+    // Clear one specific session (under every agent's namespace)
+    for (const a of Object.keys(AGENTS)) {
+      const key = summaryCacheKey(a, sessionId);
+      if (summaryCache[key]) { delete summaryCache[key]; cleared++; }
+    }
   } else if (projectId) {
     // Clear all sessions for a project
     const projectDir = path.join(PROJECTS_DIR, projectId);
@@ -1510,38 +1435,17 @@ function serveSessions(res, projectPath) {
     }
   } catch {}
 
-  // Codex sessions
-  for (const entry of codexIndex.values()) {
-    if (entry.cwd !== projectPath && canonOf(entry.cwd) !== canonQuery) continue;
-    const key = summaryCacheKey('codex', entry.id);
-    allSessions.push({
-      id: entry.id, agent: 'codex', date: entry.date, mtime: entry.mtime,
-      preview: entry.preview,
-      summary: getSummaryText(key),
-    });
-  }
-
-  // Gemini sessions
-  for (const entry of geminiIndex.values()) {
-    if (entry.cwd !== projectPath && canonOf(entry.cwd) !== canonQuery) continue;
-    const key = summaryCacheKey('gemini', entry.id);
-    allSessions.push({
-      id: entry.id, agent: 'gemini', date: entry.date, mtime: entry.mtime,
-      preview: entry.preview,
-      summary: getSummaryText(key),
-    });
-  }
-
-  // Pi sessions
-  for (const entry of piIndex.values()) {
-    if (entry.cwd !== projectPath && canonOf(entry.cwd) !== canonQuery) continue;
-    const key = summaryCacheKey('pi', entry.id);
-    allSessions.push({
-      id: entry.id, agent: 'pi', date: entry.date, mtime: entry.mtime,
-      preview: entry.preview,
-      summary: getSummaryText(key),
-      jsonlPath: entry.jsonlPath,
-    });
+  // External agent sessions
+  for (const a of EXTERNAL_AGENTS) {
+    for (const entry of AGENTS[a].sessions()) {
+      if (entry.cwd !== projectPath && canonOf(entry.cwd) !== canonQuery) continue;
+      allSessions.push({
+        id: entry.id, agent: a, date: entry.date, mtime: entry.mtime,
+        preview: entry.preview,
+        summary: getSummaryText(summaryCacheKey(a, entry.id)),
+        jsonlPath: entry.jsonlPath, logsFile: entry.logsFile,
+      });
+    }
   }
 
   // Sort by recency, filter, truncate
@@ -1599,23 +1503,14 @@ wss.on('connection', (ws, req) => {
   const rows = parseInt(params.get('rows')) || 30;
 
   // Validate agent
-  if (agent !== 'claude' && agent !== 'codex' && agent !== 'gemini' && agent !== 'pi') {
+  const agentDef = AGENTS[agent];
+  if (!agentDef) {
     ws.send(JSON.stringify({ type: 'error', message: 'Invalid agent' }));
     ws.close();
     return;
   }
-  if (agent === 'codex' && !codexBin) {
-    ws.send(JSON.stringify({ type: 'error', message: 'Codex is not installed' }));
-    ws.close();
-    return;
-  }
-  if (agent === 'gemini' && !geminiBin) {
-    ws.send(JSON.stringify({ type: 'error', message: 'Gemini is not installed' }));
-    ws.close();
-    return;
-  }
-  if (agent === 'pi' && !piBin) {
-    ws.send(JSON.stringify({ type: 'error', message: 'Pi is not installed' }));
+  if (!agentDef.bin) {
+    ws.send(JSON.stringify({ type: 'error', message: `${agent[0].toUpperCase()}${agent.slice(1)} is not installed` }));
     ws.close();
     return;
   }
@@ -1651,14 +1546,21 @@ wss.on('connection', (ws, req) => {
   // Dedup: if an existing terminal is still registered for this (agent, sessionId),
   // its old WebSocket is likely a ghost (sleep/wake, crash) that we haven't reaped
   // yet. Kill it before spawning a replacement, otherwise both run in parallel.
+  // The old client must be told it was taken over BEFORE the socket closes —
+  // an abrupt terminate looks like a network drop, so a still-live client
+  // auto-reconnects and kills THIS terminal, and the two windows kill each
+  // other's PTYs forever. A `takenover` message (plus graceful close) lets the
+  // client mark the tab dead instead of reconnecting; true ghosts never read
+  // it and get reaped by the heartbeat.
   if (resume) {
     for (const [oldId, oldTerm] of terminals) {
       if (oldTerm.sessionId === resume && oldTerm.agent === agent) {
+        try { oldTerm.ws.send(JSON.stringify({ type: 'takenover' })); } catch {}
         // SIGHUP, not SIGTERM: interactive zsh ignores SIGTERM but honors SIGHUP
         // (terminal-hangup), which also propagates to the foreground process group
         // (claude/codex/gemini) via the tty.
         try { oldTerm.proc.kill('SIGHUP'); } catch {}
-        try { oldTerm.ws.terminate(); } catch {}
+        try { oldTerm.ws.close(4000, 'session taken over'); } catch {}
         terminals.delete(oldId);
       }
     }
@@ -1669,6 +1571,7 @@ wss.on('connection', (ws, req) => {
   // the user drops back to a live shell prompt in the same tab.
   const shell = process.env.SHELL || '/bin/zsh';
   let sessionId = resume || null;
+  const sessionStart = Date.now();
 
   // Snapshot the sessions that already exist in this project BEFORE launching the
   // agent. detectSessionId() picks the most-recently-written session file in the
@@ -1678,36 +1581,13 @@ wss.on('connection', (ws, req) => {
   // session, and the brand-new tab gets bound to the wrong session ID. On reload
   // it then resumes the wrong session and the real new session's tab vanishes.
   // Excluding everything that existed at connect time makes detection consider
-  // only the file this PTY actually creates. Filenames identify Claude/Codex/Pi
-  // sessions; Gemini groups multiple sessions inside one shared logs.json, so it
-  // is keyed by session id instead.
+  // only the file this PTY actually creates. What gets snapshotted (filenames vs
+  // session ids) is each agent's business — see AGENTS[*].snapshotKeys.
   const preexistingSessions = new Set();
   if (!resume) {
     try {
-      if (agent === 'claude' && encodedDir) {
-        for (const f of readdirSafe(path.join(PROJECTS_DIR, encodedDir)))
-          if (f.endsWith('.jsonl')) preexistingSessions.add(f);
-      } else if (agent === 'codex') {
-        const now = new Date();
-        const dayDir = path.join(CODEX_SESSIONS_DIR,
-          String(now.getFullYear()),
-          String(now.getMonth() + 1).padStart(2, '0'),
-          String(now.getDate()).padStart(2, '0'));
-        for (const f of readdirSafe(dayDir))
-          if (f.endsWith('.jsonl')) preexistingSessions.add(f);
-      } else if (agent === 'gemini') {
-        scanGeminiSessions();
-        for (const s of geminiIndex.values())
-          if (s.cwd === resolvedProject) preexistingSessions.add(s.id);
-      } else if (agent === 'pi') {
-        for (const dirName of readdirSafe(PI_SESSIONS_DIR)) {
-          let decoded;
-          try { decoded = decodePiProjectPath(dirName); } catch { continue; }
-          if (decoded !== resolvedProject) continue;
-          for (const f of readdirSafe(path.join(PI_SESSIONS_DIR, dirName)))
-            if (f.endsWith('.jsonl')) preexistingSessions.add(f);
-          break;
-        }
+      for (const k of agentDef.snapshotKeys({ project: resolvedProject, encodedDir, sessionStart })) {
+        preexistingSessions.add(k);
       }
     } catch {}
   }
@@ -1745,34 +1625,7 @@ wss.on('connection', (ws, req) => {
     ? `stty cols ${effectiveCols} 2>/dev/null; clear; `
     : 'clear; ';
 
-  let launchCmd;
-  if (agent === 'codex') {
-    if (resume) {
-      launchCmd = `${setSize}${codexBin} resume -C ${JSON.stringify(resolvedProject)} ${resume}\n`;
-    } else {
-      launchCmd = `${setSize}${codexBin} -C ${JSON.stringify(resolvedProject)}\n`;
-    }
-  } else if (agent === 'gemini') {
-    if (resume) {
-      launchCmd = `${setSize}${geminiBin} --sandbox --resume ${resume}\n`;
-    } else {
-      launchCmd = `${setSize}${geminiBin} --sandbox\n`;
-    }
-  } else if (agent === 'pi') {
-    if (resume) {
-      launchCmd = `${setSize}${piBin} --session ${resume}\n`;
-    } else {
-      launchCmd = `${setSize}${piBin}\n`;
-    }
-  } else {
-    const sandboxFlag = `--settings '{"sandbox":{"enabled":true}}'`;
-    if (resume) {
-      launchCmd = `${setSize}${claudeBin} ${sandboxFlag} --resume ${resume}\n`;
-    } else {
-      launchCmd = `${setSize}${claudeBin} ${sandboxFlag}\n`;
-    }
-  }
-  proc.write(launchCmd);
+  proc.write(`${setSize}${agentDef.launch(resume, resolvedProject)}\n`);
 
   // --- Auto-naming ---
   let outputBuffer = '';
@@ -1784,7 +1637,6 @@ wss.on('connection', (ws, req) => {
   const RENAME_INTERVAL = 5 * 60_000; // 5 minutes
   const MAX_RENAME_AGE = 30 * 60_000; // 30 minutes
   const MIN_NEW_CHARS = 1000;
-  const sessionStart = Date.now();
   let renameTimer = null;
   let sessionEnded = false;
 
@@ -1820,153 +1672,39 @@ wss.on('connection', (ws, req) => {
     return s;
   }
 
-  // Detect session ID for new sessions by finding the newest JSONL in the project dir
+  // Detect the session ID the agent created (see AGENTS[*].detect) and notify
+  // the client once, so the tab can be persisted and resumed.
   function detectSessionId() {
     if (sessionId) return sessionId;
-
-    if (agent === 'codex') {
-      // Scan today's Codex rollout dir for recently-created files
-      try {
-        const now = new Date();
-        const dayDir = path.join(CODEX_SESSIONS_DIR,
-          String(now.getFullYear()),
-          String(now.getMonth() + 1).padStart(2, '0'),
-          String(now.getDate()).padStart(2, '0'));
-        const files = readdirSafe(dayDir)
-          .filter(f => f.endsWith('.jsonl') && !preexistingSessions.has(f))
-          .map(f => {
-            const fp = path.join(dayDir, f);
-            return { name: codexFileSessionId(f), mtime: fs.statSync(fp).mtimeMs, path: fp };
-          })
-          .filter(f => f.name && f.mtime >= sessionStart - 5000)
-          .sort((a, b) => b.mtime - a.mtime);
-        if (files.length > 0) {
-          sessionId = files[0].name;
-          const entry = terminals.get(termId);
-          if (entry) entry.sessionId = sessionId;
-          try { ws.send(JSON.stringify({ type: 'ready', termId, sessionId })); } catch {}
-        }
-      } catch {}
-    } else if (agent === 'gemini') {
-      try {
-        scanGeminiSessions();
-        const session = Array.from(geminiIndex.values())
-          .filter(s => s.cwd === resolvedProject && s.mtime >= sessionStart - 5000 && !preexistingSessions.has(s.id))
-          .sort((a, b) => b.mtime - a.mtime)[0];
-        if (session) {
-          sessionId = session.id;
-          const entry = terminals.get(termId);
-          if (entry) entry.sessionId = sessionId;
-          try { ws.send(JSON.stringify({ type: 'ready', termId, sessionId })); } catch {}
-        }
-      } catch {}
-    } else if (agent === 'pi') {
-      try {
-        scanPiSessions();
-        const piDirs = readdirSafe(PI_SESSIONS_DIR);
-        for (const dirName of piDirs) {
-          let decoded;
-          try { decoded = decodePiProjectPath(dirName); } catch { continue; }
-          if (decoded !== resolvedProject) continue;
-          const projDir = path.join(PI_SESSIONS_DIR, dirName);
-          const files = readdirSafe(projDir)
-            .filter(f => f.endsWith('.jsonl') && !preexistingSessions.has(f))
-            .map(f => {
-              const filePath = path.join(projDir, f);
-              try {
-                const stat = fs.statSync(filePath);
-                return { name: f, path: filePath, mtime: stat.mtimeMs };
-              } catch { return null; }
-            })
-            .filter(f => f && f.mtime >= sessionStart - 5000)
-            .sort((a, b) => b.mtime - a.mtime);
-          if (files.length > 0) {
-            // Read first line to get session ID
-            try {
-              const headerLine = fs.readFileSync(files[0].path, 'utf8').split('\n')[0];
-              const header = JSON.parse(headerLine);
-              if (header.type === 'session' && header.id) {
-                sessionId = header.id;
-                const entry = terminals.get(termId);
-                if (entry) entry.sessionId = sessionId;
-                try { ws.send(JSON.stringify({ type: 'ready', termId, sessionId })); } catch {}
-              }
-            } catch {}
-          }
-          break; // Found the matching project dir
-        }
-      } catch {}
-    } else {
-      if (!encodedDir) return null;
-      try {
-        const projDir = path.join(PROJECTS_DIR, encodedDir);
-        const files = fs.readdirSync(projDir)
-          .filter(f => f.endsWith('.jsonl') && !preexistingSessions.has(f))
-          .map(f => ({ name: f.replace('.jsonl', ''), mtime: fs.statSync(path.join(projDir, f)).mtimeMs }))
-          .filter(f => f.mtime >= sessionStart - 5000)
-          .sort((a, b) => b.mtime - a.mtime);
-        if (files.length > 0) {
-          sessionId = files[0].name;
-          const entry = terminals.get(termId);
-          if (entry) entry.sessionId = sessionId;
-          try { ws.send(JSON.stringify({ type: 'ready', termId, sessionId })); } catch {}
-        }
-      } catch {}
+    let found = null;
+    try {
+      found = agentDef.detect({
+        project: resolvedProject, encodedDir,
+        preexisting: preexistingSessions, sessionStart,
+      });
+    } catch {}
+    if (found) {
+      sessionId = found;
+      const entry = terminals.get(termId);
+      if (entry) entry.sessionId = sessionId;
+      try { ws.send(JSON.stringify({ type: 'ready', termId, sessionId })); } catch {}
     }
     return sessionId;
   }
 
-  // Build naming input from JSONL user messages when available
+  // Build naming input from the session's transcript when available. Reuses
+  // getNamingText's per-agent extraction by synthesizing a session record;
+  // preview:null so a transcript-less session falls back to terminal output.
   function getJsonlNamingText() {
     const sid = detectSessionId();
     if (!sid) return null;
-
-    if (agent === 'gemini') {
-      let logsFile = null;
-      for (const entry of geminiIndex.values()) {
-        if (entry.id === sid) { logsFile = entry.logsFile; break; }
-      }
-      if (!logsFile) return null;
-      try {
-        const logs = JSON.parse(fs.readFileSync(logsFile, 'utf8'));
-        const msgs = logs.filter(e => e.sessionId === sid && e.type === 'user' && e.message && !e.message.startsWith('/'))
-                         .map(e => e.message.slice(0, 300).replace(/\n/g, ' ').trim());
-        if (!msgs.length) return null;
-        let text = '';
-        for (const m of msgs) {
-          if (text.length + m.length > 1500) break;
-          text += (text ? ' | ' : '') + m;
-        }
-        return text;
-      } catch {
-        return null;
-      }
+    if (agent === 'claude') {
+      if (!encodedDir) return null;
+      return getNamingText({ agent, id: sid, jsonlPath: path.join(PROJECTS_DIR, encodedDir, `${sid}.jsonl`), preview: null });
     }
-
-    let jsonlPath = null;
-    if (agent === 'codex') {
-      // Find Codex session file from index
-      for (const [fp, entry] of codexIndex.entries()) {
-        if (entry.id === sid) { jsonlPath = fp; break; }
-      }
-    } else if (agent === 'pi') {
-      // Find Pi session file from index
-      for (const [fp, entry] of piIndex.entries()) {
-        if (entry.id === sid) { jsonlPath = fp; break; }
-      }
-    } else if (encodedDir) {
-      jsonlPath = path.join(PROJECTS_DIR, encodedDir, `${sid}.jsonl`);
-    }
-    if (!jsonlPath) return null;
-    const msgs = agent === 'pi' ? getPiUserMessages(jsonlPath) : getUserMessages(jsonlPath);
-    if (!msgs.length) return null;
-    // Include all user messages, truncated to ~1500 chars total
-    let text = '';
-    for (const m of msgs) {
-      if (text.length + m.length > 1500) break;
-      text += (text ? ' | ' : '') + m;
-    }
-    return text;
+    const entry = findAgentSession(agent, sid);
+    if (!entry) return null;
+    return getNamingText({ agent, id: sid, jsonlPath: entry.jsonlPath, logsFile: entry.logsFile, preview: null });
   }
 
   async function generateTitle() {
@@ -2023,35 +1761,16 @@ wss.on('connection', (ws, req) => {
   // For resumed sessions, use cached summary immediately
   if (resume) {
     renameCount = MAX_RENAMES; // don't auto-rename resumed sessions
-    const cacheKey = summaryCacheKey(agent, resume);
-    if (agent === 'codex') {
-      // Look up Codex session preview from rollout index
-      let preview = null;
-      for (const entry of codexIndex.values()) {
-        if (entry.id === resume) { preview = entry.preview; break; }
+    let preview = null;
+    if (agent === 'claude') {
+      if (encodedDir) {
+        preview = getSessionInfo(path.join(PROJECTS_DIR, encodedDir, `${resume}.jsonl`)).firstUserMessage;
       }
-      const title = getSummaryText(cacheKey) || (preview && preview.slice(0, 60));
-      if (title) ws.send(JSON.stringify({ type: 'title', title }));
-    } else if (agent === 'gemini') {
-      let preview = null;
-      for (const entry of geminiIndex.values()) {
-        if (entry.id === resume) { preview = entry.preview; break; }
-      }
-      const title = getSummaryText(cacheKey) || (preview && preview.slice(0, 60));
-      if (title) ws.send(JSON.stringify({ type: 'title', title }));
-    } else if (agent === 'pi') {
-      let preview = null;
-      for (const entry of piIndex.values()) {
-        if (entry.id === resume) { preview = entry.preview; break; }
-      }
-      const title = getSummaryText(cacheKey) || (preview && preview.slice(0, 60));
-      if (title) ws.send(JSON.stringify({ type: 'title', title }));
-    } else if (encodedDir) {
-      const jsonlDir = path.join(PROJECTS_DIR, encodedDir);
-      const info = getSessionInfo(path.join(jsonlDir, `${resume}.jsonl`));
-      const title = getSummaryText(cacheKey) || (info.firstUserMessage && info.firstUserMessage.slice(0, 60));
-      if (title) ws.send(JSON.stringify({ type: 'title', title }));
+    } else {
+      preview = findAgentSession(agent, resume)?.preview || null;
     }
+    const title = getSummaryText(summaryCacheKey(agent, resume)) || (preview && preview.slice(0, 60));
+    if (title) ws.send(JSON.stringify({ type: 'title', title }));
   } else {
     // First rename after 1 minute
     renameTimer = setTimeout(generateTitle, INITIAL_DELAY);

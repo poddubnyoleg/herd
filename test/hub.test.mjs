@@ -67,7 +67,9 @@ async function setup() {
 }
 
 async function loadPage() {
-  await page.goto(URL, { waitUntil: 'networkidle' });
+  // Not 'networkidle': the /api/summary-events SSE stream never goes idle,
+  // so networkidle waits its full timeout on every load.
+  await page.goto(URL, { waitUntil: 'load' });
   await page.waitForTimeout(800);
 }
 
