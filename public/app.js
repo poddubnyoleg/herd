@@ -724,9 +724,16 @@ class Herd {
       finished: false, idleTimer: null, outputSinceViewed: 0,
       _closeRequested: 0, _inactiveSince: 0,
       _writeBuf: '', _writeRaf: 0,
+      _chunkTimes: [], _scrolled: false, _lineWatermark: undefined,
       _resizeObserver: null,
     };
     this.tabs.set(tabId, tab);
+
+    // Buffer-scroll = content growth even at the scrollback cap, where the
+    // cursor-line watermark stops moving. Feeds trackTabActivity.
+    terminal.onScroll(() => { tab._scrolled = true; });
+    // Reflow after a resize shifts absolute line numbers; re-baseline.
+    terminal.onResize(() => { tab._lineWatermark = undefined; });
 
     // macOS keyboard navigation: Option+Arrow for word jump, Cmd+Arrow for line jump
     terminal.attachCustomKeyEventHandler(e => {
@@ -889,6 +896,7 @@ class Herd {
       // Clear any stale finished-tracking from the prior connection
       if (tab.idleTimer) { clearTimeout(tab.idleTimer); tab.idleTimer = null; }
       tab.outputSinceViewed = 0;
+      tab._scrolled = false;
       // Remove loading/reconnect overlay
       const overlay = document.getElementById(`term-${tabId}`)?.querySelector('.terminal-overlay');
       if (overlay) overlay.remove();
@@ -918,38 +926,23 @@ class Herd {
                 // Check if viewport is near the bottom before writing
                 const buf = terminal.buffer.active;
                 const atBottom = buf.viewportY >= buf.baseY - 1;
+                // onScroll also fires on viewport scrolls (user scrolling,
+                // scrollToBottom), not just buffer growth. Reset the flag
+                // before the write and consume it before scrolling, so only
+                // scrolls caused by this write's content count as growth.
+                tab._scrolled = false;
                 terminal.write(chunk, () => {
+                  this.trackTabActivity(tabId, tab, terminal);
                   if (atBottom) terminal.scrollToBottom();
                 });
               });
             }
-            // Rate-based activity detection. Idle gemini (and similar ink TUIs) emits one
-            // footer repaint every ~2s as a steady heartbeat — cosmetic counter updates
-            // that shouldn't flag the tab. Real model output produces many chunks per
-            // second. Counting chunks per rolling 2s window cleanly separates the two.
+            // Incoming-chunk rate (rolling 2s window): the activity signal for
+            // alt-screen TUIs and the "still working" test before the green
+            // finished pulse — see trackTabActivity / armFinishedTimer.
             const _now = Date.now();
-            tab._chunkTimes = (tab._chunkTimes || []).filter(t => _now - t < 2000);
+            tab._chunkTimes = tab._chunkTimes.filter(t => _now - t < 2000);
             tab._chunkTimes.push(_now);
-            if (tabId !== this.activeTabId && tab._inactiveSince && _now - tab._inactiveSince > 5000 && _now >= (tab._suppressUntil || 0) && tab._chunkTimes.length >= 4) {
-              if (tab.finished) {
-                tab.finished = false;
-                this.updateSidebarFinished(tabId, false);
-                this.renderTabs();
-              }
-              if (tab.idleTimer) clearTimeout(tab.idleTimer);
-              tab.idleTimer = setTimeout(() => {
-                if (tabId !== this.activeTabId && !tab.finished) {
-                  tab.finished = true;
-                  tab.unread = false;
-                  this.renderTabs();
-                  this.updateSidebarFinished(tabId, true);
-                }
-              }, 5000);
-              if (!tab.unread) {
-                tab.unread = true;
-                this.renderTabs();
-              }
-            }
             break;
           case 'ready':
             tab.sessionId = msg.sessionId;
@@ -1029,6 +1022,63 @@ class Herd {
     }, delay);
   }
 
+  // Unread/finished detection, run after each batched write completes (buffer
+  // state is only current then). "Unread" means content actually grew: the
+  // absolute cursor line passed its high-water mark, or the buffer scrolled
+  // (covers the scrollback cap, where baseY stops moving). In-place repaints —
+  // gemini's ~2s idle footer heartbeat, Claude Code's spinner and live agent
+  // counters — rewrite the same rows without growth, so they don't flag the
+  // tab. Alt-screen TUIs (codex) repaint full-screen in place and have no
+  // growth signal; for them the chunk-rate heuristic (≥4 chunks per rolling
+  // 2s ≈ real output) remains.
+  trackTabActivity(tabId, tab, terminal) {
+    const buf = terminal.buffer.active;
+    const now = Date.now();
+    let grew;
+    if (buf.type === 'alternate') {
+      grew = tab._chunkTimes.filter(t => now - t < 2000).length >= 4;
+    } else {
+      const line = buf.baseY + buf.cursorY;
+      grew = tab._scrolled || (tab._lineWatermark !== undefined && line > tab._lineWatermark);
+      tab._scrolled = false;
+      if (tab._lineWatermark === undefined || line > tab._lineWatermark) tab._lineWatermark = line;
+    }
+    if (!grew || now < (tab._suppressUntil || 0)) return;
+    if (tabId === this.activeTabId || !tab._inactiveSince || now - tab._inactiveSince < 5000) return;
+    if (tab.finished) {
+      tab.finished = false;
+      this.updateSidebarFinished(tabId, false);
+      this.renderTabs();
+    }
+    this.armFinishedTimer(tabId, tab);
+    if (!tab.unread) {
+      tab.unread = true;
+      this.renderTabs();
+    }
+  }
+
+  // The green "finished" pulse means done, not paused: it fires only after
+  // content growth stops AND the TUI goes quiet. A session that is still
+  // working keeps its spinner animating — many repaints per 2s even with no
+  // new content lines (e.g. Claude Code waiting on background agents) — so
+  // keep re-arming until the repaints stop too.
+  armFinishedTimer(tabId, tab) {
+    if (tab.idleTimer) clearTimeout(tab.idleTimer);
+    tab.idleTimer = setTimeout(() => {
+      tab.idleTimer = null;
+      if (tab._destroyed || tabId === this.activeTabId || tab.finished) return;
+      const now = Date.now();
+      if (tab._chunkTimes.filter(t => now - t < 2000).length >= 4) {
+        this.armFinishedTimer(tabId, tab);
+        return;
+      }
+      tab.finished = true;
+      tab.unread = false;
+      this.renderTabs();
+      this.updateSidebarFinished(tabId, true);
+    }, 5000);
+  }
+
   switchTab(tabId) {
     // Mark the previously active tab with the time it became inactive
     if (this.activeTabId && this.activeTabId !== tabId) {
@@ -1063,6 +1113,7 @@ class Herd {
 
     tab._destroyed = true;
     if (tab._reconnectTimer) clearTimeout(tab._reconnectTimer);
+    if (tab.idleTimer) clearTimeout(tab.idleTimer);
     if (tab._writeRaf) cancelAnimationFrame(tab._writeRaf);
     if (tab._resizeObserver) tab._resizeObserver.disconnect();
     try { tab.ws?.close(); } catch {}
