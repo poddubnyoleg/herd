@@ -1064,10 +1064,21 @@ class Herd {
   // keep re-arming until the repaints stop too.
   armFinishedTimer(tabId, tab) {
     if (tab.idleTimer) clearTimeout(tab.idleTimer);
+    const armedAt = Date.now();
     tab.idleTimer = setTimeout(() => {
       tab.idleTimer = null;
       if (tab._destroyed || tabId === this.activeTabId || tab.finished) return;
       const now = Date.now();
+      // Fired way past its 5s deadline: the machine slept (lid close) or the
+      // browser throttled a hidden tab. Every _chunkTimes entry has aged out
+      // during the gap, so the quiet-check below would false-positive and
+      // paint all working tabs green at once. Re-arm and judge on fresh data.
+      // Same while a post-(re)connect suppress window is active: resume
+      // replay is muted, so quiet ≠ done.
+      if (now - armedAt > 7000 || now < (tab._suppressUntil || 0)) {
+        this.armFinishedTimer(tabId, tab);
+        return;
+      }
       if (tab._chunkTimes.filter(t => now - t < 2000).length >= 4) {
         this.armFinishedTimer(tabId, tab);
         return;
