@@ -59,10 +59,25 @@ class Herd {
     this.codexAvailable = false;
     this.geminiAvailable = false;
     this.piAvailable = false;
+    // Diagnostic ring buffer for the unread/finished pipeline. Dump with
+    // __herd.dumpLog() in the console when tabs pulse green spuriously.
+    this._log = [];
     this.init();
   }
 
+  _dbg(event, data) {
+    this._log.push({ t: new Date().toISOString(), event, ...data });
+    if (this._log.length > 300) this._log.splice(0, this._log.length - 300);
+  }
+
+  dumpLog() {
+    return this._log.map(e => JSON.stringify(e)).join('\n');
+  }
+
   async init() {
+    // Bump when debugging client-side state issues: confirms in the console
+    // which build the browser actually loaded after a fix.
+    console.log('[herd] build 2026-07-08 — input-gated finished pulse, layered wake detect');
     this.initTheme();
     await this.loadProjects();
     await this.loadRecentSessions();
@@ -101,17 +116,23 @@ class Herd {
     // Sleep/wake detector. System sleep freezes timers and WebSockets; on
     // wake, armed finished-timers flush at once against aged-out _chunkTimes
     // and resume replays race the fixed suppress window — both used to paint
-    // every background tab green the moment the lid opened. Detect suspend
-    // via wall-vs-monotonic clock drift: during sleep Date.now() jumps while
-    // performance.now() stalls (macOS), so the gap is actual suspend time.
-    // Hidden-tab timer throttling delays both clocks equally and never
-    // triggers this. On wake, treat every tab like it just reconnected.
+    // every background tab green the moment the lid opened. Two signals:
+    // wall-vs-monotonic clock drift (performance.now() stalls during sleep
+    // on platforms where it excludes suspend), and the heartbeat firing far
+    // later than any hidden-tab throttling allows (Chrome's intensive
+    // throttling is one run per 60s, so a >90s gap means suspend even where
+    // performance.now() keeps counting through sleep, as modern Chrome on
+    // macOS does via mach_continuous_time). On wake, treat every tab like it
+    // just reconnected. The check also runs on visibilitychange so a wake
+    // with the page hidden is handled before the user looks at it.
     this._lastWall = Date.now();
     this._lastPerf = performance.now();
-    setInterval(() => {
+    const wakeCheck = () => {
       const wall = Date.now(), perf = performance.now();
-      const suspended = (wall - this._lastWall) - (perf - this._lastPerf);
-      if (suspended > 10000) {
+      const wallGap = wall - this._lastWall;
+      const drift = wallGap - (perf - this._lastPerf);
+      if (drift > 10000 || wallGap > 90000) {
+        this._dbg('wake', { wallGap, drift });
         for (const tab of this.tabs.values()) {
           tab._suppressUntil = Math.max(tab._suppressUntil || 0, wall + 30000);
           tab._sawOutput = false;
@@ -121,7 +142,11 @@ class Herd {
       }
       this._lastWall = wall;
       this._lastPerf = perf;
-    }, 5000);
+    };
+    setInterval(wakeCheck, 5000);
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') wakeCheck();
+    });
 
     // P9: Warn before closing page with active sessions
     window.addEventListener('beforeunload', e => {
@@ -751,6 +776,7 @@ class Herd {
       _writeBuf: '', _writeRaf: 0,
       _chunkTimes: [], _scrolled: false, _lineWatermark: undefined,
       _resizeObserver: null, _suppressUntil: 0, _sawOutput: false,
+      _awaitingInput: true,
     };
     this.tabs.set(tabId, tab);
 
@@ -794,6 +820,9 @@ class Herd {
 
     // Register terminal I/O handlers once (they reference tab.ws dynamically)
     terminal.onData(data => {
+      // First keystroke since (re)connect: only now can this session start
+      // real work, so only now may it later earn the green finished pulse.
+      tab._awaitingInput = false;
       if (tab.ws?.readyState === WebSocket.OPEN) tab.ws.send(JSON.stringify({ type: 'input', data }));
     });
     terminal.onResize(({ cols, rows }) => {
@@ -919,6 +948,13 @@ class Herd {
       // tab with the green "finished" pulse.
       tab._suppressUntil = Date.now() + 15000;
       tab._sawOutput = false;
+      // A (re)connected session was respawned via `--resume` (or is brand
+      // new) and sits at a prompt: it cannot be doing work, so nothing it
+      // prints — replay, MCP banners, trailing startup hints, error dumps —
+      // is ever "work finished". The green pulse stays disabled until the
+      // user actually types into this tab (terminal.onData clears the flag).
+      tab._awaitingInput = true;
+      this._dbg('ws-open', { tab: tabId, name: tab.name });
       // Clear any stale finished-tracking from the prior connection
       if (tab.idleTimer) { clearTimeout(tab.idleTimer); tab.idleTimer = null; }
       tab.outputSinceViewed = 0;
@@ -1008,7 +1044,11 @@ class Herd {
           case 'exit':
             tab.alive = false;
             terminal.write('\r\n\x1b[38;5;240m[shell exited]\x1b[0m\r\n');
-            if (tabId !== this.activeTabId) {
+            this._dbg('exit-msg', { tab: tabId, name: tab.name, awaitingInput: tab._awaitingInput });
+            // Only pulse green if the user engaged this session since its
+            // last (re)connect — a resumed-but-untouched tab dying at startup
+            // isn't finished work. The dead dot already shows it exited.
+            if (tabId !== this.activeTabId && !tab._awaitingInput) {
               tab.finished = true;
               tab.unread = false;
               this.updateSidebarFinished(tabId, true);
@@ -1024,6 +1064,7 @@ class Herd {
 
     ws.onclose = () => {
       if (tab._destroyed) return;
+      this._dbg('ws-close', { tab: tabId, name: tab.name, alive: tab.alive });
       if (tab.alive) {
         tab.alive = false;
         terminal.write('\r\n\x1b[38;5;240m[disconnected]\x1b[0m\r\n');
@@ -1084,7 +1125,10 @@ class Herd {
       this.updateSidebarFinished(tabId, false);
       this.renderTabs();
     }
-    this.armFinishedTimer(tabId, tab);
+    // No green pulse for a session the user hasn't typed into since its last
+    // (re)connect: post-resume it sits at a prompt, so any output-then-quiet
+    // it produces (startup noise, error dumps) is not finished work.
+    if (!tab._awaitingInput) this.armFinishedTimer(tabId, tab);
     if (!tab.unread) {
       tab.unread = true;
       this.renderTabs();
@@ -1117,6 +1161,11 @@ class Herd {
         this.armFinishedTimer(tabId, tab);
         return;
       }
+      this._dbg('finished-set', {
+        tab: tabId, name: tab.name, cause: 'idle-timer',
+        lateMs: now - armedAt - 5000,
+        sinceLastChunk: tab._chunkTimes.length ? now - tab._chunkTimes[tab._chunkTimes.length - 1] : -1,
+      });
       tab.finished = true;
       tab.unread = false;
       this.renderTabs();
