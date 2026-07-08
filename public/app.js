@@ -568,10 +568,21 @@ class Herd {
     if (!data) return;
 
     const shortModel = m => {
-      if (m.includes('opus')) return 'Opus';
-      if (m.includes('sonnet')) return 'Sonnet';
-      if (m.includes('haiku')) return 'Haiku';
-      return m.split('-').slice(0, 2).join(' ');
+      const oneM = m.includes('[1m]');
+      const base = m.replace('[1m]', '').replace(/^.*\//, '').replace(/-\d{8}$/, '');
+      const cap = s => s[0].toUpperCase() + s.slice(1);
+      let label, match;
+      if ((match = base.match(/claude-(opus|sonnet|haiku|fable)-(\d+)(?:[.-](\d+))?/)))
+        label = `${cap(match[1])} ${match[2]}${match[3] ? '.' + match[3] : ''}`;
+      else if ((match = base.match(/^(gpt-[\d.]+|o\d)(?:-(\w+))?/)))
+        label = match[1].toUpperCase() + (match[2] ? ' ' + cap(match[2]) : '');
+      else if ((match = base.match(/gemini-([\d.]+)-(.+)/)))
+        label = `Gemini ${match[1]} ${match[2].replace(/-?preview/, '').split('-').filter(Boolean).map(cap).join(' ')}`.trim();
+      else if (base.startsWith('glm'))
+        label = base.toUpperCase();
+      else
+        label = base;
+      return label + (oneM ? ' (1M)' : '');
     };
 
     const modelEntries = Object.entries(data.models)

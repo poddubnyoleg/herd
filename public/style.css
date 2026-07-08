@@ -770,10 +770,12 @@ body {
 }
 
 .model-detail {
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
   gap: 10px;
   font-size: 10px;
   color: var(--text-muted);
+  white-space: nowrap;
 }
 
 .usage-spark {

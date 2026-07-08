@@ -1017,45 +1017,162 @@ async function generateMissingSummaries(sessions) {
 
 // --- Token usage ---
 
+// $/MTok, matched by longest prefix (see resolvePricing). Anthropic cache
+// multipliers are uniform: write 5m = 1.25x input, write 1h = 2x input,
+// read = 0.1x input. No long-context premium for [1m] models — 1M context
+// bills at standard rates, so the prefix match covers "...[1m]" ids.
+// `tier` overrides rates when a single call's prompt exceeds `threshold`
+// tokens (Gemini Pro models). Prices as of 2026-07.
 const MODEL_PRICING = {
-  'claude-opus-4-6':              { input: 5,     output: 25,    cache_write_5m: 6.25,  cache_write_1h: 10,    cache_read: 0.50 },
-  'claude-opus-4-5':              { input: 5,     output: 25,    cache_write_5m: 6.25,  cache_write_1h: 10,    cache_read: 0.50 },
+  // Anthropic. Bare 'claude-opus'/'claude-sonnet'/'claude-haiku' are prefix
+  // fallbacks so unknown versions don't fall through to DEFAULT_PRICING.
+  'claude-fable-5':               { input: 10,    output: 50,    cache_write_5m: 12.50, cache_write_1h: 20,    cache_read: 1.00 },
   'claude-opus-4-1':              { input: 15,    output: 75,    cache_write_5m: 18.75, cache_write_1h: 30,    cache_read: 1.50 },
-  'claude-sonnet-4-6':            { input: 3,     output: 15,    cache_write_5m: 3.75,  cache_write_1h: 6,     cache_read: 0.30 },
-  'claude-haiku-4-5-20251001':    { input: 1,     output: 5,     cache_write_5m: 1.25,  cache_write_1h: 2,     cache_read: 0.10 },
+  'claude-opus':                  { input: 5,     output: 25,    cache_write_5m: 6.25,  cache_write_1h: 10,    cache_read: 0.50 },
+  // Intro pricing through 2026-08-31; revert to 3/15 (write 3.75/6, read 0.30) after
+  'claude-sonnet-5':              { input: 2,     output: 10,    cache_write_5m: 2.50,  cache_write_1h: 4,     cache_read: 0.20 },
+  'claude-sonnet':                { input: 3,     output: 15,    cache_write_5m: 3.75,  cache_write_1h: 6,     cache_read: 0.30 },
+  'claude-haiku':                 { input: 1,     output: 5,     cache_write_5m: 1.25,  cache_write_1h: 2,     cache_read: 0.10 },
+  // OpenAI (Codex): cached input = 90% discount, no cache-write fee
+  'gpt-5.5':                      { input: 5,     output: 30,    cache_read: 0.50 },
+  'gpt-5.4-mini':                 { input: 0.75,  output: 4.50,  cache_read: 0.075 },
+  'gpt-5.4-nano':                 { input: 0.20,  output: 1.25,  cache_read: 0.02 },
+  'gpt-5.4':                      { input: 2.50,  output: 15,    cache_read: 0.25 },
+  'gpt-5.3-codex':                { input: 1.75,  output: 14,    cache_read: 0.175 },
+  'gpt-5.2':                      { input: 1.75,  output: 14,    cache_read: 0.175 },
+  'gpt-5':                        { input: 1.25,  output: 10,    cache_read: 0.125 }, // also 5.1/codex variants + fallback
+  'o3':                           { input: 2,     output: 8,     cache_read: 0.50 },
+  'o4-mini':                      { input: 1.10,  output: 4.40,  cache_read: 0.275 },
+  // Google (Gemini CLI); Pro models bill higher above 200k prompt tokens
+  'gemini-3.1-pro-preview':       { input: 2,     output: 12,    cache_read: 0.20,
+                                    tier: { threshold: 200_000, input: 4, output: 18, cache_read: 0.40 } },
+  'gemini-3-flash':               { input: 0.50,  output: 3,     cache_read: 0.05 },
+  'gemini-2.5-pro':               { input: 1.25,  output: 10,    cache_read: 0.125,
+                                    tier: { threshold: 200_000, input: 2.50, output: 15, cache_read: 0.25 } },
+  'gemini-2.5-flash-lite':        { input: 0.10,  output: 0.40,  cache_read: 0.01 },
+  'gemini-2.5-flash':             { input: 0.30,  output: 2.50,  cache_read: 0.03 },
+  // Fallback for bare/unknown gemini ids (2.5-pro rates) so they don't hit DEFAULT
+  'gemini':                       { input: 1.25,  output: 10,    cache_read: 0.125,
+                                    tier: { threshold: 200_000, input: 2.50, output: 15, cache_read: 0.25 } },
+  // Zhipu GLM (z.ai)
+  'glm-5.2':                      { input: 1.40,  output: 4.40,  cache_read: 0.26 },
+  'glm-5.1':                      { input: 1.40,  output: 4.40,  cache_read: 0.26 },
+  'glm-5':                        { input: 1.00,  output: 3.20,  cache_read: 0.20 },
+  'glm-4.7-flashx':               { input: 0.07,  output: 0.40,  cache_read: 0.01 },
+  'glm-4.7-flash':                { input: 0,     output: 0,     cache_read: 0 },
+  'glm-4.7':                      { input: 0.60,  output: 2.20,  cache_read: 0.11 },
+  'glm-4.6':                      { input: 0.60,  output: 2.20,  cache_read: 0.11 },
+  'glm-4.5-airx':                 { input: 1.10,  output: 4.50,  cache_read: 0.22 },
+  'glm-4.5-air':                  { input: 0.20,  output: 1.10,  cache_read: 0.03 },
+  'glm-4.5-x':                    { input: 2.20,  output: 8.90,  cache_read: 0.45 },
+  'glm-4.5-flash':                { input: 0,     output: 0,     cache_read: 0 },
+  'glm-4.5':                      { input: 0.60,  output: 2.20,  cache_read: 0.11 },
 };
 // Aliases for model strings that appear with different names
 const MODEL_ALIASES = {
   'anthropic/claude-4.6-sonnet-20260217': 'claude-sonnet-4-6',
   'anthropic/claude-4.6-opus-20260205': 'claude-opus-4-6',
+  'claude-mythos-5': 'claude-fable-5',
+  'gemini-3.1-pro-preview-customtools': 'gemini-3.1-pro-preview',
+  // Bare aliases occasionally logged instead of full ids
+  'opus': 'claude-opus-4-8',
+  'sonnet': 'claude-sonnet-5',
+  'haiku': 'claude-haiku-4-5',
+  'fable': 'claude-fable-5',
 };
-const DEFAULT_PRICING = MODEL_PRICING['claude-opus-4-6']; // user's default
+const DEFAULT_PRICING = MODEL_PRICING['claude-opus'];
 
 let tokenUsageCache = null;
 let tokenUsageCacheTime = 0;
 const TOKEN_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
-function computeTokenUsage() {
-  const now = Date.now();
-  if (tokenUsageCache && now - tokenUsageCacheTime < TOKEN_CACHE_TTL) return tokenUsageCache;
+// Resolve a model id to its pricing: alias, exact key, then longest prefix
+// (covers dated/suffixed variants like claude-haiku-4-5-20251001 and
+// claude-opus-4-8[1m]). Bedrock's "anthropic." prefix is stripped.
+function resolvePricing(rawModel) {
+  // Strip router/provider prefixes ("anthropic.", "zai/glm-4.6", "openrouter/x/y")
+  const model = (MODEL_ALIASES[rawModel] || rawModel).replace(/^anthropic\./, '').replace(/^.*\//, '');
+  if (MODEL_PRICING[model]) return MODEL_PRICING[model];
+  let best = null, bestLen = 0;
+  for (const key of Object.keys(MODEL_PRICING)) {
+    if (model.startsWith(key) && key.length > bestLen) { best = MODEL_PRICING[key]; bestLen = key.length; }
+  }
+  return best || DEFAULT_PRICING;
+}
 
-  const cutoff = new Date(now - 30 * 24 * 60 * 60 * 1000);
-  const byModel = {};
-  const byDate = {};
-  let totalMessages = 0;
-  let totalSessions = 0;
+// Cost of ONE API call. Tiered models (Gemini Pro) bill the whole prompt at
+// the higher rate when its size exceeds the threshold, so this must be
+// applied per call, never to aggregated totals.
+function messageCost(pricing, u) {
+  const promptTokens = u.input + u.cache_read + u.cache_write_5m + u.cache_write_1h;
+  const p = pricing.tier && promptTokens > pricing.tier.threshold ? { ...pricing, ...pricing.tier } : pricing;
+  return (u.input * (p.input || 0)
+    + u.output * (p.output || 0)
+    + u.cache_write_5m * (p.cache_write_5m || 0)
+    + u.cache_write_1h * (p.cache_write_1h || 0)
+    + u.cache_read * (p.cache_read || 0)) / 1_000_000;
+}
 
+// One API call's worth of tokens into the per-model and per-day accumulators.
+// u: { input, output, cache_write_5m, cache_write_1h, cache_read } (missing = 0)
+// knownCost: provider-reported $ for this call, overrides table pricing.
+function addUsage(acc, rawModel, dateKey, u, knownCost) {
+  const model = MODEL_ALIASES[rawModel] || rawModel;
+  const full = {
+    input: u.input || 0, output: u.output || 0,
+    cache_write_5m: u.cache_write_5m || 0, cache_write_1h: u.cache_write_1h || 0,
+    cache_read: u.cache_read || 0,
+  };
+  const cost = knownCost !== undefined ? knownCost : messageCost(resolvePricing(model), full);
+  if (!acc.byModel[model]) acc.byModel[model] = { input: 0, output: 0, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0, messages: 0, cost: 0 };
+  const m = acc.byModel[model];
+  m.input += full.input;
+  m.output += full.output;
+  m.cache_write_5m += full.cache_write_5m;
+  m.cache_write_1h += full.cache_write_1h;
+  m.cache_read += full.cache_read;
+  m.messages++;
+  m.cost += cost;
+  acc.totalMessages++;
+
+  if (dateKey) {
+    if (!acc.byDate[dateKey]) acc.byDate[dateKey] = { input: 0, output: 0, cache_write: 0, cache_read: 0, cost: 0 };
+    const d = acc.byDate[dateKey];
+    d.input += full.input;
+    d.output += full.output;
+    d.cache_write += full.cache_write_5m + full.cache_write_1h;
+    d.cache_read += full.cache_read;
+    d.cost += cost;
+  }
+}
+
+function scanClaudeUsage(acc, cutoff) {
   let dirs;
-  try { dirs = fs.readdirSync(PROJECTS_DIR).filter(d => { try { return fs.statSync(path.join(PROJECTS_DIR, d)).isDirectory(); } catch { return false; } }); }
+  try { dirs = fs.readdirSync(PROJECTS_DIR).filter(d => isDir(path.join(PROJECTS_DIR, d))); }
   catch { dirs = []; }
+
+  // Claude Code logs the same API response once per content block, and resumed
+  // sessions copy prior history into a new file — dedupe across all files by
+  // (message.id, requestId) so each API call is counted exactly once.
+  const seenCalls = new Set();
 
   for (const encoded of dirs) {
     const projDir = path.join(PROJECTS_DIR, encoded);
-    let files;
-    try { files = fs.readdirSync(projDir).filter(f => f.endsWith('.jsonl')); } catch { continue; }
+    let entries;
+    try { entries = fs.readdirSync(projDir); } catch { continue; }
+    // Top-level session files, plus subagent transcripts nested under
+    // <session-uuid>/subagents/ — real API calls that belong to the parent
+    // session (so they add tokens but don't count as sessions).
+    const files = [];
+    for (const f of entries) {
+      if (f.endsWith('.jsonl')) { files.push({ filePath: path.join(projDir, f), isSubagent: false }); continue; }
+      const subDir = path.join(projDir, f, 'subagents');
+      for (const sf of readdirSafe(subDir)) {
+        if (sf.endsWith('.jsonl')) files.push({ filePath: path.join(subDir, sf), isSubagent: true });
+      }
+    }
 
-    for (const file of files) {
-      const filePath = path.join(projDir, file);
+    for (const { filePath, isSubagent } of files) {
       let stat;
       try { stat = fs.statSync(filePath); } catch { continue; }
       if (stat.mtime < cutoff) continue;
@@ -1063,76 +1180,212 @@ function computeTokenUsage() {
       let sessionHadUsage = false;
       try {
         forEachJsonlEntry(filePath, {}, entry => {
-          // Check timestamp
-          const ts = entry.timestamp;
-          if (ts && typeof ts === 'string') {
+          const ts = typeof entry.timestamp === 'string' ? entry.timestamp : null;
+          if (ts) {
             try { if (new Date(ts) < cutoff) return; } catch {}
           }
           const msg = entry.message;
           if (!msg || typeof msg !== 'object' || !msg.usage) return;
-          const usage = msg.usage;
           const rawModel = msg.model || 'unknown';
-          const model = MODEL_ALIASES[rawModel] || rawModel;
+          if (rawModel === '<synthetic>') return; // error placeholder, not an API call
+          if (msg.id) {
+            const key = `${msg.id}:${entry.requestId || ''}`;
+            if (seenCalls.has(key)) return;
+            seenCalls.add(key);
+          }
+          const usage = msg.usage;
           sessionHadUsage = true;
-          totalMessages++;
-
-          if (!byModel[model]) byModel[model] = { input: 0, output: 0, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0, messages: 0 };
-          const m = byModel[model];
-          m.input += usage.input_tokens || 0;
-          m.output += usage.output_tokens || 0;
-          m.cache_read += usage.cache_read_input_tokens || 0;
-          // Break down cache write by duration if available
           const cc = usage.cache_creation;
-          if (cc && typeof cc === 'object') {
-            m.cache_write_5m += cc.ephemeral_5m_input_tokens || 0;
-            m.cache_write_1h += cc.ephemeral_1h_input_tokens || 0;
-          } else {
-            // Older format: all cache creation lumped together, assume 5m
-            m.cache_write_5m += usage.cache_creation_input_tokens || 0;
-          }
-          m.messages++;
-
-          // Daily aggregation
-          let dateKey = null;
-          if (ts && typeof ts === 'string') {
-            try { dateKey = ts.slice(0, 10); } catch {}
-          }
-          if (dateKey) {
-            if (!byDate[dateKey]) byDate[dateKey] = { input: 0, output: 0, cache_write: 0, cache_read: 0, cost: 0 };
-            const d = byDate[dateKey];
-            d.input += usage.input_tokens || 0;
-            d.output += usage.output_tokens || 0;
-            d.cache_write += usage.cache_creation_input_tokens || 0;
-            d.cache_read += usage.cache_read_input_tokens || 0;
-
-            // Compute cost for this message
-            const pricing = MODEL_PRICING[model] || DEFAULT_PRICING;
-            const cw5m = cc?.ephemeral_5m_input_tokens || (cc ? 0 : (usage.cache_creation_input_tokens || 0));
-            const cw1h = cc?.ephemeral_1h_input_tokens || 0;
-            d.cost += ((usage.input_tokens || 0) * pricing.input
-              + (usage.output_tokens || 0) * pricing.output
-              + cw5m * pricing.cache_write_5m
-              + cw1h * pricing.cache_write_1h
-              + (usage.cache_read_input_tokens || 0) * pricing.cache_read) / 1_000_000;
-          }
+          addUsage(acc, rawModel, ts ? ts.slice(0, 10) : null, {
+            input: usage.input_tokens,
+            output: usage.output_tokens,
+            cache_read: usage.cache_read_input_tokens,
+            // Older format lumps cache writes together; assume 5m
+            cache_write_5m: cc && typeof cc === 'object' ? cc.ephemeral_5m_input_tokens : usage.cache_creation_input_tokens,
+            cache_write_1h: cc && typeof cc === 'object' ? cc.ephemeral_1h_input_tokens : 0,
+          });
         });
       } catch {}
-      if (sessionHadUsage) totalSessions++;
+      if (sessionHadUsage && !isSubagent) acc.totalSessions++;
     }
   }
+}
 
-  // Compute costs per model
+// Codex rollouts: turn_context carries the model; each token_count event_msg
+// carries last_token_usage for the API call that just finished. OpenAI's
+// input_tokens includes the cached portion — split it out as cache_read.
+function scanCodexUsage(acc, cutoff) {
+  try { fs.statSync(CODEX_SESSIONS_DIR); } catch { return; }
+  for (const year of readdirSafe(CODEX_SESSIONS_DIR)) {
+    const yearDir = path.join(CODEX_SESSIONS_DIR, year);
+    if (!isDir(yearDir)) continue;
+    for (const month of readdirSafe(yearDir)) {
+      const monthDir = path.join(yearDir, month);
+      if (!isDir(monthDir)) continue;
+      for (const day of readdirSafe(monthDir)) {
+        const dayDir = path.join(monthDir, day);
+        if (!isDir(dayDir)) continue;
+        for (const file of readdirSafe(dayDir)) {
+          if (!file.endsWith('.jsonl')) continue;
+          const filePath = path.join(dayDir, file);
+          let stat;
+          try { stat = fs.statSync(filePath); } catch { continue; }
+          if (stat.mtime < cutoff) continue;
+
+          let model = 'gpt-5';
+          let hadUsage = false;
+          // token_count events can be re-emitted; total_token_usage is cumulative,
+          // so attribute per-event deltas of the totals (a duplicate event
+          // advances nothing and contributes zero).
+          let prev = { input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 };
+          try {
+            forEachJsonlEntry(filePath, {}, entry => {
+              const p = entry.payload;
+              if (!p) return;
+              if ((entry.type === 'turn_context' || entry.type === 'session_meta') && p.model) {
+                model = p.model;
+                return;
+              }
+              if (entry.type !== 'event_msg' || p.type !== 'token_count') return;
+              const total = p.info && p.info.total_token_usage;
+              if (!total) return;
+              const dInput = Math.max(0, (total.input_tokens || 0) - prev.input_tokens);
+              const dCached = Math.max(0, (total.cached_input_tokens || 0) - prev.cached_input_tokens);
+              const dOutput = Math.max(0, (total.output_tokens || 0) - prev.output_tokens);
+              prev = {
+                input_tokens: total.input_tokens || 0,
+                cached_input_tokens: total.cached_input_tokens || 0,
+                output_tokens: total.output_tokens || 0,
+              };
+              if (dInput + dCached + dOutput === 0) return;
+              const ts = typeof entry.timestamp === 'string' ? entry.timestamp : null;
+              if (ts) {
+                try { if (new Date(ts) < cutoff) return; } catch {}
+              }
+              hadUsage = true;
+              addUsage(acc, model, ts ? ts.slice(0, 10) : null, {
+                input: Math.max(0, dInput - dCached), // input includes the cached portion
+                cache_read: dCached,
+                output: dOutput, // includes reasoning tokens
+              });
+            });
+          } catch {}
+          if (hadUsage) acc.totalSessions++;
+        }
+      }
+    }
+  }
+}
+
+// Gemini CLI chats: ~/.gemini/tmp/<project>/chats/**/*.json, each assistant
+// message carries tokens {input, output, cached, thoughts, tool}. input
+// includes the cached portion; thoughts bill as output, tool as input.
+function scanGeminiUsage(acc, cutoff) {
+  try { fs.statSync(GEMINI_TMP_DIR); } catch { return; }
+  const seenMsgs = new Set(); // checkpoint files can duplicate messages
+  for (const dirName of readdirSafe(GEMINI_TMP_DIR)) {
+    const chatsDir = path.join(GEMINI_TMP_DIR, dirName, 'chats');
+    if (!isDir(chatsDir)) continue;
+    // Nested dirs hold checkpoint/subagent transcripts — counted for tokens
+    // (deduped by message id) but not as sessions.
+    const jsonFiles = [];
+    for (const f of readdirSafe(chatsDir)) {
+      const p = path.join(chatsDir, f);
+      if (f.endsWith('.json')) jsonFiles.push({ filePath: p, isNested: false });
+      else if (isDir(p)) for (const f2 of readdirSafe(p)) if (f2.endsWith('.json')) jsonFiles.push({ filePath: path.join(p, f2), isNested: true });
+    }
+    for (const { filePath, isNested } of jsonFiles) {
+      let stat;
+      try { stat = fs.statSync(filePath); } catch { continue; }
+      if (stat.mtime < cutoff) continue;
+      let data;
+      try { data = JSON.parse(fs.readFileSync(filePath, 'utf8')); } catch { continue; }
+      const messages = Array.isArray(data.messages) ? data.messages : [];
+      let hadUsage = false;
+      for (const m of messages) {
+        const t = m.tokens;
+        if (!t || typeof t !== 'object') continue;
+        const ts = typeof m.timestamp === 'string' ? m.timestamp : null;
+        if (ts) {
+          try { if (new Date(ts) < cutoff) continue; } catch {}
+        }
+        if (m.id) {
+          if (seenMsgs.has(m.id)) continue;
+          seenMsgs.add(m.id);
+        }
+        const cached = t.cached || 0;
+        hadUsage = true;
+        addUsage(acc, m.model || 'gemini', ts ? ts.slice(0, 10) : null, {
+          input: Math.max(0, (t.input || 0) - cached) + (t.tool || 0),
+          cache_read: cached,
+          output: (t.output || 0) + (t.thoughts || 0),
+        });
+      }
+      if (hadUsage && !isNested) acc.totalSessions++;
+    }
+  }
+}
+
+// Pi sessions: ~/.pi/agent/sessions/<encoded-cwd>/*.jsonl, assistant messages
+// carry normalized usage {input, output, cacheRead, cacheWrite} (disjoint
+// buckets) plus a provider-reported cost — trusted when positive (OpenRouter
+// bills exact), otherwise priced from the table (GLM et al).
+function scanPiUsage(acc, cutoff) {
+  try { fs.statSync(PI_SESSIONS_DIR); } catch { return; }
+  for (const dirName of readdirSafe(PI_SESSIONS_DIR)) {
+    const projDir = path.join(PI_SESSIONS_DIR, dirName);
+    if (!isDir(projDir)) continue;
+    for (const file of readdirSafe(projDir)) {
+      if (!file.endsWith('.jsonl')) continue;
+      const filePath = path.join(projDir, file);
+      let stat;
+      try { stat = fs.statSync(filePath); } catch { continue; }
+      if (stat.mtime < cutoff) continue;
+      let hadUsage = false;
+      try {
+        forEachJsonlEntry(filePath, {}, entry => {
+          const msg = entry.message;
+          const u = msg && msg.usage;
+          if (entry.type !== 'message' || !u || msg.role !== 'assistant') return;
+          const ts = typeof entry.timestamp === 'string' ? entry.timestamp : null;
+          if (ts) {
+            try { if (new Date(ts) < cutoff) return; } catch {}
+          }
+          hadUsage = true;
+          addUsage(acc, msg.model || 'unknown', ts ? ts.slice(0, 10) : null, {
+            input: u.input,
+            output: u.output,
+            cache_read: u.cacheRead,
+            cache_write_5m: u.cacheWrite,
+          }, u.cost && u.cost.total > 0 ? u.cost.total : undefined);
+        });
+      } catch {}
+      if (hadUsage) acc.totalSessions++;
+    }
+  }
+}
+
+function computeTokenUsage() {
+  const now = Date.now();
+  if (tokenUsageCache && now - tokenUsageCacheTime < TOKEN_CACHE_TTL) return tokenUsageCache;
+
+  const cutoff = new Date(now - 30 * 24 * 60 * 60 * 1000);
+  const acc = { byModel: {}, byDate: {}, totalMessages: 0, totalSessions: 0 };
+  scanClaudeUsage(acc, cutoff);
+  scanCodexUsage(acc, cutoff);
+  scanGeminiUsage(acc, cutoff);
+  scanPiUsage(acc, cutoff);
+  const { byModel, byDate, totalMessages, totalSessions } = acc;
+
+  // Totals per model (cost is accumulated per call in addUsage — tiered
+  // pricing makes it non-derivable from aggregates)
   const models = {};
   let totalCost = 0;
   let totalTokens = 0;
   for (const [model, m] of Object.entries(byModel)) {
-    const pricing = MODEL_PRICING[model] || DEFAULT_PRICING;
-    const cost = (m.input * pricing.input + m.output * pricing.output
-      + m.cache_write_5m * pricing.cache_write_5m + m.cache_write_1h * pricing.cache_write_1h
-      + m.cache_read * pricing.cache_read) / 1_000_000;
     const tokens = m.input + m.output + m.cache_write_5m + m.cache_write_1h + m.cache_read;
-    models[model] = { ...m, cost, tokens };
-    totalCost += cost;
+    models[model] = { ...m, tokens };
+    totalCost += m.cost;
     totalTokens += tokens;
   }
 
