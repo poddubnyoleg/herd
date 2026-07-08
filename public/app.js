@@ -98,6 +98,31 @@ class Herd {
       }
     });
 
+    // Sleep/wake detector. System sleep freezes timers and WebSockets; on
+    // wake, armed finished-timers flush at once against aged-out _chunkTimes
+    // and resume replays race the fixed suppress window — both used to paint
+    // every background tab green the moment the lid opened. Detect suspend
+    // via wall-vs-monotonic clock drift: during sleep Date.now() jumps while
+    // performance.now() stalls (macOS), so the gap is actual suspend time.
+    // Hidden-tab timer throttling delays both clocks equally and never
+    // triggers this. On wake, treat every tab like it just reconnected.
+    this._lastWall = Date.now();
+    this._lastPerf = performance.now();
+    setInterval(() => {
+      const wall = Date.now(), perf = performance.now();
+      const suspended = (wall - this._lastWall) - (perf - this._lastPerf);
+      if (suspended > 10000) {
+        for (const tab of this.tabs.values()) {
+          tab._suppressUntil = Math.max(tab._suppressUntil || 0, wall + 30000);
+          tab._sawOutput = false;
+          tab._chunkTimes = [];
+          if (tab.idleTimer) { clearTimeout(tab.idleTimer); tab.idleTimer = null; }
+        }
+      }
+      this._lastWall = wall;
+      this._lastPerf = perf;
+    }, 5000);
+
     // P9: Warn before closing page with active sessions
     window.addEventListener('beforeunload', e => {
       if ([...this.tabs.values()].some(t => t.alive)) {
@@ -725,7 +750,7 @@ class Herd {
       _closeRequested: 0, _inactiveSince: 0,
       _writeBuf: '', _writeRaf: 0,
       _chunkTimes: [], _scrolled: false, _lineWatermark: undefined,
-      _resizeObserver: null,
+      _resizeObserver: null, _suppressUntil: 0, _sawOutput: false,
     };
     this.tabs.set(tabId, tab);
 
@@ -893,6 +918,7 @@ class Herd {
       // (output, then quiet), which used to mark every restored background
       // tab with the green "finished" pulse.
       tab._suppressUntil = Date.now() + 15000;
+      tab._sawOutput = false;
       // Clear any stale finished-tracking from the prior connection
       if (tab.idleTimer) { clearTimeout(tab.idleTimer); tab.idleTimer = null; }
       tab.outputSinceViewed = 0;
@@ -913,7 +939,15 @@ class Herd {
             // easily outlast the initial 15s window on long sessions; without
             // this, the tail of the replay flips every restored background
             // tab to "finished" (green pulse) a few seconds after refresh.
-            if (tab._suppressUntil && Date.now() < tab._suppressUntil) {
+            // The FIRST burst after a (re)connect or wake is always resume
+            // replay / startup noise, so it opens the window unconditionally:
+            // when many tabs respawn `claude --resume` at once (page refresh,
+            // laptop wake), a slow spawn can push the replay past the fixed
+            // 15s window, and its tail used to read as work-then-quiet.
+            if (!tab._sawOutput) {
+              tab._sawOutput = true;
+              tab._suppressUntil = Math.max(tab._suppressUntil || 0, Date.now() + 3000);
+            } else if (tab._suppressUntil && Date.now() < tab._suppressUntil) {
               tab._suppressUntil = Math.max(tab._suppressUntil, Date.now() + 3000);
             }
             // Batch writes via rAF to reduce render calls and improve FPS
