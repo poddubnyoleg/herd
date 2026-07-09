@@ -170,7 +170,13 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use(express.static(path.join(__dirname, 'public')));
+// no-cache = revalidate every time (ETag still avoids re-transfer). Without
+// a Cache-Control header Chrome falls back to heuristic freshness and a
+// restored or re-navigated tab can keep running a stale app.js long after a
+// fix shipped.
+app.use(express.static(path.join(__dirname, 'public'), {
+  setHeaders: res => res.setHeader('Cache-Control', 'no-cache'),
+}));
 
 // Resolve agent binaries once at startup
 function resolveBin(name, candidates = []) {
