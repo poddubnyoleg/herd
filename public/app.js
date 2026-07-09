@@ -77,7 +77,7 @@ class Herd {
   async init() {
     // Bump when debugging client-side state issues: confirms in the console
     // which build the browser actually loaded after a fix.
-    console.log('[herd] build 2026-07-08 — input-gated finished pulse, layered wake detect');
+    console.log('[herd] build 2026-07-09 — instant finished mark on return from hidden');
     this.initTheme();
     await this.loadProjects();
     await this.loadRecentSessions();
@@ -1024,6 +1024,7 @@ class Herd {
             const _now = Date.now();
             tab._chunkTimes = tab._chunkTimes.filter(t => _now - t < 2000);
             tab._chunkTimes.push(_now);
+            tab._lastChunkAt = _now;
             break;
           case 'ready':
             tab.sessionId = msg.sessionId;
@@ -1139,7 +1140,25 @@ class Herd {
     // No green pulse for a session the user hasn't typed into since its last
     // (re)connect: post-resume it sits at a prompt, so any output-then-quiet
     // it produces (startup noise, error dumps) is not finished work.
-    if (!tab._awaitingInput) this.armFinishedTimer(tabId, tab);
+    if (!tab._awaitingInput) {
+      // Writes are rAF-batched and rAF freezes while the page is hidden, so
+      // a run that ended during that time is only processed on return. If
+      // the flushed chunk is already stale, the session has long gone quiet:
+      // mark finished now, so the user comes back to tabs already green
+      // instead of watching them all flash in sync 5 seconds later.
+      if (now - (tab._lastChunkAt || 0) > 5000) {
+        this._dbg('finished-set', {
+          tab: tabId, name: tab.name, cause: 'stale-on-return',
+          sinceLastChunk: now - (tab._lastChunkAt || 0),
+        });
+        tab.finished = true;
+        tab.unread = false;
+        this.renderTabs();
+        this.updateSidebarFinished(tabId, true);
+        return;
+      }
+      this.armFinishedTimer(tabId, tab);
+    }
     if (!tab.unread) {
       tab.unread = true;
       this.renderTabs();
