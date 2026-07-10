@@ -77,7 +77,7 @@ class Herd {
   async init() {
     // Bump when debugging client-side state issues: confirms in the console
     // which build the browser actually loaded after a fix.
-    console.log('[herd] build 2026-07-09 — instant finished mark on return from hidden');
+    console.log('[herd] build 2026-07-10 — input gate ignores focus/mouse/query noise');
     this.initTheme();
     await this.loadProjects();
     await this.loadRecentSessions();
@@ -833,7 +833,16 @@ class Herd {
     terminal.onData(data => {
       // First keystroke since (re)connect: only now can this session start
       // real work, so only now may it later earn the green finished pulse.
-      tab._awaitingInput = false;
+      // onData also carries data the user never typed — focus reports
+      // (\x1b[I, \x1b[O: apps like claude enable DECSET 1004, so merely
+      // clicking into or away from a tab fires these), mouse reports, and
+      // xterm's automatic replies to the app's status queries (cursor
+      // position etc.). All of it is ESC-prefixed; real engagement is
+      // printable keys, Enter, or a bracketed paste.
+      if ((!data.startsWith('\x1b') || data.startsWith('\x1b[200~')) && tab._awaitingInput) {
+        tab._awaitingInput = false;
+        this._dbg('input-gate-cleared', { tab: tab.id, name: tab.name });
+      }
       if (tab.ws?.readyState === WebSocket.OPEN) tab.ws.send(JSON.stringify({ type: 'input', data }));
     });
     terminal.onResize(({ cols, rows }) => {
