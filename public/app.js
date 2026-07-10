@@ -77,7 +77,7 @@ class Herd {
   async init() {
     // Bump when debugging client-side state issues: confirms in the console
     // which build the browser actually loaded after a fix.
-    console.log('[herd] build 2026-07-10 — input gate ignores focus/mouse/query noise');
+    console.log('[herd] build 2026-07-10b — unread (blue) also input-gated');
     this.initTheme();
     await this.loadProjects();
     await this.loadRecentSessions();
@@ -1141,33 +1141,34 @@ class Herd {
     }
     if (!grew || now < (tab._suppressUntil || 0)) return;
     if (tabId === this.activeTabId || !tab._inactiveSince || now - tab._inactiveSince < 5000) return;
+    // Until the user engages the session (types) after a (re)connect, nothing
+    // it prints is signal: no unread accent, no green pulse. Post-resume the
+    // session sits at a prompt, so its output is replay tails, banners, or
+    // startup noise — and a green earned before the reconnect stays visible
+    // (its result is still unseen) instead of being demoted to unread.
+    if (tab._awaitingInput) return;
     if (tab.finished) {
       tab.finished = false;
       this.updateSidebarFinished(tabId, false);
       this.renderTabs();
     }
-    // No green pulse for a session the user hasn't typed into since its last
-    // (re)connect: post-resume it sits at a prompt, so any output-then-quiet
-    // it produces (startup noise, error dumps) is not finished work.
-    if (!tab._awaitingInput) {
-      // Writes are rAF-batched and rAF freezes while the page is hidden, so
-      // a run that ended during that time is only processed on return. If
-      // the flushed chunk is already stale, the session has long gone quiet:
-      // mark finished now, so the user comes back to tabs already green
-      // instead of watching them all flash in sync 5 seconds later.
-      if (now - (tab._lastChunkAt || 0) > 5000) {
-        this._dbg('finished-set', {
-          tab: tabId, name: tab.name, cause: 'stale-on-return',
-          sinceLastChunk: now - (tab._lastChunkAt || 0),
-        });
-        tab.finished = true;
-        tab.unread = false;
-        this.renderTabs();
-        this.updateSidebarFinished(tabId, true);
-        return;
-      }
-      this.armFinishedTimer(tabId, tab);
+    // Writes are rAF-batched and rAF freezes while the page is hidden, so
+    // a run that ended during that time is only processed on return. If
+    // the flushed chunk is already stale, the session has long gone quiet:
+    // mark finished now, so the user comes back to tabs already green
+    // instead of watching them all flash in sync 5 seconds later.
+    if (now - (tab._lastChunkAt || 0) > 5000) {
+      this._dbg('finished-set', {
+        tab: tabId, name: tab.name, cause: 'stale-on-return',
+        sinceLastChunk: now - (tab._lastChunkAt || 0),
+      });
+      tab.finished = true;
+      tab.unread = false;
+      this.renderTabs();
+      this.updateSidebarFinished(tabId, true);
+      return;
     }
+    this.armFinishedTimer(tabId, tab);
     if (!tab.unread) {
       tab.unread = true;
       this.renderTabs();
