@@ -1,7 +1,7 @@
 const express = require('express');
 const http = require('http');
 const { WebSocketServer } = require('ws');
-const { execFile, execSync } = require('child_process');
+const { execFile, execSync, spawn } = require('child_process');
 const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
@@ -632,8 +632,13 @@ const AGENTS = {
     scan: scanPiSessions,
     sessions: () => piIndex.values(),
     summaryKey: id => `pi:${id}`,
-    launch(resume) {
-      return resume ? `${piBin} --session ${resume}` : `${piBin}`;
+    async launch(resume) {
+      if (resume) return `${piBin} --session ${resume}`;
+      // New sessions default to local Gemma when the llama.cpp server is up
+      // (localModelUp is hoisted; probe fails fast when the port is closed).
+      return (await localModelUp())
+        ? `${piBin} --provider local --model gemma-4-12b`
+        : `${piBin}`;
     },
     snapshotKeys({ project }) {
       const dir = piProjectDir(project);
@@ -1060,6 +1065,9 @@ const MODEL_PRICING = {
   // Fallback for bare/unknown gemini ids (2.5-pro rates) so they don't hit DEFAULT
   'gemini':                       { input: 1.25,  output: 10,    cache_read: 0.125,
                                     tier: { threshold: 200_000, input: 2.50, output: 15, cache_read: 0.25 } },
+  // Local models (llama.cpp via pi's `local` provider) — on-device, costs nothing.
+  // Without this, gemma ids match no prefix and fall to DEFAULT_PRICING (Opus rates).
+  'gemma':                        { input: 0,     output: 0,     cache_read: 0 },
   // Zhipu GLM (z.ai)
   'glm-5.2':                      { input: 1.40,  output: 4.40,  cache_read: 0.26 },
   'glm-5.1':                      { input: 1.40,  output: 4.40,  cache_read: 0.26 },
@@ -1749,6 +1757,58 @@ app.post('/api/open-in-finder', express.json(), (req, res) => {
   });
 });
 
+// C1c: Local model server (llama.cpp serving Gemma for pi's `local` provider).
+// Status is a cheap loopback health probe (llama-server exempts /health from its
+// API key). Start spawns the launcher detached so the model server survives Herd
+// restarts — it is infrastructure, not a session, so cleanup() must not reap it.
+// POST is origin-checked by the generic middleware.
+const LOCAL_MODEL_HEALTH = process.env.LOCAL_MODEL_HEALTH || 'http://127.0.0.1:8080/health';
+const LOCAL_MODEL_CMD = process.env.LOCAL_MODEL_CMD || path.join(os.homedir(), '.local', 'bin', 'gemma-server');
+const LOCAL_MODEL_LOG = '/tmp/llama-gemma.log';
+
+async function localModelUp() {
+  try {
+    const res = await fetch(LOCAL_MODEL_HEALTH, { signal: AbortSignal.timeout(1500) });
+    // 401/403 still proves the server is up — covers llama.cpp builds where
+    // /health is not exempt from --api-key.
+    return res.ok || res.status === 401 || res.status === 403;
+  } catch { return false; }
+}
+
+// In-process start lock: model load takes ~10-30s (longer with a cold download)
+// during which /health is down — without this, a reload or second browser tab
+// could spawn a second 7GB model process on a 16GB machine.
+let localModelStartedAt = 0;
+const LOCAL_MODEL_START_GRACE_MS = 3 * 60 * 1000;
+const localModelStarting = () => Date.now() - localModelStartedAt < LOCAL_MODEL_START_GRACE_MS;
+
+app.get('/api/local-model', async (req, res) => {
+  const running = await localModelUp();
+  if (running) localModelStartedAt = 0;
+  res.json({ running, starting: !running && localModelStarting(), available: fs.existsSync(LOCAL_MODEL_CMD) });
+});
+
+app.post('/api/local-model/start', async (req, res) => {
+  if (await localModelUp()) return res.json({ running: true });
+  if (localModelStarting()) return res.json({ starting: true });
+  if (!fs.existsSync(LOCAL_MODEL_CMD)) {
+    return res.status(404).json({ error: `launcher not found: ${LOCAL_MODEL_CMD}` });
+  }
+  try {
+    const out = fs.openSync(LOCAL_MODEL_LOG, 'a');
+    const child = spawn(LOCAL_MODEL_CMD, [], { detached: true, stdio: ['ignore', out, out] });
+    // Without this, an async spawn failure (EACCES on a bad chmod, ENOEXEC) is an
+    // unhandled 'error' event that would crash Herd and SIGHUP every live session.
+    child.on('error', err => console.error('[local-model] spawn failed:', err.message));
+    child.unref();
+    fs.closeSync(out);
+    localModelStartedAt = Date.now();
+    res.json({ started: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // --- WebSocket terminal (using `script` as PTY wrapper) ---
 
 const terminals = new Map();
@@ -1884,7 +1944,9 @@ wss.on('connection', (ws, req) => {
     ? `stty cols ${effectiveCols} 2>/dev/null; clear; `
     : 'clear; ';
 
-  proc.write(`${setSize}${agentDef.launch(resume, resolvedProject)}\n`);
+  // launch() may be async (pi probes the local model server to pick a default)
+  Promise.resolve(agentDef.launch(resume, resolvedProject))
+    .then(cmd => proc.write(`${setSize}${cmd}\n`));
 
   // --- Auto-naming ---
   let outputBuffer = '';

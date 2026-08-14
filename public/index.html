@@ -6,7 +6,7 @@
   <title>&#8203;</title>
   <link rel="icon" media="(prefers-color-scheme: light)" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90' fill='black'>%3E_</text></svg>">
   <link rel="icon" media="(prefers-color-scheme: dark)" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90' fill='white'>%3E_</text></svg>">
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
+  <link rel="stylesheet" href="/vendor/xterm.css">
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
@@ -17,6 +17,7 @@
         <span id="usage-badge" class="usage-badge" title="30-day token usage"></span>
         <button id="add-project-btn" title="Add project">+</button>
         <button id="refresh-btn" title="Refresh projects" onclick="window.__herd?.loadProjects()">&#x21bb;</button>
+        <button id="local-model-btn" title="Local model server" hidden>&#x2301;</button>
       </div>
       <div id="search-bar">
         <input type="text" id="project-search" placeholder="Filter projects..." spellcheck="false">
@@ -48,10 +49,10 @@
     </main>
   </div>
 
-  <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-web-links@0.9.0/lib/xterm-addon-web-links.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-webgl@0.16.0/lib/xterm-addon-webgl.js"></script>
+  <script src="/vendor/xterm.js"></script>
+  <script src="/vendor/xterm-addon-fit.js"></script>
+  <script src="/vendor/xterm-addon-web-links.js"></script>
+  <script src="/vendor/xterm-addon-webgl.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

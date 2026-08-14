@@ -86,6 +86,7 @@ class Herd {
     this.setupResize();
     this.setupSearch();
     this.setupAddProject();
+    this.setupLocalModel();
     this.listenForSummaryUpdates();
     document.getElementById('new-tab-btn').addEventListener('click', () => this.newSessionInLastProject());
     // Window resize is handled per-terminal by ResizeObserver in createTab
@@ -390,6 +391,68 @@ class Herd {
       } catch {}
       finally { btn.disabled = false; }
     });
+  }
+
+  // ── Local model server (llama.cpp for pi's `local` provider) ──
+
+  setupLocalModel() {
+    const btn = document.getElementById('local-model-btn');
+    if (!btn) return;
+
+    const render = (state) => {
+      btn.hidden = !state.available;
+      btn.classList.toggle('up', !!state.running);
+      btn.classList.toggle('starting', !state.running && !!state.starting);
+      btn.title = state.running ? 'Local model server: running'
+        : state.starting ? 'Local model server: starting…'
+        : 'Local model server: stopped — click to start';
+    };
+    const refresh = async () => {
+      try { render(await (await fetch('/api/local-model')).json()); } catch {}
+    };
+    // Model load takes ~10-30s (minutes on a cold download); poll until healthy
+    const pollUntilUp = async () => {
+      for (let i = 0; i < 90; i++) {
+        await new Promise(r => setTimeout(r, 2000));
+        try {
+          const s = await (await fetch('/api/local-model')).json();
+          if (s.running || !s.starting) { render(s); return; }
+        } catch {}
+      }
+      btn.classList.remove('starting');
+      btn.title = 'Local model server: still not up — check /tmp/llama-gemma.log';
+      refresh();
+    };
+
+    btn.addEventListener('click', async () => {
+      if (btn.classList.contains('up') || btn.classList.contains('starting')) return;
+      btn.classList.add('starting');
+      btn.title = 'Local model server: starting…';
+      try {
+        const res = await fetch('/api/local-model/start', { method: 'POST' });
+        const data = await res.json();
+        if (!res.ok) {
+          btn.classList.remove('starting');
+          btn.title = `Local model server: failed — ${data.error || 'see /tmp/llama-gemma.log'}`;
+          return;
+        }
+        if (data.running) { render({ available: true, running: true }); return; }
+        await pollUntilUp();
+      } catch {
+        btn.classList.remove('starting');
+        refresh();
+      }
+    });
+
+    // Initial state; if a start is already in flight (another tab, or a reload
+    // mid-load), resume polling instead of showing a clickable gray button
+    (async () => {
+      try {
+        const s = await (await fetch('/api/local-model')).json();
+        render(s);
+        if (!s.running && s.starting) await pollUntilUp();
+      } catch {}
+    })();
   }
 
   // ── Projects ──

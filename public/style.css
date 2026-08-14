@@ -125,6 +125,38 @@ body {
   background: var(--bg-hover);
 }
 
+#local-model-btn {
+  margin-left: 0;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 16px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  line-height: 1;
+  transition: color 0.1s, background 0.1s;
+}
+
+#local-model-btn:hover {
+  color: var(--accent);
+  background: var(--bg-hover);
+}
+
+#local-model-btn.up {
+  color: var(--green);
+}
+
+#local-model-btn.starting {
+  color: var(--accent);
+  animation: local-model-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes local-model-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
 /* F1: Search bar */
 #search-bar {
   padding: 6px 12px;

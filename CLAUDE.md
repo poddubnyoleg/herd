@@ -4,14 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-Herd is a web-based terminal multiplexer for Claude Code, Codex, and Gemini CLI sessions. It lets you browse, resume, and manage sessions across all your projects from a single browser tab. It scans `~/.claude/projects/` for Claude Code history, `~/.codex/sessions/` for OpenAI Codex history, and `~/.gemini/tmp/` for Gemini CLI logs (JSONL files), merging them into a unified project view.
+Herd is a web-based terminal multiplexer for Claude Code, Codex, Gemini CLI, and pi sessions. It lets you browse, resume, and manage sessions across all your projects from a single browser tab. It scans `~/.claude/projects/` for Claude Code history, `~/.codex/sessions/` for OpenAI Codex history, `~/.gemini/tmp/` for Gemini CLI logs, and `~/.pi/agent/sessions/` for pi logs (JSONL files), merging them into a unified project view.
 
 ## Commands
 
 - `npm install` — install dependencies
 - `npm start` — run the server (default http://localhost:3456, configurable via `PORT` env var)
 - `npm test` — run Playwright browser tests (`test/hub.test.mjs`)
-- **Restart server from Claude Code**: `lsof -ti:3456 | xargs kill -9 2>/dev/null; while lsof -ti:3456 >/dev/null 2>&1; do sleep 0.3; done; nohup node server.js > /tmp/herd.log 2>&1 &` — must be a single foreground Bash call, never use `run_in_background` (it kills child processes on cleanup)
+- **Restart server from Claude Code**: `lsof -ti:3456 | xargs kill -9 2>/dev/null; while lsof -ti:3456 >/dev/null 2>&1; do sleep 0.3; done; nohup node server.js > /tmp/herd.log 2>&1 &` — must be a single foreground Bash call, never use `run_in_background` (it kills child processes on cleanup). Run it with the sandbox disabled: node-pty's `spawn-helper` fails with `posix_spawnp failed` under the Bash sandbox, and the server cannot bind its port
 
 No linter or build step configured. Tests use Playwright (devDependency).
 
@@ -21,35 +21,41 @@ Single-process Node.js server (`server.js`) serving a vanilla JS frontend (`publ
 
 **Backend (`server.js`):**
 - Express serves static files from `public/` and REST endpoints:
-  - `GET /api/projects` — lists projects from `~/.claude/projects/`, `~/.codex/sessions/`, and `~/.gemini/tmp/`, merged by real path, sorted by name. Lazily prunes stale summary cache entries
+  - `GET /api/projects` — lists projects from `~/.claude/projects/`, `~/.codex/sessions/`, `~/.gemini/tmp/`, and `~/.pi/agent/sessions/`, merged by real path, sorted by name. Lazily prunes stale summary cache entries
   - `GET /api/projects/:id/sessions` — returns `{ sessions, total, truncated }` (max 30 sessions). Path traversal is blocked by validating resolved path stays inside `PROJECTS_DIR`
-  - `GET /api/sessions?project=<realPath>` — unified sessions endpoint that works with real paths (also serves Codex and Gemini sessions for the project)
-  - `GET /api/recent-sessions?limit=N` — most recent sessions across all projects (Claude, Codex, and Gemini), max 50
-  - `GET /api/token-usage` — 30-day token usage/cost breakdown by model and day, computed from JSONL usage data. Includes model-specific pricing (Opus, Sonnet, Haiku) with cache tier breakdowns. Cached for 5 minutes
+  - `GET /api/sessions?project=<realPath>` — unified sessions endpoint that works with real paths (also serves Codex, Gemini, and pi sessions for the project)
+  - `GET /api/recent-sessions?limit=N` — most recent sessions across all projects (Claude, Codex, Gemini, and pi), max 50
+  - `GET /api/token-usage` — 30-day token usage/cost breakdown by model and day, computed from JSONL usage data by `scanClaudeUsage`/`scanCodexUsage`/`scanGeminiUsage`/`scanPiUsage`. `MODEL_PRICING` covers Anthropic (with 5m/1h cache-write and cache-read tiers), OpenAI/Codex, Gemini, and GLM, with prefix fallback so unknown model versions don't drop to the default. Cached for 5 minutes. Guarded by `GUARDED_GET_PATHS` (Origin-checked despite being a GET — it's expensive)
   - `GET /api/summary-events` — SSE stream for real-time summary updates (session names update in-place without re-rendering)
   - `POST /api/regenerate-summaries` — force re-generation of summaries (single session, per-project, or all)
   - `POST /api/pick-folder` — triggers native macOS folder picker via `osascript` for adding arbitrary project directories (POST because it has UI side effects; cross-origin blocked by Origin check)
-- WebSocket server (`noServer: true`) only upgrades connections on `/ws` path. Spawns terminal processes through `node-pty` for a real PTY with full resize (`ioctl TIOCSWINSZ`) support. Supports `agent=claude`, `agent=codex`, and `agent=gemini` parameters. New sessions launch `claude`/`codex`/`gemini` directly; resumed sessions use `--resume <id>`
-- Claude, Codex, and Gemini binaries resolved once at startup from common paths or `which`
+  - `POST /api/open-in-finder` — reveals a project directory via `open`. Validates the path resolves to an existing directory and uses `execFile` (no shell) with a 5s timeout
+  - `GET /api/local-model` + `POST /api/local-model/start` — status probe and launcher for the local llama.cpp model server (Gemma for pi's `local` provider). Status is a 1.5s-timeout fetch of `http://127.0.0.1:8080/health`; start spawns `~/.local/bin/gemma-server` (override via `LOCAL_MODEL_CMD`/`LOCAL_MODEL_HEALTH`) detached with `unref()` so the model server survives Herd restarts and is not reaped by `cleanup()`. An in-process start lock (3-min grace, reported as `starting`) prevents duplicate spawns while the model loads and `/health` is still down; a 401/403 from the probe counts as up (covers llama.cpp builds where `/health` honors `--api-key`). Gemma ids have a zero-cost `MODEL_PRICING` entry so local tokens don't get billed at `DEFAULT_PRICING` (Opus) rates in the usage badge
+- WebSocket server (`noServer: true`) only upgrades connections on `/ws` path. Spawns terminal processes through `node-pty` for a real PTY with full resize (`ioctl TIOCSWINSZ`) support. Supports `agent=claude|codex|gemini|pi`. New sessions launch the agent binary directly; resumed sessions use `--resume <id>` (`--session <id>` for pi). `launch()` may be async: new pi sessions probe the local model server and default to `--provider local --model gemma-4-12b` when it is up (resumed pi sessions keep their stored model)
+- Claude, Codex, Gemini, and pi binaries resolved once at startup from common paths or `which`; a missing binary just disables that agent
+- **`AGENTS` registry** (`server.js:~560`) is the per-agent abstraction — every agent supplies `bin`, `launch(resume, project)`, `summaryKey(id)`, `snapshotKeys()`, and `detect()`, and the external ones also supply `scan()`/`sessions()`. `EXTERNAL_AGENTS` is every key except `claude` (Claude is special-cased because `~/.claude/projects/` already groups by project). Add a new agent by adding a registry entry plus a scanner — the REST/WS/summary paths iterate the registry rather than naming agents
 - Codex integration: scans `~/.codex/sessions/YYYY/MM/DD/*.jsonl` for Codex rollout files. Parses `session_meta` and `event_msg` entries to extract session IDs, cwds, and previews. Cached by `(filePath, mtimeMs)` for incremental rescans
-- Gemini integration: scans `~/.gemini/tmp/<project-hash>/logs.json` files. Groups entries by session ID, extracts cwd and preview from message history. Cached by `(filePath, mtimeMs)`. Loads `~/.gemini/.env` into a scoped object (not `process.env`) to avoid side-effects
+- Gemini integration: scans `~/.gemini/tmp/<project-hash>/logs.json` files. Groups entries by session ID, extracts cwd and preview from message history. Cached by `(filePath, mtimeMs)`
+- pi integration: scans `~/.pi/agent/sessions/<encoded-project>/*.jsonl`. The filename is *not* the session id — it's read from the `{type:"session"}` header line. Resume is `pi --session <id>`; summary cache keys are namespaced `pi:<id>`
+- Agent env isolation: `agentEnv(agent)` builds each PTY's environment from `stripAgentSessionEnv(stripDangerousEnv(process.env))`, deletes every key in `AGENT_API_KEYS`, then re-adds only the one that agent should see — so Codex can't read the Anthropic key and vice versa. Gemini's key comes from `~/.gemini/.env` and pi's `OPENROUTER_API_KEY` from the project-local `.env`, both parsed into scoped objects that never touch `process.env`
 - Project paths are encoded/decoded between the filesystem dash-separated format in `~/.claude/projects/` and real paths using a backtracking solver (`decodeProjectPath`) that validates against the actual filesystem. `findEncodedDir()` reverse-lookups the encoded directory name for a given real path
-- Security: binds to `127.0.0.1` by default (configurable via `HOST` env var), sets `X-Content-Type-Options` and `X-Frame-Options` headers, validates `resume` parameter as UUID format. Origin header is checked on WebSocket upgrades and on non-GET / expensive REST routes to prevent cross-origin shell hijack and CSRF; missing/`null` Origin (non-browser clients like curl) is allowed. Reverse-proxy / HTTPS deployments must set `ALLOWED_ORIGINS` (comma-separated) to the external origin(s)
+- Security: binds to `127.0.0.1` by default (configurable via `HOST` env var), sets `X-Content-Type-Options` and `X-Frame-Options` headers, validates `resume` parameter against a strict UUID regex (`server.js:1778`) for every agent. Origin header is checked on WebSocket upgrades and on non-GET / expensive REST routes (`GUARDED_GET_PATHS`) to prevent cross-origin shell hijack and CSRF. A **missing** Origin (non-browser clients like curl) is allowed; the literal string `null` is **not** — browsers send `"null"` for opaque-origin contexts (sandboxed iframes, `data:`), so allowlisting it would be a cross-site-WebSocket-hijack → RCE bypass. Reverse-proxy / HTTPS deployments must set `ALLOWED_ORIGINS` (comma-separated) to the external origin(s)
+- **Origin checks are not authentication.** Because missing-Origin is deliberately allowed, any local process — including an agent Herd itself spawned — can open `/ws` with no Origin header and spawn, type into, or kill a PTY. That is accepted for a localhost-only tool with no auth; it is the thing to revisit before any control-plane API or non-loopback bind (see `docs/proposal-telegram-supervisor.md`)
 - Haiku summaries: spawns `claude -p --model haiku` to generate 2-4 word session names (no API key needed), cached in `summaries.json` on disk with timestamps. Background-generates missing summaries when sessions are fetched. Stale summaries (session modified after generation, with 5-min cooldown) are automatically re-generated. Tracks in-flight requests to prevent duplicate calls
 - Auto-naming: buffers terminal output (capped at 2KB) and periodically sends it to Haiku via CLI for tab title generation (max 5 renames over 30 minutes per session). Live titles are persisted to the summary cache on disk
-- Session ID detection: for new (non-resumed) sessions, the server discovers the session ID by scanning the project dir for recently-created JSONL files, then notifies the client via a `ready` message
-- JSONL parsing: reads session files line-by-line with chunked I/O (up to 20 lines, 64KB chunks) instead of a fixed 16KB buffer
-- Token usage computation: scans all JSONL files from last 30 days, extracts `usage` fields from messages, applies per-model pricing with cache tier breakdowns (5m ephemeral, 1h ephemeral, cache reads)
+- Session ID detection: for new (non-resumed) sessions, the server discovers the session ID via `AGENTS[*].detect` — scanning the agent's session dir for JSONL files created after launch (pi additionally reads the id out of the file's header line) — then notifies the client via a `ready` message. Polls every 1s up to a 5-minute deadline, so `sessionId` is null for a while on a fresh session; `termId` is generated at spawn and is the only identifier available immediately
+- JSONL parsing: reads session files line-by-line with chunked I/O (up to 20 lines, 64KB chunks) instead of a fixed 16KB buffer. The parsers extract metadata only (id, cwd, a 150-char preview) — there is no full-transcript reader
+- Token usage computation: scans all JSONL files from last 30 days, extracts `usage` fields from messages, applies per-model pricing. Cache tiers are provider-shaped: Anthropic has 5m/1h ephemeral writes plus reads, while OpenAI/Gemini/GLM only have discounted cached input
 - Graceful shutdown: SIGINT/SIGTERM kill terminal processes, close WebSocket server, then close HTTP server with a 3s timeout
 
 **Frontend (`public/app.js`, `public/index.html`, `public/style.css`):**
 - Single `Herd` class manages all state — project list, tabs, terminals, theme, search
 - Each tab holds an xterm.js terminal instance connected to the server via WebSocket
-- Tabs track `alive`, `unread`, and `finished` states; background tabs with 5s output idle are marked finished (green pulse)
+- Tabs track `alive`, `unread`, and `finished` states; background tabs with output-idle are marked finished (green pulse). **Both accents are gated on real user input** (`tab._awaitingInput`, cleared only by actual typing in `terminal.onData` — not focus, mouse, or terminal query replies). A tab that just (re)connected is replaying `--resume` history, which is output-then-quiet and indistinguishable from a finished run; without the gate every restored background tab pulsed green. `_suppressUntil` adds a time-based mute after connect and around known output bursts. This is subtle and was arrived at the hard way — see the green-tabs history before touching it
 - Terminal auto-refit: each terminal uses a `ResizeObserver` on its container to refit on any size change (window resize, sidebar drag, etc.)
 - Smart scroll: output writes preserve scroll position when the user has scrolled up; auto-scrolls only when already at the bottom
 - "+" button in tab bar creates a new session in the most recent active project
-- Recent sessions: "Recent" section at top of sidebar shows 20 most recent sessions across all projects with project labels, supports Claude, Codex, and Gemini
+- Recent sessions: "Recent" section at top of sidebar shows 20 most recent sessions across all projects with project labels. Agent badges render generically from `s.agent` (`badge-${agent}`), and the per-project new-session buttons are emitted only for agents whose binary was resolved — so agent support is data-driven, not hardcoded per call site
 - SSE live updates: listens on `/api/summary-events` via EventSource; updates session names in-place in both project and recent sections without full re-render
 - Token usage badge: sidebar header shows 30-day cost/token summary; clicking opens a popup with per-model breakdown, stats (tokens, sessions, API calls), and a 14-day daily cost sparkline chart
 - Add project button: "+" in sidebar header opens native macOS folder picker to add arbitrary project directories
@@ -57,18 +63,22 @@ Single-process Node.js server (`server.js`) serving a vanilla JS frontend (`publ
 - Search/filter: sidebar text input filters projects by name and sessions by summary/preview text. Auto-expands projects that match only by session content
 - WebSocket reconnection: auto-reconnects with exponential backoff (up to 30s) for sessions that have a `sessionId`
 - Keyboard shortcuts: Ctrl+W (close tab), Ctrl+T (new session in active project), Ctrl+PageDown/PageUp (cycle tabs)
-- xterm.js and addons (fit, web-links) loaded from CDN
+- xterm.js and addons (fit, web-links, webgl) vendored in `public/vendor/` (pinned versions, downloaded from jsdelivr) so the UI works fully offline
+- Local model button: `⌁` in the sidebar header (hidden unless the `gemma-server` launcher script exists). Gray = down, click to start (pulses while llama.cpp loads the model, polls up to 2 min), green = `/health` responding
 - Theme system: dark/light/auto with CSS custom properties and matching xterm color schemes
 - Sidebar is resizable via drag handle, width persisted in localStorage
 - `beforeunload` warning prevents accidental page close with active sessions
+- Diagnostics: the client keeps a ring of tab-state events; run `__herd.dumpLog()` in the browser console to dump it. Built for debugging spurious green pulses — reach for it before re-deriving the tab-state logic
 - Active project highlighted in sidebar with accent border
 
 ## Key Design Decisions
 
 - **Real PTY via node-pty**: previously used macOS `script -q /dev/null` to avoid native deps, but macOS 26 (Darwin 25) tightened `script` so it now errors with `tcgetattr/ioctl: Operation not supported on socket` when stdin isn't a TTY. Migrated to `node-pty`, which also gives us real `resize()` support
 - **macOS-focused but portable**: no longer depends on `script`, so node-pty's platform support (macOS/Linux/Windows) applies — still only tested on macOS
-- **No bundler**: vanilla JS served directly, xterm from CDN
+- **No bundler**: vanilla JS served directly, xterm vendored under `public/vendor/`
 - **Localhost only by default**: no auth, so binds to `127.0.0.1`. Override with `HOST` env var
 - **No API key needed**: Haiku summaries use the `claude` CLI (`claude -p --model haiku`), which handles its own auth
-- **Multi-agent**: Claude Code, Codex, and Gemini CLI sessions are unified under the same project view. Sessions are namespaced by agent (`claude`/`codex`/`gemini`) in the summary cache and WebSocket protocol (Claude uses plain IDs for backward compat)
+- **Multi-agent**: Claude Code, Codex, Gemini CLI, and pi sessions are unified under the same project view. Sessions are namespaced by agent (`claude`/`codex`/`gemini`/`pi`) in the summary cache and WebSocket protocol (Claude uses plain IDs for backward compat). Adding an agent means an `AGENTS` registry entry plus a session scanner — nothing outside the registry should name agents individually
 - **Token usage is estimated**: costs are computed from JSONL usage fields using hardcoded model pricing, not from actual billing. Labeled "API equivalent" in the UI
+- **PTY width is capped at 96 columns** (`MAX_COLS`, applied via `stty cols` at launch — narrow terminals keep their real width). This is deliberate, for readability on wide displays. Do not "fix" it
+- **Sessions die with their viewer, and with the server**: `ws.on('close')` SIGHUPs the PTY, and `cleanup()` SIGHUPs every terminal on SIGINT/SIGTERM. The registry is in-memory, so nothing survives a restart. SIGHUP rather than SIGTERM throughout, because interactive zsh ignores SIGTERM but honors terminal-hangup and propagates it to the foreground process group. `docs/proposal-telegram-supervisor.md` is the design for changing this
