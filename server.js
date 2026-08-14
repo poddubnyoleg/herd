@@ -635,10 +635,11 @@ const AGENTS = {
     async launch(resume) {
       if (resume) return `${piBin} --session ${resume}`;
       // New sessions default to local Gemma when the llama.cpp server is up
-      // (localModelUp is hoisted; probe fails fast when the port is closed).
+      // (probe fails fast when the port is closed; LOCAL_SERVICES is
+      // initialized by the time any WS connection can call this).
       // The guard extension makes every bash/edit/write require approval —
       // a small local model can hallucinate destructive commands.
-      if (await localModelUp()) {
+      if (await LOCAL_SERVICES.model.up()) {
         const guard = path.join(os.homedir(), '.pi', 'agent', 'local-guard.ts');
         const guardFlag = fs.existsSync(guard) ? ` -e ${guard}` : '';
         return `${piBin} --provider local --model gemma-4-12b${guardFlag}`;
@@ -1762,70 +1763,125 @@ app.post('/api/open-in-finder', express.json(), (req, res) => {
   });
 });
 
-// C1c: Local model server (llama.cpp serving Gemma for pi's `local` provider).
-// Status is a cheap loopback health probe (llama-server exempts /health from its
-// API key). Start spawns the launcher detached so the model server survives Herd
-// restarts — it is infrastructure, not a session, so cleanup() must not reap it.
-// POST is origin-checked by the generic middleware.
+// C1c: Local resource-heavy services Herd can toggle for memory management —
+// the llama.cpp model server (Gemma for pi's `local` provider) and the STT
+// dictation daemon. Started processes are detached / externally owned so they
+// survive Herd restarts and are not reaped by cleanup(). POSTs are
+// origin-checked by the generic middleware.
 const LOCAL_MODEL_HEALTH = process.env.LOCAL_MODEL_HEALTH || 'http://127.0.0.1:8080/health';
 const LOCAL_MODEL_CMD = process.env.LOCAL_MODEL_CMD || path.join(os.homedir(), '.local', 'bin', 'gemma-server');
 const LOCAL_MODEL_LOG = '/tmp/llama-gemma.log';
+const STT_LAUNCHER = process.env.STT_LAUNCHER
+  || path.join(os.homedir(), 'Documents', 'Personal', 'stt', 'scripts', 'stt-dictate.command');
+const STT_PATTERN = 'python.*dictate\\.py';
 
-async function localModelUp() {
+async function httpUp(url) {
   try {
-    const res = await fetch(LOCAL_MODEL_HEALTH, { signal: AbortSignal.timeout(1500) });
+    const res = await fetch(url, { signal: AbortSignal.timeout(1500) });
     // 401/403 still proves the server is up — covers llama.cpp builds where
     // /health is not exempt from --api-key.
     return res.ok || res.status === 401 || res.status === 403;
   } catch { return false; }
 }
 
-// In-process start lock: model load takes ~10-30s (longer with a cold download)
-// during which /health is down — without this, a reload or second browser tab
-// could spawn a second 7GB model process on a 16GB machine.
-let localModelStartedAt = 0;
-const LOCAL_MODEL_START_GRACE_MS = 3 * 60 * 1000;
-const localModelStarting = () => Date.now() - localModelStartedAt < LOCAL_MODEL_START_GRACE_MS;
-
-app.get('/api/local-model', async (req, res) => {
-  const running = await localModelUp();
-  if (running) localModelStartedAt = 0;
-  res.json({ running, starting: !running && localModelStarting(), available: fs.existsSync(LOCAL_MODEL_CMD) });
+const pgrepUp = pattern => new Promise(resolve => {
+  execFile('pgrep', ['-f', pattern], { timeout: 5000 }, err => resolve(!err));
 });
 
-// Stop = SIGTERM whatever listens on the health URL's port. The server was
-// spawned detached (possibly by a previous Herd process), so there is no child
-// handle to kill — the port is the only reliable identity we have.
-app.post('/api/local-model/stop', async (req, res) => {
-  localModelStartedAt = 0;
-  if (!(await localModelUp())) return res.json({ running: false });
-  const port = new URL(LOCAL_MODEL_HEALTH).port || '80';
-  execFile('lsof', ['-ti', `tcp:${port}`, '-sTCP:LISTEN'], { timeout: 5000 }, (err, stdout) => {
-    const pids = (stdout || '').trim().split('\n').filter(Boolean);
-    if (!pids.length) return res.json({ running: false });
-    for (const pid of pids) {
-      try { process.kill(Number(pid), 'SIGTERM'); } catch {}
-    }
-    res.json({ stopped: true });
-  });
+const LOCAL_SERVICES = {
+  model: {
+    label: 'Local model server',
+    icon: '⌁',
+    confirmStop: 'Stop the local model server? pi sessions using it will lose their model.',
+    // Load takes ~10-30s (longer with a cold download) during which /health is
+    // down — the grace lock stops a reload/second tab spawning a second 7GB
+    // model process on a 16GB machine.
+    graceMs: 3 * 60 * 1000,
+    available: () => fs.existsSync(LOCAL_MODEL_CMD),
+    up: () => httpUp(LOCAL_MODEL_HEALTH),
+    start() {
+      const out = fs.openSync(LOCAL_MODEL_LOG, 'a');
+      const child = spawn(LOCAL_MODEL_CMD, [], { detached: true, stdio: ['ignore', out, out] });
+      // Without this, an async spawn failure (EACCES on a bad chmod, ENOEXEC) is
+      // an unhandled 'error' event that would crash Herd and SIGHUP every session.
+      child.on('error', err => console.error('[local-service model] spawn failed:', err.message));
+      child.unref();
+      fs.closeSync(out);
+    },
+    // SIGTERM whatever listens on the health URL's port — the server may have
+    // been spawned by a previous Herd process, so the port is the only reliable
+    // identity we have.
+    stop() {
+      const port = new URL(LOCAL_MODEL_HEALTH).port || '80';
+      execFile('lsof', ['-ti', `tcp:${port}`, '-sTCP:LISTEN'], { timeout: 5000 }, (err, stdout) => {
+        for (const pid of (stdout || '').trim().split('\n').filter(Boolean)) {
+          try { process.kill(Number(pid), 'SIGTERM'); } catch {}
+        }
+      });
+    },
+  },
+  stt: {
+    label: 'Dictation (STT)',
+    icon: '⊙',
+    confirmStop: 'Stop the dictation daemon?',
+    graceMs: 60 * 1000,
+    available: () => fs.existsSync(STT_LAUNCHER),
+    up: () => pgrepUp(STT_PATTERN),
+    // Must run inside Terminal.app so the daemon inherits its TCC grants (mic,
+    // Input Monitoring, Accessibility) — spawned bare from Herd it records
+    // silent all-zero audio. The launcher script guards double-starts itself.
+    start() {
+      execFile('open', ['-a', 'Terminal', STT_LAUNCHER], { timeout: 5000 },
+        err => { if (err) console.error('[local-service stt] open failed:', err.message); });
+    },
+    // SIGTERM the python daemon; its `uv run` parent exits with it.
+    stop() {
+      execFile('pkill', ['-f', STT_PATTERN], { timeout: 5000 }, () => {});
+    },
+  },
+};
+const serviceStartedAt = { model: 0, stt: 0 };
+
+async function serviceState(id) {
+  const svc = LOCAL_SERVICES[id];
+  const running = await svc.up();
+  if (running) serviceStartedAt[id] = 0;
+  return {
+    id, label: svc.label, icon: svc.icon, confirmStop: svc.confirmStop,
+    running,
+    starting: !running && Date.now() - serviceStartedAt[id] < svc.graceMs,
+    available: svc.available(),
+  };
+}
+
+app.get('/api/local-services', async (req, res) => {
+  res.json(await Promise.all(Object.keys(LOCAL_SERVICES).map(serviceState)));
 });
 
-app.post('/api/local-model/start', async (req, res) => {
-  if (await localModelUp()) return res.json({ running: true });
-  if (localModelStarting()) return res.json({ starting: true });
-  if (!fs.existsSync(LOCAL_MODEL_CMD)) {
-    return res.status(404).json({ error: `launcher not found: ${LOCAL_MODEL_CMD}` });
-  }
+app.post('/api/local-services/:id/start', async (req, res) => {
+  const id = req.params.id;
+  if (!LOCAL_SERVICES[id]) return res.status(404).json({ error: 'unknown service' });
+  const state = await serviceState(id);
+  if (state.running) return res.json({ running: true });
+  if (state.starting) return res.json({ starting: true });
+  if (!state.available) return res.status(404).json({ error: 'launcher not found' });
   try {
-    const out = fs.openSync(LOCAL_MODEL_LOG, 'a');
-    const child = spawn(LOCAL_MODEL_CMD, [], { detached: true, stdio: ['ignore', out, out] });
-    // Without this, an async spawn failure (EACCES on a bad chmod, ENOEXEC) is an
-    // unhandled 'error' event that would crash Herd and SIGHUP every live session.
-    child.on('error', err => console.error('[local-model] spawn failed:', err.message));
-    child.unref();
-    fs.closeSync(out);
-    localModelStartedAt = Date.now();
+    LOCAL_SERVICES[id].start();
+    serviceStartedAt[id] = Date.now();
     res.json({ started: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/local-services/:id/stop', async (req, res) => {
+  const id = req.params.id;
+  if (!LOCAL_SERVICES[id]) return res.status(404).json({ error: 'unknown service' });
+  serviceStartedAt[id] = 0;
+  if (!(await LOCAL_SERVICES[id].up())) return res.json({ running: false });
+  try {
+    LOCAL_SERVICES[id].stop();
+    res.json({ stopped: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

@@ -86,7 +86,7 @@ class Herd {
     this.setupResize();
     this.setupSearch();
     this.setupAddProject();
-    this.setupLocalModel();
+    this.setupLocalServices();
     this.listenForSummaryUpdates();
     document.getElementById('new-tab-btn').addEventListener('click', () => this.newSessionInLastProject());
     // Window resize is handled per-terminal by ResizeObserver in createTab
@@ -393,74 +393,87 @@ class Herd {
     });
   }
 
-  // ── Local model server (llama.cpp for pi's `local` provider) ──
+  // ── Local services (llama.cpp model server, STT dictation daemon) ──
 
-  setupLocalModel() {
-    const btn = document.getElementById('local-model-btn');
-    if (!btn) return;
+  setupLocalServices() {
+    const header = document.getElementById('sidebar-header');
+    if (!header) return;
+    const buttons = new Map();  // id -> button element
 
+    const getState = async (id) => {
+      const list = await (await fetch('/api/local-services')).json();
+      return list.find(s => s.id === id);
+    };
     const render = (state) => {
+      let btn = buttons.get(state.id);
+      if (!btn) {
+        btn = document.createElement('button');
+        btn.className = 'local-svc-btn';
+        btn.textContent = state.icon;
+        btn.addEventListener('click', () => onClick(state.id, btn));
+        header.appendChild(btn);
+        buttons.set(state.id, btn);
+      }
       btn.hidden = !state.available;
       btn.classList.toggle('up', !!state.running);
       btn.classList.toggle('starting', !state.running && !!state.starting);
-      btn.title = state.running ? 'Local model server: running — click to stop'
-        : state.starting ? 'Local model server: starting…'
-        : 'Local model server: stopped — click to start';
+      btn.title = state.running ? `${state.label}: running — click to stop`
+        : state.starting ? `${state.label}: starting…`
+        : `${state.label}: stopped — click to start`;
+      return btn;
     };
-    const refresh = async () => {
-      try { render(await (await fetch('/api/local-model')).json()); } catch {}
-    };
-    // Model load takes ~10-30s (minutes on a cold download); poll until healthy
-    const pollUntilUp = async () => {
+    // Starts can be slow (model load ~10-30s, minutes on a cold download);
+    // poll until up or until the server-side grace expires
+    const pollUntilUp = async (id, btn) => {
       for (let i = 0; i < 90; i++) {
         await new Promise(r => setTimeout(r, 2000));
         try {
-          const s = await (await fetch('/api/local-model')).json();
+          const s = await getState(id);
           if (s.running || !s.starting) { render(s); return; }
         } catch {}
       }
       btn.classList.remove('starting');
-      btn.title = 'Local model server: still not up — check /tmp/llama-gemma.log';
-      refresh();
+      btn.title = 'Still not up — check the service log';
     };
 
-    btn.addEventListener('click', async () => {
+    const onClick = async (id, btn) => {
       if (btn.classList.contains('starting')) return;
       if (btn.classList.contains('up')) {
-        if (!confirm('Stop the local model server? pi sessions using it will lose their model.')) return;
+        const s = await getState(id).catch(() => null);
+        if (!confirm((s && s.confirmStop) || 'Stop this service?')) return;
         try {
-          await fetch('/api/local-model/stop', { method: 'POST' });
-          // llama-server exits fast on SIGTERM; give it a beat, then re-probe
+          await fetch(`/api/local-services/${id}/stop`, { method: 'POST' });
+          // SIGTERM is fast for both services; give it a beat, then re-probe
           await new Promise(r => setTimeout(r, 1000));
         } catch {}
-        refresh();
+        try { render(await getState(id)); } catch {}
         return;
       }
       btn.classList.add('starting');
-      btn.title = 'Local model server: starting…';
       try {
-        const res = await fetch('/api/local-model/start', { method: 'POST' });
+        const res = await fetch(`/api/local-services/${id}/start`, { method: 'POST' });
         const data = await res.json();
         if (!res.ok) {
           btn.classList.remove('starting');
-          btn.title = `Local model server: failed — ${data.error || 'see /tmp/llama-gemma.log'}`;
+          btn.title = `Failed to start — ${data.error || 'see service log'}`;
           return;
         }
-        if (data.running) { render({ available: true, running: true }); return; }
-        await pollUntilUp();
+        if (data.running) { btn.classList.remove('starting'); btn.classList.add('up'); return; }
+        await pollUntilUp(id, btn);
       } catch {
         btn.classList.remove('starting');
-        refresh();
       }
-    });
+    };
 
     // Initial state; if a start is already in flight (another tab, or a reload
     // mid-load), resume polling instead of showing a clickable gray button
     (async () => {
       try {
-        const s = await (await fetch('/api/local-model')).json();
-        render(s);
-        if (!s.running && s.starting) await pollUntilUp();
+        const list = await (await fetch('/api/local-services')).json();
+        for (const state of list) {
+          const btn = render(state);
+          if (!state.running && state.starting) pollUntilUp(state.id, btn);
+        }
       } catch {}
     })();
   }

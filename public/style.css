@@ -125,7 +125,7 @@ body {
   background: var(--bg-hover);
 }
 
-#local-model-btn {
+.local-svc-btn {
   margin-left: 0;
   background: none;
   border: none;
@@ -138,21 +138,21 @@ body {
   transition: color 0.1s, background 0.1s;
 }
 
-#local-model-btn:hover {
+.local-svc-btn:hover {
   color: var(--accent);
   background: var(--bg-hover);
 }
 
-#local-model-btn.up {
+.local-svc-btn.up {
   color: var(--green);
 }
 
-#local-model-btn.starting {
+.local-svc-btn.starting {
   color: var(--accent);
-  animation: local-model-pulse 1.2s ease-in-out infinite;
+  animation: local-svc-pulse 1.2s ease-in-out infinite;
 }
 
-@keyframes local-model-pulse {
+@keyframes local-svc-pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.35; }
 }
