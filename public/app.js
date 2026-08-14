@@ -403,7 +403,7 @@ class Herd {
       btn.hidden = !state.available;
       btn.classList.toggle('up', !!state.running);
       btn.classList.toggle('starting', !state.running && !!state.starting);
-      btn.title = state.running ? 'Local model server: running'
+      btn.title = state.running ? 'Local model server: running — click to stop'
         : state.starting ? 'Local model server: starting…'
         : 'Local model server: stopped — click to start';
     };
@@ -425,7 +425,17 @@ class Herd {
     };
 
     btn.addEventListener('click', async () => {
-      if (btn.classList.contains('up') || btn.classList.contains('starting')) return;
+      if (btn.classList.contains('starting')) return;
+      if (btn.classList.contains('up')) {
+        if (!confirm('Stop the local model server? pi sessions using it will lose their model.')) return;
+        try {
+          await fetch('/api/local-model/stop', { method: 'POST' });
+          // llama-server exits fast on SIGTERM; give it a beat, then re-probe
+          await new Promise(r => setTimeout(r, 1000));
+        } catch {}
+        refresh();
+        return;
+      }
       btn.classList.add('starting');
       btn.title = 'Local model server: starting…';
       try {

@@ -1788,6 +1788,23 @@ app.get('/api/local-model', async (req, res) => {
   res.json({ running, starting: !running && localModelStarting(), available: fs.existsSync(LOCAL_MODEL_CMD) });
 });
 
+// Stop = SIGTERM whatever listens on the health URL's port. The server was
+// spawned detached (possibly by a previous Herd process), so there is no child
+// handle to kill — the port is the only reliable identity we have.
+app.post('/api/local-model/stop', async (req, res) => {
+  localModelStartedAt = 0;
+  if (!(await localModelUp())) return res.json({ running: false });
+  const port = new URL(LOCAL_MODEL_HEALTH).port || '80';
+  execFile('lsof', ['-ti', `tcp:${port}`, '-sTCP:LISTEN'], { timeout: 5000 }, (err, stdout) => {
+    const pids = (stdout || '').trim().split('\n').filter(Boolean);
+    if (!pids.length) return res.json({ running: false });
+    for (const pid of pids) {
+      try { process.kill(Number(pid), 'SIGTERM'); } catch {}
+    }
+    res.json({ stopped: true });
+  });
+});
+
 app.post('/api/local-model/start', async (req, res) => {
   if (await localModelUp()) return res.json({ running: true });
   if (localModelStarting()) return res.json({ starting: true });
