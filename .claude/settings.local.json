@@ -70,7 +70,9 @@
       "Bash(xattr node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper)",
       "Bash(codesign -dv node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper)",
       "WebFetch(domain:openrouter.ai)",
-      "Bash(ps -eo pid,ppid,etime,command)"
+      "Bash(ps -eo pid,ppid,etime,command)",
+      "Read(//Users/pd/.pi/**)",
+      "Bash(/Users/pd/.nvm/versions/node/v22.17.1/bin/pi --help)"
     ]
   },
   "sandbox": {
