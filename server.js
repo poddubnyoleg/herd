@@ -636,9 +636,14 @@ const AGENTS = {
       if (resume) return `${piBin} --session ${resume}`;
       // New sessions default to local Gemma when the llama.cpp server is up
       // (localModelUp is hoisted; probe fails fast when the port is closed).
-      return (await localModelUp())
-        ? `${piBin} --provider local --model gemma-4-12b`
-        : `${piBin}`;
+      // The guard extension makes every bash/edit/write require approval —
+      // a small local model can hallucinate destructive commands.
+      if (await localModelUp()) {
+        const guard = path.join(os.homedir(), '.pi', 'agent', 'local-guard.ts');
+        const guardFlag = fs.existsSync(guard) ? ` -e ${guard}` : '';
+        return `${piBin} --provider local --model gemma-4-12b${guardFlag}`;
+      }
+      return `${piBin}`;
     },
     snapshotKeys({ project }) {
       const dir = piProjectDir(project);
