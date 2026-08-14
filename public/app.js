@@ -432,8 +432,14 @@ class Herd {
           if (s.running || !s.starting) { render(s); return; }
         } catch {}
       }
+      // Deadline: render the actual state once more (it may have come up at
+      // the last moment) and only then show the failure hint
       btn.classList.remove('starting');
-      btn.title = 'Still not up — check the service log';
+      try {
+        const s = await getState(id);
+        render(s);
+        if (!s.running) btn.title = `${s.label}: still not up — check the service log`;
+      } catch {}
     };
 
     const onClick = async (id, btn) => {
@@ -462,6 +468,7 @@ class Herd {
         await pollUntilUp(id, btn);
       } catch {
         btn.classList.remove('starting');
+        try { render(await getState(id)); } catch {}
       }
     };
 

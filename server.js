@@ -444,6 +444,33 @@ scanGeminiSessions();
 // --- Pi session index ---
 const piIndex = new Map(); // filePath -> { id, cwd, mtime, date, preview, jsonlPath }
 
+// True when the pi session's most recent recorded provider is `local` — pi
+// stamps provider/model on each message, so the last occurrence in the file
+// tail is the model the session will resume with. Used to re-attach the
+// local-guard extension on resume.
+async function piSessionIsLocal(id) {
+  try {
+    scanPiSessions();
+    const entry = [...piIndex.values()].find(e => e.id === id || (e.id && e.id.startsWith(id)));
+    if (!entry || !entry.jsonlPath) return false;
+    const fd = fs.openSync(entry.jsonlPath, 'r');
+    let text;
+    try {
+      const size = fs.fstatSync(fd).size;
+      const len = Math.min(size, 64 * 1024);
+      const buf = Buffer.alloc(len);
+      fs.readSync(fd, buf, 0, len, size - len);
+      text = buf.toString('utf8');
+    } finally {
+      fs.closeSync(fd);
+    }
+    const providers = [...text.matchAll(/"provider"\s*:\s*"([^"]+)"/g)];
+    return providers.length > 0 && providers[providers.length - 1][1] === 'local';
+  } catch {
+    return false;
+  }
+}
+
 function scanPiSessions() {
   if (!piBin) return;
   try { fs.statSync(PI_SESSIONS_DIR); } catch { return; }
@@ -633,15 +660,22 @@ const AGENTS = {
     sessions: () => piIndex.values(),
     summaryKey: id => `pi:${id}`,
     async launch(resume) {
-      if (resume) return `${piBin} --session ${resume}`;
+      const guard = path.join(os.homedir(), '.pi', 'agent', 'local-guard.ts');
+      const guardFlag = fs.existsSync(guard) ? ` -e ${guard}` : '';
+      if (resume) {
+        // pi restores the session's own provider/model from its JSONL, so a
+        // resumed local-Gemma session needs the guard re-attached explicitly —
+        // without this it reopens fully ungated.
+        const local = guardFlag && await piSessionIsLocal(resume);
+        return `${piBin} --session ${resume}${local ? guardFlag : ''}`;
+      }
       // New sessions default to local Gemma when the llama.cpp server is up
       // (probe fails fast when the port is closed; LOCAL_SERVICES is
       // initialized by the time any WS connection can call this).
-      // The guard extension makes every bash/edit/write require approval —
-      // a small local model can hallucinate destructive commands.
-      if (await LOCAL_SERVICES.model.up()) {
-        const guard = path.join(os.homedir(), '.pi', 'agent', 'local-guard.ts');
-        const guardFlag = fs.existsSync(guard) ? ` -e ${guard}` : '';
+      // The guard extension makes every bash/edit/write require approval — a
+      // small local model can hallucinate destructive commands. Fail closed:
+      // if the guard file is missing, don't auto-select the untrusted model.
+      if (guardFlag && await LOCAL_SERVICES.model.up()) {
         return `${piBin} --provider local --model gemma-4-12b${guardFlag}`;
       }
       return `${piBin}`;
@@ -1775,15 +1809,6 @@ const STT_LAUNCHER = process.env.STT_LAUNCHER
   || path.join(os.homedir(), 'Documents', 'Personal', 'stt', 'scripts', 'stt-dictate.command');
 const STT_PATTERN = 'python.*dictate\\.py';
 
-async function httpUp(url) {
-  try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(1500) });
-    // 401/403 still proves the server is up — covers llama.cpp builds where
-    // /health is not exempt from --api-key.
-    return res.ok || res.status === 401 || res.status === 403;
-  } catch { return false; }
-}
-
 const pgrepUp = pattern => new Promise(resolve => {
   execFile('pgrep', ['-f', pattern], { timeout: 5000 }, err => resolve(!err));
 });
@@ -1798,7 +1823,20 @@ const LOCAL_SERVICES = {
     // model process on a 16GB machine.
     graceMs: 3 * 60 * 1000,
     available: () => fs.existsSync(LOCAL_MODEL_CMD),
-    up: () => httpUp(LOCAL_MODEL_HEALTH),
+    // Identity probe, not just liveness: :8080 is a heavily-collided dev port,
+    // and a bare /health 200 from some unrelated server would turn the badge
+    // green, route new pi sessions at it, AND make stop SIGTERM it. /v1/models
+    // is public in llama.cpp even with --api-key; 401/403 (non-exempt builds)
+    // still counts as up since the body can't be read.
+    async up() {
+      try {
+        const res = await fetch(new URL('/v1/models', LOCAL_MODEL_HEALTH).href,
+          { signal: AbortSignal.timeout(1500) });
+        if (res.status === 401 || res.status === 403) return true;
+        if (!res.ok) return false;
+        return (await res.text()).includes('gemma');
+      } catch { return false; }
+    },
     start() {
       const out = fs.openSync(LOCAL_MODEL_LOG, 'a');
       const child = spawn(LOCAL_MODEL_CMD, [], { detached: true, stdio: ['ignore', out, out] });
@@ -1812,8 +1850,15 @@ const LOCAL_SERVICES = {
     // been spawned by a previous Herd process, so the port is the only reliable
     // identity we have.
     stop() {
-      const port = new URL(LOCAL_MODEL_HEALTH).port || '80';
-      execFile('lsof', ['-ti', `tcp:${port}`, '-sTCP:LISTEN'], { timeout: 5000 }, (err, stdout) => {
+      const u = new URL(LOCAL_MODEL_HEALTH);
+      const loopback = ['127.0.0.1', 'localhost', '::1'].includes(u.hostname);
+      if (!loopback || !u.port) {
+        // A portless URL would default to killing port 80, and a remote URL
+        // would kill whatever LOCAL process shares that port — refuse both.
+        console.error('[local-service model] refusing to stop: health URL is not loopback-with-port');
+        return;
+      }
+      execFile('lsof', ['-ti', `tcp:${u.port}`, '-sTCP:LISTEN'], { timeout: 5000 }, (err, stdout) => {
         for (const pid of (stdout || '').trim().split('\n').filter(Boolean)) {
           try { process.kill(Number(pid), 'SIGTERM'); } catch {}
         }
@@ -1858,14 +1903,18 @@ app.get('/api/local-services', async (req, res) => {
   res.json(await Promise.all(Object.keys(LOCAL_SERVICES).map(serviceState)));
 });
 
+// Object.hasOwn, not truthiness: `__proto__`/`constructor` as :id would pass a
+// plain lookup, then throw in the async handler — an unhandled rejection that
+// kills the whole server (Express 4 doesn't catch async errors). The try/catch
+// wraps everything for the same reason.
 app.post('/api/local-services/:id/start', async (req, res) => {
   const id = req.params.id;
-  if (!LOCAL_SERVICES[id]) return res.status(404).json({ error: 'unknown service' });
-  const state = await serviceState(id);
-  if (state.running) return res.json({ running: true });
-  if (state.starting) return res.json({ starting: true });
-  if (!state.available) return res.status(404).json({ error: 'launcher not found' });
+  if (!Object.hasOwn(LOCAL_SERVICES, id)) return res.status(404).json({ error: 'unknown service' });
   try {
+    const state = await serviceState(id);
+    if (state.running) return res.json({ running: true });
+    if (state.starting) return res.json({ starting: true });
+    if (!state.available) return res.status(404).json({ error: 'launcher not found' });
     LOCAL_SERVICES[id].start();
     serviceStartedAt[id] = Date.now();
     res.json({ started: true });
@@ -1876,10 +1925,10 @@ app.post('/api/local-services/:id/start', async (req, res) => {
 
 app.post('/api/local-services/:id/stop', async (req, res) => {
   const id = req.params.id;
-  if (!LOCAL_SERVICES[id]) return res.status(404).json({ error: 'unknown service' });
-  serviceStartedAt[id] = 0;
-  if (!(await LOCAL_SERVICES[id].up())) return res.json({ running: false });
+  if (!Object.hasOwn(LOCAL_SERVICES, id)) return res.status(404).json({ error: 'unknown service' });
   try {
+    serviceStartedAt[id] = 0;
+    if (!(await LOCAL_SERVICES[id].up())) return res.json({ running: false });
     LOCAL_SERVICES[id].stop();
     res.json({ stopped: true });
   } catch (e) {
