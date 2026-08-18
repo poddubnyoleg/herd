@@ -866,6 +866,12 @@ class Herd {
     const fitAddon = new FitAddon.FitAddon();
     terminal.loadAddon(fitAddon);
     try { terminal.loadAddon(new WebLinksAddon.WebLinksAddon()); } catch {}
+    // Inline images (sixel + iTerm2 IIP). The vendored addon is a locally
+    // patched build ("HERD PATCH (DPR)" in the source): bitmaps are decoded
+    // and drawn at device resolution so images stay crisp on retina.
+    // storageLimit is per-terminal MB of decoded pixels — device-res costs
+    // 4x on 2x displays, so keep the addon default rather than trimming it.
+    try { terminal.loadAddon(new ImageAddon.ImageAddon({ storageLimit: 128 })); } catch {}
     // IMPORTANT: terminal.open() is deferred until AFTER switchTab makes the
     // wrapper visible. xterm's CharSizeService measures the font against a
     // DOM element at open time — if the wrapper is display:none then, it

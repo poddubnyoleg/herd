@@ -1,0 +1,223 @@
+--- pristine/package/out/ImageRenderer.js	1985-10-26 12:15:00
++++ package/out/ImageRenderer.js	2026-08-18 11:59:24
+@@ -130,7 +130,8 @@
+      */
+     clearLines(start, end) {
+         var _a, _b, _c, _d;
+-        (_a = this._ctx) === null || _a === void 0 ? void 0 : _a.clearRect(0, start * (((_b = this.dimensions) === null || _b === void 0 ? void 0 : _b.css.cell.height) || 0), ((_c = this.dimensions) === null || _c === void 0 ? void 0 : _c.css.canvas.width) || 0, (++end - start) * (((_d = this.dimensions) === null || _d === void 0 ? void 0 : _d.css.cell.height) || 0));
++        // HERD PATCH (DPR): clear in device pixels
++        (_a = this._ctx) === null || _a === void 0 ? void 0 : _a.clearRect(0, start * (((_b = this.dimensions) === null || _b === void 0 ? void 0 : _b.css.cell.height) || 0) * this.dpr, (((_c = this.dimensions) === null || _c === void 0 ? void 0 : _c.css.canvas.width) || 0) * this.dpr, (++end - start) * (((_d = this.dimensions) === null || _d === void 0 ? void 0 : _d.css.cell.height) || 0) * this.dpr);
+     }
+     /**
+      * Clear whole image canvas.
+@@ -146,11 +147,17 @@
+         if (!this._ctx) {
+             return;
+         }
+-        const { width, height } = this.cellSize;
++        const { width: cssWidth, height: cssHeight } = this.cellSize;
+         // Don't try to draw anything, if we cannot get valid renderer metrics.
+-        if (width === -1 || height === -1) {
++        if (cssWidth === -1 || cssHeight === -1) {
+             return;
+         }
++        // HERD PATCH (DPR): all pixel math below runs in device pixels — the
++        // canvas backing is device-sized and stored bitmaps carry device
++        // resolution (their origCellSize is scaled accordingly at insert).
++        const width = cssWidth * this.dpr;
++        const height = cssHeight * this.dpr;
++        this._ctx.imageSmoothingQuality = 'high';
+         this._rescaleImage(imgSpec, width, height);
+         const img = imgSpec.actual;
+         const cols = Math.ceil(img.width / width);
+@@ -171,11 +178,15 @@
+      * Extract a single tile from an image.
+      */
+     extractTile(imgSpec, tileId) {
+-        const { width, height } = this.cellSize;
++        const { width: cssWidth, height: cssHeight } = this.cellSize;
+         // Don't try to draw anything, if we cannot get valid renderer metrics.
+-        if (width === -1 || height === -1) {
++        if (cssWidth === -1 || cssHeight === -1) {
+             return;
+         }
++        // HERD PATCH (DPR): extract at device resolution — keeps spec.actual
++        // device-sized so draw() doesn't thrash between two rescale targets.
++        const width = cssWidth * this.dpr;
++        const height = cssHeight * this.dpr;
+         this._rescaleImage(imgSpec, width, height);
+         const img = imgSpec.actual;
+         const cols = Math.ceil(img.width / width);
+@@ -195,11 +206,14 @@
+      */
+     drawPlaceholder(col, row, count = 1) {
+         if (this._ctx) {
+-            const { width, height } = this.cellSize;
++            // HERD PATCH (DPR): placeholder cells in device pixels
++            const { width: cssWidth, height: cssHeight } = this.cellSize;
+             // Don't try to draw anything, if we cannot get valid renderer metrics.
+-            if (width === -1 || height === -1) {
++            if (cssWidth === -1 || cssHeight === -1) {
+                 return;
+             }
++            const width = cssWidth * this.dpr;
++            const height = cssHeight * this.dpr;
+             if (!this._placeholder) {
+                 this._createPlaceHolder(Math.max(height + 1, PLACEHOLDER_HEIGHT));
+             }
+@@ -220,20 +234,32 @@
+         if (!this.canvas) {
+             return;
+         }
+-        if (this.canvas.width !== this.dimensions.css.canvas.width || this.canvas.height !== this.dimensions.css.canvas.height) {
+-            this.canvas.width = this.dimensions.css.canvas.width || 0;
+-            this.canvas.height = this.dimensions.css.canvas.height || 0;
++        // HERD PATCH (DPR): compare/set device-pixel backing, keep CSS box in sync
++        const cssW = this.dimensions.css.canvas.width || 0;
++        const cssH = this.dimensions.css.canvas.height || 0;
++        const devW = Math.round(cssW * this.dpr);
++        const devH = Math.round(cssH * this.dpr);
++        if (this.canvas.width !== devW || this.canvas.height !== devH) {
++            this.canvas.width = devW;
++            this.canvas.height = devH;
++            this.canvas.style.width = cssW + 'px';
++            this.canvas.style.height = cssH + 'px';
+         }
+     }
+     /**
+      * Rescale image in storage if needed.
+      */
+     _rescaleImage(spec, currentWidth, currentHeight) {
+-        if (currentWidth === spec.actualCellSize.width && currentHeight === spec.actualCellSize.height) {
++        // HERD PATCH (DPR): tolerance compare — decode-time rounding
++        // (round(css*dpr)/css vs dpr) and fractional dpr (browser zoom)
++        // leave sub-0.1% float noise that must not trigger a full-image
++        // rescale to virtually identical dimensions.
++        const close = (a, b) => Math.abs(a - b) < 0.05;
++        if (close(currentWidth, spec.actualCellSize.width) && close(currentHeight, spec.actualCellSize.height)) {
+             return;
+         }
+         const { width: originalWidth, height: originalHeight } = spec.origCellSize;
+-        if (currentWidth === originalWidth && currentHeight === originalHeight) {
++        if (close(currentWidth, originalWidth) && close(currentHeight, originalHeight)) {
+             spec.actual = spec.orig;
+             spec.actualCellSize.width = originalWidth;
+             spec.actualCellSize.height = originalHeight;
+@@ -242,6 +268,7 @@
+         const canvas = ImageRenderer.createCanvas(this.document, Math.ceil(spec.orig.width * currentWidth / originalWidth), Math.ceil(spec.orig.height * currentHeight / originalHeight));
+         const ctx = canvas.getContext('2d');
+         if (ctx) {
++            ctx.imageSmoothingQuality = 'high'; // HERD PATCH: default is 'low'
+             ctx.drawImage(spec.orig, 0, 0, canvas.width, canvas.height);
+             spec.actual = canvas;
+             spec.actualCellSize.width = currentWidth;
+@@ -265,7 +292,12 @@
+         // make sure that the terminal is attached to a document and to DOM
+         if (this.document && this._terminal._core.screenElement) {
+             if (!this.canvas) {
+-                this.canvas = ImageRenderer.createCanvas(this.document, ((_a = this.dimensions) === null || _a === void 0 ? void 0 : _a.css.canvas.width) || 0, ((_b = this.dimensions) === null || _b === void 0 ? void 0 : _b.css.canvas.height) || 0);
++                // HERD PATCH (DPR): device-pixel backing store, CSS-sized layout box
++                const cssW = ((_a = this.dimensions) === null || _a === void 0 ? void 0 : _a.css.canvas.width) || 0;
++                const cssH = ((_b = this.dimensions) === null || _b === void 0 ? void 0 : _b.css.canvas.height) || 0;
++                this.canvas = ImageRenderer.createCanvas(this.document, Math.round(cssW * this.dpr), Math.round(cssH * this.dpr));
++                this.canvas.style.width = cssW + 'px';
++                this.canvas.style.height = cssH + 'px';
+                 this.canvas.classList.add('xterm-image-layer');
+                 this._terminal._core.screenElement.appendChild(this.canvas);
+                 this._ctx = this.canvas.getContext('2d', { alpha: true, desynchronized: true });
+@@ -307,7 +339,8 @@
+         }
+         ctx.putImageData(imgData, 0, 0);
+         // create placeholder line, width aligned to blueprint width
+-        const width = (screen.width + bWidth - 1) & ~(bWidth - 1) || PLACEHOLDER_LENGTH;
++        // HERD PATCH (DPR): cover device-pixel widths on hidpi screens
++        const width = ((screen.width * Math.ceil(this.dpr)) + bWidth - 1) & ~(bWidth - 1) || PLACEHOLDER_LENGTH;
+         this._placeholder = ImageRenderer.createCanvas(this.document, width, height);
+         const ctx2 = this._placeholder.getContext('2d', { alpha: false });
+         if (!ctx2) {
+@@ -323,6 +356,17 @@
+         var _a;
+         return (_a = this._terminal._core._coreBrowserService) === null || _a === void 0 ? void 0 : _a.window.document;
+     }
++    /**
++     * HERD PATCH (DPR): device pixel ratio of the hosting window. The stock
++     * addon renders its layer at CSS resolution, which retina displays then
++     * upscale — blurry images. All backing-store sizes and draw coordinates
++     * are multiplied by this factor; layout/cell math elsewhere stays CSS.
++     */
++    get dpr() {
++        var _a;
++        return ((_a = this._terminal._core._coreBrowserService) === null || _a === void 0 ? void 0 : _a.dpr)
++            || (typeof window !== 'undefined' && window.devicePixelRatio) || 1;
++    }
+ }
+ exports.ImageRenderer = ImageRenderer;
+ //# sourceMappingURL=ImageRenderer.js.map
+\ No newline at end of file
+--- pristine/package/out/ImageStorage.js	1985-10-26 12:15:00
++++ package/out/ImageStorage.js	2026-08-18 11:35:43
+@@ -196,7 +196,7 @@
+     /**
+      * Method to add an image to the storage.
+      */
+-    addImage(img) {
++    addImage(img, cssWidth, cssHeight) {
+         var _a;
+         // never allow storage to exceed memory limit
+         this._evictOldest(img.width * img.height);
+@@ -205,8 +205,17 @@
+         if (cellSize.width === -1 || cellSize.height === -1) {
+             cellSize = exports.CELL_SIZE_DEFAULT;
+         }
+-        const cols = Math.ceil(img.width / cellSize.width);
+-        const rows = Math.ceil(img.height / cellSize.height);
++        // HERD PATCH (DPR): when the caller passes CSS display dimensions the
++        // bitmap may carry higher (device) resolution — cell layout uses the
++        // CSS dims, and origCellSize is scaled by the bitmap/CSS ratio so the
++        // renderer's "bitmap pixels per cell" invariant stays exact.
++        const layoutWidth = cssWidth || img.width;
++        const layoutHeight = cssHeight || img.height;
++        const cols = Math.ceil(layoutWidth / cellSize.width);
++        const rows = Math.ceil(layoutHeight / cellSize.height);
++        const origCellSize = cssWidth
++            ? { width: cellSize.width * img.width / layoutWidth, height: cellSize.height * img.height / layoutHeight }
++            : cellSize;
+         const imageId = ++this._lastId;
+         const buffer = this._terminal._core.buffer;
+         const termCols = this._terminal.cols;
+@@ -276,9 +285,9 @@
+         // create storage entry
+         const imgSpec = {
+             orig: img,
+-            origCellSize: cellSize,
++            origCellSize: origCellSize,
+             actual: img,
+-            actualCellSize: Object.assign({}, cellSize),
++            actualCellSize: Object.assign({}, origCellSize),
+             marker: endMarker || undefined,
+             tileCount,
+             bufferType: this._terminal.buffer.active.type
+--- pristine/package/out/IIPHandler.js	1985-10-26 12:15:00
++++ package/out/IIPHandler.js	2026-08-18 11:59:18
+@@ -109,9 +109,19 @@
+                 setTimeout(() => r(true), 1000);
+             });
+         }
+-        return createImageBitmap(blob, { resizeWidth: w, resizeHeight: h })
++        // HERD PATCH (DPR): decode at device resolution with high-quality
++        // resampling, and tell the storage the CSS display size separately.
++        // Always decode at exactly cssSize*dpr, even when that upscales the
++        // source: it keeps origCellSize an exact dpr multiple of the cell
++        // size, so draw()'s rescale early-exit hits and spec.actual stays
++        // === spec.orig (a natural-size cap here would force a runtime
++        // rescale to the very same dimensions AND retain both buffers).
++        const dpr = this._renderer.dpr || 1;
++        const tw = Math.round(w * dpr);
++        const th = Math.round(h * dpr);
++        return createImageBitmap(blob, { resizeWidth: tw, resizeHeight: th, resizeQuality: 'high' })
+             .then(bm => {
+-            this._storage.addImage(bm);
++            this._storage.addImage(bm, w, h);
+             return true;
+         });
+     }

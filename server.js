@@ -2048,6 +2048,16 @@ wss.on('connection', (ws, req) => {
       env: {
         ...agentEnv(agent),
         TERM: 'xterm-256color',
+        // Present as iTerm2 so agent CLIs emit inline images (OSC 1337 IIP),
+        // which the xterm.js image addon renders. Claude Code additionally
+        // gates iTerm features on TERM_PROGRAM_VERSION >= 3.6.6. This also
+        // overrides whatever TERM_PROGRAM leaked from the terminal that
+        // launched the server. Note: LC_TERMINAL rides ssh's default
+        // `SendEnv LANG LC_*`, so remote hosts see it too — accepted, since
+        // remote IIP output renders fine in these tabs.
+        TERM_PROGRAM: 'iTerm.app',
+        TERM_PROGRAM_VERSION: '3.7.0',
+        LC_TERMINAL: 'iTerm2',
       },
     });
   } catch (err) {
@@ -2091,6 +2101,35 @@ wss.on('connection', (ws, req) => {
   // R2: Consistent ANSI stripping (matches client)
   function stripAnsi(s) {
     return s.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '').replace(/\x1b\][^\x07]*\x07/g, '').replace(/[\x00-\x1f]/g, '');
+  }
+
+  // Inline-image payloads (OSC 1337 File=...) are hundreds of KB — far larger
+  // than the 2KB rolling naming buffer. Once the ESC]1337 prefix scrolls out
+  // of the buffer, stripAnsi above can no longer match the sequence and the
+  // buffer becomes raw base64, which would be sent to Haiku as session
+  // "content" and persisted as a garbage title. Payloads span many onData
+  // chunks, so filter them out statefully before they reach the buffer.
+  let inImagePayload = false;
+  function stripImagePayloads(str) {
+    let out = '';
+    let i = 0;
+    while (i < str.length) {
+      if (inImagePayload) {
+        const bel = str.indexOf('\x07', i);
+        const st = str.indexOf('\x1b\\', i);
+        const end = bel === -1 ? st : (st === -1 ? bel : Math.min(bel, st));
+        if (end === -1) return out; // payload continues into the next chunk
+        inImagePayload = false;
+        i = end + (end === bel ? 1 : 2);
+        continue;
+      }
+      const start = str.indexOf('\x1b]1337;', i);
+      if (start === -1) { out += str.slice(i); break; }
+      out += str.slice(i, start);
+      inImagePayload = true;
+      i = start + 7;
+    }
+    return out;
   }
 
   // Clean terminal output for naming: strip TUI chrome, banners, prompts
@@ -2279,9 +2318,12 @@ wss.on('connection', (ws, req) => {
   };
 
   proc.onData(str => {
-    outputBuffer += str;
+    // Image payloads are excluded from naming input AND from the rename
+    // gate — a 500KB base64 blob must not count as "new content".
+    const nameStr = stripImagePayloads(str);
+    outputBuffer += nameStr;
     if (outputBuffer.length > 2048) outputBuffer = outputBuffer.slice(-2048);
-    charsSinceLastRename += str.length;
+    charsSinceLastRename += nameStr.length;
     wsSendBuf += str;
     if (!ptyPaused && ws.bufferedAmount > HIGH_WATER) {
       try { proc.pause(); } catch {}
