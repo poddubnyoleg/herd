@@ -10,6 +10,13 @@ if [ -f "$HOME/.gemini/.env" ]; then
   export $(grep -v '^#' "$HOME/.gemini/.env" | xargs)
 fi
 
+# Parent agent TUIs (Grok, Claude) export these so *their* children stay
+# monochrome. A Herd started from inside one would otherwise spawn every
+# PTY with NO_COLOR and Claude's splash renders as a black silhouette.
+unset NO_COLOR FORCE_COLOR CLICOLOR CLICOLOR_FORCE
+export CLICOLOR=1
+export COLORTERM="${COLORTERM:-truecolor}"
+
 existing_pids="$(lsof -tiTCP:${PORT} 2>/dev/null || true)"
 if [ -n "${existing_pids}" ]; then
   kill -9 ${existing_pids} 2>/dev/null || true

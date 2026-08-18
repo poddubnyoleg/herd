@@ -281,6 +281,17 @@ async function runTests() {
     assert(typeof p.exists === 'boolean', 'exists should be boolean');
     assert(typeof p.sessionCount === 'number', 'sessionCount should be number');
     assert(typeof p.latestMtime === 'number', 'latestMtime should be number');
+    assert(typeof p.grokAvailable === 'boolean', 'grokAvailable should be boolean');
+  });
+
+  await test('recent sessions accept grok entries', async () => {
+    const sessions = await page.evaluate(() => fetch('/api/recent-sessions?limit=50').then(r => r.json()));
+    assert(Array.isArray(sessions), 'recent-sessions should be an array');
+    for (const s of sessions.filter(s => s.agent === 'grok')) {
+      assert(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s.id), 'grok id should be uuid');
+      assert(s.preview, 'grok session should have preview');
+      assert(s.projectPath, 'grok session should have projectPath');
+    }
   });
 
   await test('GET /api/projects/:id/sessions returns sessions', async () => {

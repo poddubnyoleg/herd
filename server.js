@@ -45,7 +45,10 @@ const DANGEROUS_ENV_PATTERNS = [
   'AZURE_CLIENT_SECRET',
   'TF_VAR_', 'VAULT_TOKEN',
 ];
-const AGENT_API_KEYS = ['OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'OPENROUTER_API_KEY'];
+const AGENT_API_KEYS = [
+  'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'OPENROUTER_API_KEY',
+  'XAI_API_KEY', 'GROK_CODE_XAI_API_KEY',
+];
 function stripDangerousEnv(env) {
   const safe = { ...env };
   for (const key of Object.keys(safe)) {
@@ -67,14 +70,28 @@ function stripDangerousEnv(env) {
 // CLAUDE_CONFIG_DIR is kept — it points at the user's config, not a session.
 function stripAgentSessionEnv(env) {
   for (const key of Object.keys(env)) {
-    if (key === 'CLAUDE_CONFIG_DIR') continue;
+    // Config-dir pointers stay; session-identity markers do not. If Herd is
+    // itself started from inside an agent, those markers would make the child
+    // treat itself as nested and skip writing its own transcript.
+    if (key === 'CLAUDE_CONFIG_DIR' || key === 'GROK_HOME') continue;
     if (/^CLAUDE/.test(key) || key === 'AI_AGENT') delete env[key];
+    if (key === 'GROK_AGENT' || key === 'GROK_SESSION_ID') delete env[key];
   }
   return env;
 }
 
 function agentEnv(agent) {
   const base = stripAgentSessionEnv(stripDangerousEnv(process.env));
+  // Agent TUIs (Grok in particular) export NO_COLOR / FORCE_COLOR=0 so their
+  // own tool children don't emit ANSI. Herd is a real color PTY — if those
+  // leak, Claude/Codex/Gemini/pi/grok all render monochrome (black mascot,
+  // no syntax colors). Drop the suppressors; COLORTERM is set at spawn.
+  delete base.NO_COLOR;
+  delete base.FORCE_COLOR;
+  delete base.CLICOLOR;
+  delete base.CLICOLOR_FORCE;
+  base.CLICOLOR = '1';
+  base.COLORTERM = 'truecolor';
   for (const k of AGENT_API_KEYS) delete base[k];
   if (agent === 'codex'  && process.env.OPENAI_API_KEY)    base.OPENAI_API_KEY    = process.env.OPENAI_API_KEY;
   if (agent === 'claude' && process.env.ANTHROPIC_API_KEY) base.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
@@ -82,6 +99,12 @@ function agentEnv(agent) {
   if (agent === 'pi') { // pi's openrouter provider reads OPENROUTER_API_KEY from env
     const orKey = localEnv.OPENROUTER_API_KEY || process.env.OPENROUTER_API_KEY;
     if (orKey) base.OPENROUTER_API_KEY = orKey;
+  }
+  if (agent === 'grok') {
+    // OAuth tokens live in ~/.grok/auth.json (file-based, no env needed).
+    // API-key fallback is only re-injected for grok, never leaked to others.
+    if (process.env.XAI_API_KEY) base.XAI_API_KEY = process.env.XAI_API_KEY;
+    if (process.env.GROK_CODE_XAI_API_KEY) base.GROK_CODE_XAI_API_KEY = process.env.GROK_CODE_XAI_API_KEY;
   }
   return base;
 }
@@ -93,6 +116,9 @@ const CODEX_SESSIONS_DIR = path.join(os.homedir(), '.codex', 'sessions');
 const GEMINI_TMP_DIR = path.join(os.homedir(), '.gemini', 'tmp');
 const PI_DIR = path.join(os.homedir(), '.pi', 'agent');
 const PI_SESSIONS_DIR = path.join(PI_DIR, 'sessions');
+const GROK_HOME = process.env.GROK_HOME || path.join(os.homedir(), '.grok');
+const GROK_SESSIONS_DIR = path.join(GROK_HOME, 'sessions');
+const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const app = express();
 const server = http.createServer(app);
@@ -194,10 +220,17 @@ const claudeBin = resolveBin('claude', [
 const codexBin = resolveBin('codex');
 const geminiBin = resolveBin('gemini');
 const piBin = resolveBin('pi');
+const grokBin = resolveBin('grok', [
+  path.join(os.homedir(), '.local', 'bin', 'grok'),
+  path.join(GROK_HOME, 'bin', 'grok'),
+  '/usr/local/bin/grok',
+  '/opt/homebrew/bin/grok',
+]);
 console.log(`  Claude binary: ${claudeBin}`);
 console.log(`  Codex binary: ${codexBin || '(not installed)'}`);
 console.log(`  Gemini binary: ${geminiBin || '(not installed)'}`);
 console.log(`  Pi binary: ${piBin || '(not installed)'}`);
+console.log(`  Grok binary: ${grokBin || '(not installed)'}`);
 
 // --- Codex rollout index ---
 // Scans ~/.codex/sessions/**/*.jsonl, reads line 1 (session_meta) to extract cwd/id.
@@ -551,6 +584,143 @@ function decodePiProjectPath(encoded) {
 // Initial scan
 scanPiSessions();
 
+// --- Grok Build session index ---
+// ~/.grok/sessions/<url-encoded-cwd>/<session-uuid>/summary.json
+// Long encoded names use a slug+hash dir with a `.cwd` file instead.
+const grokIndex = new Map(); // sessionDir -> { id, cwd, mtime, date, preview, nativeTitle, jsonlPath }
+
+function decodeGrokGroupDir(dirName) {
+  const cwdFile = path.join(GROK_SESSIONS_DIR, dirName, '.cwd');
+  try {
+    const cwd = fs.readFileSync(cwdFile, 'utf8').trim();
+    if (cwd) return cwd;
+  } catch {}
+  try { return decodeURIComponent(dirName); } catch { return null; }
+}
+
+function grokUserText(entry) {
+  const update = entry && entry.params && entry.params.update;
+  if (!update || update.sessionUpdate !== 'user_message_chunk') return '';
+  const c = update.content;
+  if (typeof c === 'string') return c;
+  if (c && typeof c.text === 'string') return c.text;
+  return '';
+}
+
+function grokNativeTitle(summary) {
+  if (!summary || typeof summary !== 'object') return null;
+  const candidates = summary.title_is_manual
+    ? [summary.session_summary, summary.generated_title]
+    : [summary.generated_title, summary.session_summary, summary.last_turn_summary];
+  for (const t of candidates) {
+    if (typeof t === 'string' && t.trim()) return t.trim();
+  }
+  return null;
+}
+
+function parseGrokSession(sessionDir, stat) {
+  const summaryPath = path.join(sessionDir, 'summary.json');
+  let summary;
+  try { summary = JSON.parse(fs.readFileSync(summaryPath, 'utf8')); } catch { return null; }
+  const id = (summary.info && summary.info.id) || path.basename(sessionDir);
+  const cwd = summary.info && summary.info.cwd;
+  if (!id || !cwd) return null;
+
+  const nativeTitle = grokNativeTitle(summary);
+  let preview = nativeTitle ? nativeTitle.slice(0, 150).replace(/\n/g, ' ').trim() : null;
+  if (!preview) {
+    try {
+      forEachJsonlEntry(path.join(sessionDir, 'updates.jsonl'), { maxLines: 40 }, entry => {
+        const text = grokUserText(entry);
+        if (text && text.length > 3) {
+          preview = text.slice(0, 150).replace(/\n/g, ' ').trim();
+          return false;
+        }
+      });
+    } catch {}
+  }
+  if (!preview) return null;
+
+  let realCwd = cwd;
+  try { realCwd = fs.realpathSync(cwd); } catch {}
+
+  let mtime = stat.mtimeMs;
+  let date = stat.mtime.toISOString();
+  const updated = summary.last_active_at || summary.updated_at;
+  if (updated) {
+    const t = Date.parse(updated);
+    if (!Number.isNaN(t)) { mtime = t; date = new Date(t).toISOString(); }
+  }
+
+  return {
+    id,
+    cwd: realCwd,
+    mtime,
+    date,
+    preview,
+    nativeTitle,
+    jsonlPath: path.join(sessionDir, 'updates.jsonl'),
+    sessionDir,
+  };
+}
+
+function scanGrokSessions() {
+  if (!grokBin) return;
+  try { fs.statSync(GROK_SESSIONS_DIR); } catch { return; }
+
+  const seen = new Set();
+  for (const dirName of readdirSafe(GROK_SESSIONS_DIR)) {
+    const groupDir = path.join(GROK_SESSIONS_DIR, dirName);
+    if (!isDir(groupDir)) continue;
+    for (const name of readdirSafe(groupDir)) {
+      if (!SESSION_ID_RE.test(name)) continue;
+      const sessionDir = path.join(groupDir, name);
+      if (!isDir(sessionDir)) continue;
+      seen.add(sessionDir);
+      try {
+        const summaryPath = path.join(sessionDir, 'summary.json');
+        const stat = fs.statSync(summaryPath);
+        const cached = grokIndex.get(sessionDir);
+        if (cached && cached.cacheMtime === stat.mtimeMs) continue;
+        const info = parseGrokSession(sessionDir, stat);
+        if (info) {
+          info.cacheMtime = stat.mtimeMs;
+          grokIndex.set(sessionDir, info);
+        }
+      } catch {}
+    }
+  }
+  for (const key of grokIndex.keys()) {
+    if (!seen.has(key)) grokIndex.delete(key);
+  }
+}
+
+function grokProjectDir(project) {
+  const candidates = [project];
+  try { candidates.push(fs.realpathSync(project)); } catch {}
+  const tried = new Set();
+  for (const c of candidates) {
+    if (!c || tried.has(c)) continue;
+    tried.add(c);
+    const p = path.join(GROK_SESSIONS_DIR, encodeURIComponent(c));
+    if (isDir(p)) return p;
+  }
+  let canonProject = project;
+  try { canonProject = fs.realpathSync(project); } catch {}
+  for (const dirName of readdirSafe(GROK_SESSIONS_DIR)) {
+    const groupDir = path.join(GROK_SESSIONS_DIR, dirName);
+    if (!isDir(groupDir)) continue;
+    const cwd = decodeGrokGroupDir(dirName);
+    if (!cwd) continue;
+    if (cwd === project || cwd === canonProject) return groupDir;
+    try { if (fs.realpathSync(cwd) === canonProject) return groupDir; } catch {}
+  }
+  return null;
+}
+
+// Initial scan
+scanGrokSessions();
+
 // --- Agent registry ---
 // Everything agent-specific lives here: binary, session index + rescan,
 // summary-cache key namespacing, launch command, and new-session detection
@@ -703,6 +873,33 @@ const AGENTS = {
         });
       } catch {}
       return id;
+    },
+  },
+  grok: {
+    bin: grokBin,
+    scan: scanGrokSessions,
+    sessions: () => grokIndex.values(),
+    summaryKey: id => `grok:${id}`,
+    launch(resume) {
+      // --minimal: scrollback-native TUI (pinned prompt, history in xterm
+      // scrollback). Session-scoped; does not write [ui] screen_mode.
+      const flags = '--minimal';
+      return resume ? `${grokBin} ${flags} --resume ${resume}` : `${grokBin} ${flags}`;
+    },
+    snapshotKeys({ project }) {
+      const dir = grokProjectDir(project);
+      return dir ? readdirSafe(dir).filter(n => SESSION_ID_RE.test(n) && isDir(path.join(dir, n))) : [];
+    },
+    detect({ project, preexisting, sessionStart }) {
+      scanGrokSessions();
+      const dir = grokProjectDir(project);
+      if (!dir) return null;
+      const sessions = readdirSafe(dir)
+        .filter(n => SESSION_ID_RE.test(n) && !preexisting.has(n) && isDir(path.join(dir, n)))
+        .map(n => ({ name: n, mtime: statMtimeSafe(path.join(dir, n, 'summary.json')) || statMtimeSafe(path.join(dir, n)) }))
+        .filter(s => s.mtime >= sessionStart - 5000)
+        .sort((a, b) => b.mtime - a.mtime);
+      return sessions[0]?.name || null;
     },
   },
 };
@@ -1023,6 +1220,21 @@ function getNamingText(session) {
     if (text.length >= 10) return text;
     return session.preview;
   }
+  if (session.agent === 'grok') {
+    if (session.nativeTitle && session.nativeTitle.length >= 3) return session.nativeTitle;
+    if (session.jsonlPath) {
+      const msgs = [];
+      try {
+        forEachJsonlEntry(session.jsonlPath, { maxBytes: 256 * 1024 }, entry => {
+          const text = grokUserText(entry);
+          if (text && text.length > 3) msgs.push(text.slice(0, 300).replace(/\n/g, ' ').trim());
+        });
+      } catch {}
+      const text = joinUpTo(msgs);
+      if (text.length >= 10) return text;
+    }
+    return session.preview;
+  }
   if (session.jsonlPath) {
     const text = joinUpTo(getUserMessages(session.jsonlPath));
     if (text.length >= 10) return text;
@@ -1034,15 +1246,26 @@ const STALE_SUMMARY_AGE = 5 * 60_000; // re-check summaries 5 min after last gen
 
 async function generateMissingSummaries(sessions) {
   const now = Date.now();
+  let seeded = false;
   const toGenerate = sessions.filter(s => {
     const key = summaryCacheKey(s.agent, s.id);
     if (summarizing.has(key) || !s.preview) return false;
+    // Grok writes its own title to summary.json — seed the cache, skip Haiku.
+    if (s.nativeTitle) {
+      if (getSummaryText(key) !== s.nativeTitle) {
+        setSummary(key, s.nativeTitle);
+        broadcastSummaryUpdate(s.id, s.agent || 'grok', s.nativeTitle);
+        seeded = true;
+      }
+      return false;
+    }
     // No summary yet — needs one
     if (!summaryCache[key]) return true;
     // Has summary but session was modified after it was generated (stale)
     const ts = getSummaryTs(key);
     return s.mtime > ts && (now - ts) >= STALE_SUMMARY_AGE;
   });
+  if (seeded) scheduleSaveSummary();
   if (!toGenerate.length) return;
 
   toGenerate.forEach(s => summarizing.add(summaryCacheKey(s.agent, s.id)));
@@ -1121,6 +1344,19 @@ const MODEL_PRICING = {
   'glm-4.5-x':                    { input: 2.20,  output: 8.90,  cache_read: 0.45 },
   'glm-4.5-flash':                { input: 0,     output: 0,     cache_read: 0 },
   'glm-4.5':                      { input: 0.60,  output: 2.20,  cache_read: 0.11 },
+  // xAI Grok. Flagship 4.5/4.6 bill a long-context tier at ≥200k prompt tokens
+  // (whole prompt, same shape as Gemini Pro). Bare 'grok' is the unknown-id
+  // fallback so grok-4.6-build etc. don't fall through to DEFAULT (Opus).
+  'grok-4.6':                     { input: 2,     output: 6,     cache_read: 0.50,
+                                    tier: { threshold: 200_000, input: 4, output: 12, cache_read: 1.00 } },
+  'grok-4.5':                     { input: 2,     output: 6,     cache_read: 0.30,
+                                    tier: { threshold: 200_000, input: 4, output: 12, cache_read: 0.60 } },
+  'grok-4.3':                     { input: 1.25,  output: 2.50,  cache_read: 0.20,
+                                    tier: { threshold: 200_000, input: 2.50, output: 5, cache_read: 0.40 } },
+  'grok-4.1-fast':                { input: 0.20,  output: 0.50,  cache_read: 0.05 },
+  'grok-code-fast':               { input: 0.20,  output: 1.50,  cache_read: 0.02 },
+  'grok-4':                       { input: 3,     output: 15,    cache_read: 0.75 },
+  'grok':                         { input: 2,     output: 6,     cache_read: 0.50 },
 };
 // Aliases for model strings that appear with different names
 const MODEL_ALIASES = {
@@ -1133,6 +1369,7 @@ const MODEL_ALIASES = {
   'sonnet': 'claude-sonnet-5',
   'haiku': 'claude-haiku-4-5',
   'fable': 'claude-fable-5',
+  'grok-4.6-build': 'grok-4.6',
 };
 const DEFAULT_PRICING = MODEL_PRICING['claude-opus'];
 
@@ -1419,6 +1656,64 @@ function scanPiUsage(acc, cutoff) {
   }
 }
 
+function grokUpdateIso(entry) {
+  const ts = entry && entry.timestamp;
+  if (typeof ts === 'string') return ts;
+  if (typeof ts === 'number') {
+    const ms = ts > 1e12 ? ts : ts * 1000;
+    const d = new Date(ms);
+    return Number.isNaN(d.getTime()) ? null : d.toISOString();
+  }
+  return null;
+}
+
+// Grok Build: ~/.grok/sessions/<cwd>/<id>/updates.jsonl. Per-turn usage is
+// on sessionUpdate=turn_completed (inputTokens includes cachedReadTokens).
+function scanGrokUsage(acc, cutoff) {
+  try { fs.statSync(GROK_SESSIONS_DIR); } catch { return; }
+  for (const dirName of readdirSafe(GROK_SESSIONS_DIR)) {
+    const groupDir = path.join(GROK_SESSIONS_DIR, dirName);
+    if (!isDir(groupDir)) continue;
+    for (const name of readdirSafe(groupDir)) {
+      if (!SESSION_ID_RE.test(name)) continue;
+      const updatesPath = path.join(groupDir, name, 'updates.jsonl');
+      let stat;
+      try { stat = fs.statSync(updatesPath); } catch { continue; }
+      if (stat.mtime < cutoff) continue;
+      let hadUsage = false;
+      try {
+        forEachJsonlEntry(updatesPath, {}, entry => {
+          const update = entry && entry.params && entry.params.update;
+          const u = update && update.sessionUpdate === 'turn_completed' && update.usage;
+          if (!u) return;
+          const iso = grokUpdateIso(entry);
+          if (iso) {
+            try { if (new Date(iso) < cutoff) return; } catch {}
+          }
+          const models = u.modelUsage && typeof u.modelUsage === 'object'
+            ? Object.entries(u.modelUsage)
+            : [[u.model || 'grok-4.6', u]];
+          for (const [model, mu] of models) {
+            const input = mu.inputTokens || 0;
+            const cached = mu.cachedReadTokens || 0;
+            const output = mu.outputTokens || 0;
+            const created = mu.cacheCreationTokens || 0;
+            if (input + cached + output + created === 0) continue;
+            hadUsage = true;
+            addUsage(acc, model, iso ? iso.slice(0, 10) : null, {
+              input: Math.max(0, input - cached),
+              cache_read: cached,
+              cache_write_5m: created,
+              output,
+            });
+          }
+        });
+      } catch {}
+      if (hadUsage) acc.totalSessions++;
+    }
+  }
+}
+
 function computeTokenUsage() {
   const now = Date.now();
   if (tokenUsageCache && now - tokenUsageCacheTime < TOKEN_CACHE_TTL) return tokenUsageCache;
@@ -1429,6 +1724,7 @@ function computeTokenUsage() {
   scanCodexUsage(acc, cutoff);
   scanGeminiUsage(acc, cutoff);
   scanPiUsage(acc, cutoff);
+  scanGrokUsage(acc, cutoff);
   const { byModel, byDate, totalMessages, totalSessions } = acc;
 
   // Totals per model (cost is accumulated per call in addUsage — tiered
@@ -1558,6 +1854,7 @@ app.get('/api/projects', (req, res) => {
         codexAvailable: !!codexBin,
         geminiAvailable: !!geminiBin,
         piAvailable: !!piBin,
+        grokAvailable: !!grokBin,
         // Keep encoded id for backward compat with session endpoint
         id: p.claudeEncoded || null,
       }))
@@ -1641,8 +1938,9 @@ app.get('/api/recent-sessions', (req, res) => {
         allSessions.push({
           id: entry.id, agent: a, date: entry.date, mtime: entry.mtime,
           preview: entry.preview,
-          summary: getSummaryText(summaryCacheKey(a, entry.id)),
+          summary: getSummaryText(summaryCacheKey(a, entry.id)) || entry.nativeTitle || null,
           jsonlPath: entry.jsonlPath, logsFile: entry.logsFile,
+          nativeTitle: entry.nativeTitle || null,
           projectPath: canonical, projectName: getProjectName(canonical),
         });
       }
@@ -1749,8 +2047,9 @@ function serveSessions(res, projectPath) {
       allSessions.push({
         id: entry.id, agent: a, date: entry.date, mtime: entry.mtime,
         preview: entry.preview,
-        summary: getSummaryText(summaryCacheKey(a, entry.id)),
+        summary: getSummaryText(summaryCacheKey(a, entry.id)) || entry.nativeTitle || null,
         jsonlPath: entry.jsonlPath, logsFile: entry.logsFile,
+        nativeTitle: entry.nativeTitle || null,
       });
     }
   }
@@ -1962,7 +2261,7 @@ wss.on('connection', (ws, req) => {
   }
 
   // B6: Validate resume parameter format
-  if (resume && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(resume)) {
+  if (resume && !SESSION_ID_RE.test(resume)) {
     ws.send(JSON.stringify({ type: 'error', message: 'Invalid session ID format' }));
     ws.close();
     return;
@@ -2048,6 +2347,7 @@ wss.on('connection', (ws, req) => {
       env: {
         ...agentEnv(agent),
         TERM: 'xterm-256color',
+        COLORTERM: 'truecolor',
         // Present as iTerm2 so agent CLIs emit inline images (OSC 1337 IIP),
         // which the xterm.js image addon renders. Claude Code additionally
         // gates iTerm features on TERM_PROGRAM_VERSION >= 3.6.6. This also
@@ -2202,6 +2502,24 @@ wss.on('connection', (ws, req) => {
     // don't leave the timer dead.
     scheduleNextRename();
 
+    // Grok writes generated_title to summary.json. Alt-screen TUI output is
+    // useless for Haiku, so poll the native title and never send it there.
+    if (agent === 'grok') {
+      try { scanGrokSessions(); } catch {}
+      const sid = detectSessionId();
+      if (!sid) return;
+      const title = findAgentSession('grok', sid)?.nativeTitle;
+      if (!title) return;
+      const key = summaryCacheKey('grok', sid);
+      if (getSummaryText(key) === title) return;
+      renameCount++;
+      try { ws.send(JSON.stringify({ type: 'title', title })); } catch {}
+      setSummary(key, title);
+      scheduleSaveSummary();
+      broadcastSummaryUpdate(sid, 'grok', title);
+      return;
+    }
+
     // Prefer JSONL user messages over noisy terminal output
     const jsonlText = getJsonlNamingText();
     let namingInput, title;
@@ -2284,6 +2602,10 @@ wss.on('connection', (ws, req) => {
       }
       if (!detectSessionId()) {
         sessionDetectTimer = setTimeout(pollSessionId, SESSION_DETECT_INTERVAL);
+      } else if (agent === 'grok') {
+        // Title lands shortly after the first prompt — don't wait 90s for Haiku.
+        if (renameTimer) clearTimeout(renameTimer);
+        renameTimer = setTimeout(generateTitle, 3000);
       }
     };
     sessionDetectTimer = setTimeout(pollSessionId, SESSION_DETECT_INTERVAL);

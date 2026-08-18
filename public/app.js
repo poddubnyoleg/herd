@@ -59,6 +59,7 @@ class Herd {
     this.codexAvailable = false;
     this.geminiAvailable = false;
     this.piAvailable = false;
+    this.grokAvailable = false;
     // Diagnostic ring buffer for the unread/finished pipeline. Dump with
     // __herd.dumpLog() in the console when tabs pulse green spuriously.
     this._log = [];
@@ -495,6 +496,7 @@ class Herd {
       this.codexAvailable = this.projects.some(p => p.codexAvailable);
       this.geminiAvailable = this.projects.some(p => p.geminiAvailable);
       this.piAvailable = this.projects.some(p => p.piAvailable);
+      this.grokAvailable = this.projects.some(p => p.grokAvailable);
       this.renderProjects();
       this.loadRecentSessions();
     } catch (err) {
@@ -673,6 +675,8 @@ class Herd {
         label = `Gemini ${match[1]} ${match[2].replace(/-?preview/, '').split('-').filter(Boolean).map(cap).join(' ')}`.trim();
       else if (base.startsWith('glm'))
         label = base.toUpperCase();
+      else if ((match = base.match(/^grok-([\d.]+)(?:-(.+))?/)))
+        label = `Grok ${match[1]}${match[2] ? ' ' + cap(match[2]) : ''}`;
       else
         label = base;
       return label + (oneM ? ' (1M)' : '');
@@ -787,8 +791,11 @@ class Herd {
     const piBtn = this.piAvailable
       ? '<button class="new-session-btn new-session-pi" data-agent="pi"><span class="badge-pi"></span> pi</button>'
       : '';
+    const grokBtn = this.grokAvailable
+      ? '<button class="new-session-btn new-session-grok" data-agent="grok"><span class="badge-grok"></span> grok</button>'
+      : '';
     container.innerHTML = `
-      ${projectExists ? `<div class="new-session-actions"><button class="new-session-btn new-session-claude" data-agent="claude"><span class="badge-claude"></span> claude</button>${codexBtn}${geminiBtn}${piBtn}</div>` : ''}
+      ${projectExists ? `<div class="new-session-actions"><button class="new-session-btn new-session-claude" data-agent="claude"><span class="badge-claude"></span> claude</button>${codexBtn}${geminiBtn}${piBtn}${grokBtn}</div>` : ''}
       ${sessions.map(s => `
         <div class="session-item" data-sid="${s.id}" data-agent="${s.agent || 'claude'}" title="${this.esc(s.preview || '')}">
           <span class="badge-${s.agent || 'claude'}"></span>
