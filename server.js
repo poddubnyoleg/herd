@@ -342,9 +342,9 @@ function isNamableUserText(text) {
 }
 
 function parseCodexRollout(filePath, stat) {
-  // session_meta can be 15KB+ due to base_instructions, hence the line cap
-  let id = null, cwd = null, preview = null;
-  forEachJsonlEntry(filePath, { maxLines: 15 }, entry => {
+  // session_meta can be 15KB+ due to base_instructions, hence the line/byte caps
+  let id = null, cwd = null, preview = null, taggedPreview = null;
+  forEachJsonlEntry(filePath, { maxLines: 40, maxBytes: 512 * 1024 }, entry => {
     if (entry.type === 'session_meta' && entry.payload) {
       id = entry.payload.id;
       cwd = entry.payload.cwd;
@@ -352,8 +352,28 @@ function parseCodexRollout(filePath, stat) {
     if (!preview && entry.type === 'event_msg' && entry.payload?.type === 'user_message' && entry.payload.message) {
       preview = entry.payload.message.slice(0, 150).replace(/\n/g, ' ').trim();
     }
+    // Codex >= ~0.149 stopped writing event_msg/user_message rollout lines; the
+    // prompt only appears as a response_item message with role "user", after
+    // several developer/scaffolding items (AGENTS.md, environment_context, ...).
+    if (!preview && entry.type === 'response_item' && entry.payload?.type === 'message'
+        && entry.payload.role === 'user' && Array.isArray(entry.payload.content)) {
+      const isScaffolding = t => t.startsWith('# AGENTS.md')
+        || t.startsWith('<environment_context') || t.startsWith('<user_instructions');
+      const text = entry.payload.content
+        .filter(b => b?.type === 'input_text' && typeof b.text === 'string')
+        .map(b => b.text.trim())
+        .filter(t => t && !isScaffolding(t))
+        .join(' ');
+      if (text.length > 3) {
+        // A tagged prompt (e.g. a <codex_delegation> wrapper) only stands in
+        // when no plain user text appears within the scan window.
+        if (text.startsWith('<')) { if (!taggedPreview) taggedPreview = text; }
+        else preview = text.slice(0, 150).replace(/\n/g, ' ').trim();
+      }
+    }
     if (id && preview) return false;
   });
+  if (!preview && taggedPreview) preview = taggedPreview.slice(0, 150).replace(/\n/g, ' ').trim();
   if (!id || !cwd) return null;
 
   // Canonicalize cwd for reliable merging with Claude projects
