@@ -1,4 +1,44 @@
 class Herd {
+  // Rejoin the hard line-wraps TUIs emit at the terminal width so copied
+  // prose pastes as real paragraphs. Heuristic, tuned to be code-safe:
+  // a line is treated as soft-wrapped (joined with the next) only when it
+  // physically reaches near the wrap column — code lines rarely do, so
+  // they keep their newlines. Blank lines stay paragraph breaks;
+  // list/box-drawing starters never join.
+  // The selection's common leading indent (Claude Code pads its whole
+  // transcript by 2) is stripped, preserving relative indent.
+  static reflowCopiedText(text, cols = 80) {
+    let lines = text.split('\n').map(l => l.replace(/\s+$/, ''));
+    if (lines.length < 2) return text;
+    const nonEmpty = lines.filter(l => l);
+    if (!nonEmpty.length) return text;
+    const minIndent = Math.min(...nonEmpty.map(l => l.match(/^ */)[0].length));
+    if (minIndent) lines = lines.map(l => l.slice(minIndent));
+    const maxLen = Math.max(...lines.map(l => l.length));
+    if (maxLen < 60) return lines.join('\n'); // too narrow to be wrapped prose
+    // A soft-wrapped line must physically reach near the wrap column
+    // (minus the TUI's own margins and ragged-right slack from long
+    // words). The wrap column is NOT terminal.cols on wide windows: the
+    // server caps every PTY at MAX_COLS=96 via stty, so xterm can be 140+
+    // cols while content wraps at 96 — clamp, or nothing ever joins. The
+    // maxLen term is a fallback for narrower content (e.g. resized since).
+    const threshold = Math.max(Math.min(cols, 96) - 22, maxLen - 16);
+    const noJoin = /^\s*([-*+•·●○◦‣›❯>]\s|\d+[.)]\s|[│┃┆┊┌└├┬┴┤─═║╔╚╠#])/;
+    const out = [];
+    let cur = null, prevLen = -1;
+    for (const line of lines) {
+      if (cur !== null && cur.trim() && prevLen >= threshold && line.trim() && !noJoin.test(line)) {
+        cur += ' ' + line.trim();
+      } else {
+        if (cur !== null) out.push(cur);
+        cur = line;
+      }
+      prevLen = line.length;
+    }
+    if (cur !== null) out.push(cur);
+    return out.join('\n');
+  }
+
   static THEMES = {
     dark: {
       background: '#0a0e14',
@@ -906,6 +946,22 @@ class Herd {
     // macOS keyboard navigation: Option+Arrow for word jump, Cmd+Arrow for line jump
     terminal.attachCustomKeyEventHandler(e => {
       if (e.type !== 'keydown') return true;
+      // Cmd+C with a selection: copy with prose reflow. TUIs (Claude Code
+      // et al.) hard-wrap prose at the terminal width, so the buffer holds
+      // real newlines xterm can't distinguish from intentional ones —
+      // pasted paragraphs break mid-sentence. Reflow joins those wraps
+      // back into paragraphs; Option+Cmd+C copies the selection verbatim.
+      // e.code, not e.key: Option+C produces key='ç' on macOS.
+      // navigator.clipboard only exists in secure contexts (localhost or
+      // https) — served plain-http from a remote HOST, fall through to the
+      // browser's default (raw) copy rather than break Cmd+C entirely.
+      if (e.metaKey && !e.ctrlKey && e.code === 'KeyC' && terminal.hasSelection() && navigator.clipboard) {
+        e.preventDefault();
+        const raw = terminal.getSelection();
+        const text = e.altKey ? raw : Herd.reflowCopiedText(raw, terminal.cols);
+        navigator.clipboard.writeText(text).catch(() => {});
+        return false;
+      }
       // Option+Left/Right: word jump (send ESC+b / ESC+f)
       if (e.altKey && !e.metaKey && !e.ctrlKey) {
         if (e.key === 'ArrowLeft') {
