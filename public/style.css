@@ -637,6 +637,9 @@ body {
 }
 
 .terminal-wrapper.active { display: flex; flex-direction: column; }
+/* Laid out but invisible: lets xterm measure its font while the tab is
+   hidden (see createTab). Only ever set within a single animation frame. */
+.terminal-wrapper.measuring { display: flex; flex-direction: column; visibility: hidden; }
 
 /* P1: Loading / reconnect overlay */
 .terminal-overlay {

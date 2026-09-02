@@ -1294,6 +1294,50 @@ async function runTests() {
     assert(stored && stored.tabs.length === 0, 'Tabs should be empty after closing all');
   });
 
+  await test('restored background tabs are sized like the active one', async () => {
+    // Regression: tabs restored while hidden (display:none wrapper) used to
+    // open xterm with a 0 cell size, so fit() never ran and the PTY was
+    // spawned at the 80x24 default — the resume replay wrapped at 80
+    // columns and the terminal sat in the top-left corner of the pane.
+    const projects = await page.evaluate(() => fetch('/api/projects').then(r => r.json()));
+    const project = projects.find(p => p.exists);
+    assert(project, 'Need an existing project');
+    const ids = [crypto.randomUUID(), crypto.randomUUID(), crypto.randomUUID()];
+    await page.evaluate(({ ids, path }) => {
+      localStorage.setItem('herd-tabs', JSON.stringify({
+        tabs: ids.map((id, i) => ({ sessionId: id, projectPath: path, name: `restored ${i}`, agent: 'claude' })),
+        activeSessionId: ids[0],
+      }));
+    }, { ids, path: project.path });
+    await loadPage();
+    await page.waitForTimeout(1500);
+
+    const dims = () => page.evaluate(() => [...window.__herd.tabs.values()].map(t => ({
+      active: t.id === window.__herd.activeTabId, cols: t.terminal.cols, rows: t.terminal.rows,
+    })));
+    let d = await dims();
+    assertEqual(d.length, 3, 'Should restore three tabs');
+    const active = d.find(t => t.active);
+    assertGreater(active.cols, 80, 'Active tab should be fit to the pane');
+    for (const t of d) {
+      assertEqual(t.cols, active.cols, 'Restored tab cols should match the active tab');
+      assertEqual(t.rows, active.rows, 'Restored tab rows should match the active tab');
+    }
+
+    // Switching to a restored tab must keep (or re-fit to) the pane size.
+    await page.locator('.tab').nth(1).click();
+    await page.waitForTimeout(800);
+    d = await dims();
+    const shown = d.find(t => t.active);
+    assertEqual(shown.cols, active.cols, 'Switched-to tab cols should match the pane');
+    assertEqual(shown.rows, active.rows, 'Switched-to tab rows should match the pane');
+
+    while (await page.locator('.tab').count() > 0) {
+      await page.locator('.tab .tab-close').first().click();
+      await page.waitForTimeout(300);
+    }
+  });
+
   // ═══════════════════════════════════════════
   group('Smart scroll');
   // ═══════════════════════════════════════════

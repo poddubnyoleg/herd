@@ -1027,6 +1027,16 @@ class Herd {
     // open the terminal (correct font measurement → correct cell dims →
     // fitAddon works), then fit + spawn the PTY with real cols/rows.
     requestAnimationFrame(() => {
+      // A tab restored in the background (restoreTabState opens several
+      // at once and only the active one is displayed) reaches this frame
+      // with a display:none wrapper. xterm measures its cell size against
+      // the DOM at open() and the fit addon bails while that size is 0, so
+      // such a tab used to connect at xterm's 80x24 default: `--resume`
+      // replayed at 80 columns and the terminal sat in the top-left corner
+      // of the pane. Give the wrapper layout — but no pixels — for the
+      // duration of this callback so the measurement and the fit are real.
+      const hidden = wrapper.getClientRects().length === 0;
+      if (hidden) wrapper.classList.add('measuring');
       terminal.open(wrapper);
 
       // GPU-accelerated rendering via WebGL (major FPS improvement).
@@ -1101,8 +1111,9 @@ class Herd {
       tab._resizeObserver = resizeObserver;
 
       try { fitAddon.fit(); } catch {}
+      if (hidden) wrapper.classList.remove('measuring');
       this.connectWebSocket(tab);
-      terminal.focus();
+      if (this.activeTabId === tabId) terminal.focus();
     });
   }
 
@@ -1395,12 +1406,24 @@ class Herd {
       document.getElementById(`term-${tabId}`).classList.add('active');
       document.getElementById('terminal-area').classList.add('has-tabs');
       document.getElementById('empty-state').classList.add('hidden');
-      requestAnimationFrame(() => { tab.fitAddon.fit(); tab.terminal.scrollToBottom(); tab.terminal.focus(); });
+      requestAnimationFrame(() => { this.fitTab(tab); tab.terminal.scrollToBottom(); tab.terminal.focus(); });
     }
     this.renderTabs();
     // F8: Highlight active project in sidebar
     this.highlightActiveProject();
     this.saveTabState();
+  }
+
+  // Fit a tab that has just been made visible. If xterm still has no cell
+  // size (it was opened hidden and re-measures only from an
+  // IntersectionObserver task that may land after this frame), fit() is a
+  // silent no-op — retry over the next frames until the measurement exists.
+  fitTab(tab, tries = 10) {
+    if (tab._destroyed) return;
+    try { tab.fitAddon.fit(); } catch {}
+    if (tries > 0 && tab.fitAddon.proposeDimensions() === undefined) {
+      requestAnimationFrame(() => this.fitTab(tab, tries - 1));
+    }
   }
 
   closeTab(tabId) {
