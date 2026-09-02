@@ -1406,7 +1406,12 @@ class Herd {
       document.getElementById(`term-${tabId}`).classList.add('active');
       document.getElementById('terminal-area').classList.add('has-tabs');
       document.getElementById('empty-state').classList.add('hidden');
-      requestAnimationFrame(() => { this.fitTab(tab); tab.terminal.scrollToBottom(); tab.terminal.focus(); });
+      requestAnimationFrame(() => {
+        this.fitTab(tab);
+        tab.terminal.scrollToBottom();
+        this.syncViewport(tab.terminal);
+        tab.terminal.focus();
+      });
     }
     this.renderTabs();
     // F8: Highlight active project in sidebar
@@ -1424,6 +1429,22 @@ class Herd {
     if (tries > 0 && tab.fitAddon.proposeDimensions() === undefined) {
       requestAnimationFrame(() => this.fitTab(tab, tries - 1));
     }
+  }
+
+  // Re-sync xterm's DOM scrollbar with its buffer after the wrapper was
+  // display:none. Output written to a hidden tab still refreshes the
+  // viewport, but it measures a 0px viewport (so the scroll area comes out
+  // one screen short) and its scrollTop assignment is dropped by the
+  // browser — the thumb stays wherever it was (at the top, for a tab opened
+  // hidden) while the buffer is at the bottom. xterm only re-syncs on a
+  // resize or a buffer scroll, and a restored tab does neither when shown:
+  // it was fit at open, and scrollToBottom is a no-op at the bottom. So the
+  // first scrollbar or wheel movement mapped a near-zero scrollTop to a row
+  // near the start of the session, and scrolling up had nowhere to go.
+  // Private API: xterm is vendored and pinned, and the public scroll calls
+  // would fire onScroll into the tab-activity tracking.
+  syncViewport(terminal) {
+    try { terminal._core?.viewport?.syncScrollArea(true); } catch {}
   }
 
   closeTab(tabId) {

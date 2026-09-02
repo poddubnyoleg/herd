@@ -1324,6 +1324,17 @@ async function runTests() {
       assertEqual(t.rows, active.rows, 'Restored tab rows should match the active tab');
     }
 
+    // Output that arrives while the tab is hidden (the --resume replay)
+    // refreshes xterm's viewport against a 0px box; showing the tab must
+    // re-sync the DOM scrollbar with the buffer, or scrolling up is
+    // impossible and scrolling down jumps to the start of the session.
+    await page.evaluate(() => {
+      const t = [...window.__herd.tabs.values()].find(t => t.id !== window.__herd.activeTabId);
+      let s = ''; for (let i = 1; i <= 300; i++) s += `hidden line ${i}\r\n`;
+      t.terminal.write(s);
+    });
+    await page.waitForTimeout(300);
+
     // Switching to a restored tab must keep (or re-fit to) the pane size.
     await page.locator('.tab').nth(1).click();
     await page.waitForTimeout(800);
@@ -1331,6 +1342,18 @@ async function runTests() {
     const shown = d.find(t => t.active);
     assertEqual(shown.cols, active.cols, 'Switched-to tab cols should match the pane');
     assertEqual(shown.rows, active.rows, 'Switched-to tab rows should match the pane');
+
+    const scroll = await page.evaluate(() => {
+      const t = window.__herd.tabs.get(window.__herd.activeTabId);
+      const vp = document.getElementById(`term-${t.id}`).querySelector('.xterm-viewport');
+      const b = t.terminal.buffer.active;
+      return { atBottom: b.viewportY === b.baseY, baseY: b.baseY,
+        scrollTop: vp.scrollTop, maxScrollTop: vp.scrollHeight - vp.clientHeight };
+    });
+    assert(scroll.atBottom && scroll.baseY > 0, 'Buffer should have scrollback and sit at the bottom');
+    assertGreater(scroll.scrollTop, 0, 'DOM scrollbar should not be parked at the top');
+    assert(Math.abs(scroll.maxScrollTop - scroll.scrollTop) <= 2,
+      `DOM scrollbar should be at the bottom (scrollTop ${scroll.scrollTop}, max ${scroll.maxScrollTop})`);
 
     while (await page.locator('.tab').count() > 0) {
       await page.locator('.tab .tab-close').first().click();
