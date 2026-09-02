@@ -5,6 +5,7 @@ const { execFile, execSync, spawn } = require('child_process');
 const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
+const { StringDecoder } = require('string_decoder');
 const os = require('os');
 const pty = require('node-pty');
 
@@ -291,10 +292,16 @@ function statMtimeSafe(p) {
 // lines, after maxBytes bytes, or when onEntry returns false. A final
 // unterminated line (file without trailing newline) is included. Throws only
 // if the file can't be opened — callers that must not throw wrap the call.
+// A JSONL line is read to its end even when it straddles maxBytes (a user turn
+// with inline images runs to several MB), within LINE_OVERRUN; maxBytes only
+// bounds where a line may start. Decoding goes through StringDecoder so a
+// multibyte character split across two reads is not mangled.
+const LINE_OVERRUN = 32 * 1024 * 1024;
 function forEachJsonlEntry(filePath, { maxLines = Infinity, maxBytes = Infinity } = {}, onEntry) {
   const fd = fs.openSync(filePath, 'r');
   try {
     const buf = Buffer.alloc(Math.min(65536, maxBytes));
+    const decoder = new StringDecoder('utf8');
     let remainder = '';
     let offset = 0;
     let count = 0;
@@ -305,16 +312,21 @@ function forEachJsonlEntry(filePath, { maxLines = Infinity, maxBytes = Infinity 
       try { entry = JSON.parse(line); } catch { return true; }
       return onEntry(entry) !== false;
     };
-    while (count < maxLines && offset < maxBytes) {
+    let overrun = false; // past maxBytes: finish the pending line, start no new one
+    while (count < maxLines) {
+      if (offset >= maxBytes) {
+        if (!remainder || offset >= maxBytes + LINE_OVERRUN) break;
+        overrun = true;
+      }
       const bytesRead = fs.readSync(fd, buf, 0, buf.length, offset);
       if (bytesRead === 0) break;
       offset += bytesRead;
-      const chunk = remainder + buf.toString('utf8', 0, bytesRead);
+      const chunk = remainder + decoder.write(buf.subarray(0, bytesRead));
       const parts = chunk.split('\n');
       remainder = parts.pop();
       for (const part of parts) {
         if (!emit(part)) return;
-        if (count >= maxLines) return;
+        if (count >= maxLines || overrun) return;
       }
     }
     if (count < maxLines && remainder.trim()) emit(remainder);
@@ -335,10 +347,27 @@ function piTextContent(content) {
   if (Array.isArray(content)) return content.filter(c => c.type === 'text').map(c => c.text).join(' ');
   return '';
 }
+// Tags that open user turns Claude Code writes on the user's behalf: slash-
+// command echoes, hook caveats, local-command output, background-task pings.
+const SCAFFOLDING_TAGS = ['<local-command-caveat>', '<command-name>', '<command-message>',
+  '<local-command-stdout>', '<task-notification>', '<bash-input>', '<bash-stdout>',
+  '<bash-stderr>', '<system-reminder>'];
 // A user message worth naming a session after (not injected scaffolding).
 function isNamableUserText(text) {
-  return !!text && text.length > 3 && !text.startsWith('You are a')
-    && !text.includes('<local-command-caveat>') && !text.includes('<command-name>');
+  if (!text || text.length <= 3 || text.startsWith('You are a')) return false;
+  const head = text.trimStart();
+  return !SCAFFOLDING_TAGS.some(t => head.startsWith(t));
+}
+// Text of a Claude JSONL user entry worth naming after, or ''. isMeta marks
+// content the CLI injected (skill bodies, hook caveats) rather than what the
+// user typed. A slash command with arguments is user-typed and often the only
+// prompt in the session, so it is kept as "/name args"; bare ones (/clear) are not.
+function namableClaudeUserText(entry) {
+  if (entry.type !== 'user' || entry.isMeta || !entry.message?.content) return '';
+  const text = claudeTextContent(entry.message.content);
+  const cmd = text.match(/<command-name>([^<]+)<\/command-name>[\s\S]*?<command-args>([^<]*)<\/command-args>/);
+  if (cmd) return cmd[2].trim() ? `${cmd[1].trim()} ${cmd[2].trim()}` : '';
+  return isNamableUserText(text) ? text : '';
 }
 
 function parseCodexRollout(filePath, stat) {
@@ -1022,17 +1051,18 @@ function getProjectName(p) {
 
 // --- Session parsing ---
 
-// Extract user messages from a JSONL file for naming purposes.
-// Reads up to maxBytes from the file to find user messages.
-function getUserMessages(jsonlPath, maxBytes = 256 * 1024) {
+// Extract user messages from a JSONL file for naming purposes. Only runs when
+// a summary is (re)generated, so the byte window is generous: a session that
+// opens with a skill run can bury its first typed prompt behind 500KB+ of
+// tool results. Stops once joinUpTo's limit is covered.
+function getUserMessages(jsonlPath, maxBytes = 4 * 1024 * 1024, maxMessages = 6) {
   const messages = [];
   try {
     forEachJsonlEntry(jsonlPath, { maxBytes }, entry => {
-      if (entry.type !== 'user' || !entry.message?.content) return;
-      const text = claudeTextContent(entry.message.content);
-      if (isNamableUserText(text)) {
-        messages.push(text.slice(0, 300).replace(/\n/g, ' ').trim());
-      }
+      const text = namableClaudeUserText(entry);
+      if (!text) return;
+      messages.push(text.slice(0, 300).replace(/\n/g, ' ').trim());
+      if (messages.length >= maxMessages) return false;
     });
   } catch {}
   return messages;
@@ -1052,24 +1082,35 @@ function getSessionInfo(jsonlPath) {
   return info;
 }
 
+// Byte-capped rather than line-capped: the first typed prompt can sit behind
+// a long injected skill body and its tool results. Result is cached per mtime.
+// A session with no typed prompt at all still lists when a bare slash command
+// pulled in a skill (an isMeta body follows it): the command name stands in as
+// the preview, since real work usually followed. Sessions that only ran
+// /login, /model and the like have neither and are not listed.
 function readSessionInfo(jsonlPath) {
   let firstUserMessage = null;
+  let fallback = null;
+  let lastBareCommand = null;
   let timestamp = null;
   let slug = null;
   try {
-    forEachJsonlEntry(jsonlPath, { maxLines: 20 }, entry => {
+    forEachJsonlEntry(jsonlPath, { maxBytes: 2 * 1024 * 1024 }, entry => {
       if (!timestamp && entry.timestamp) timestamp = entry.timestamp;
       if (!slug && entry.slug) slug = entry.slug;
-      if (entry.type === 'user' && entry.message?.content) {
-        const text = claudeTextContent(entry.message.content);
-        if (isNamableUserText(text)) {
-          firstUserMessage = text.slice(0, 150).replace(/\n/g, ' ').trim();
-          return false;
-        }
+      if (entry.type !== 'user' || !entry.message?.content) return;
+      const text = namableClaudeUserText(entry);
+      if (text) {
+        firstUserMessage = text.slice(0, 150).replace(/\n/g, ' ').trim();
+        return false;
       }
+      const raw = claudeTextContent(entry.message.content);
+      const cmd = raw.match(/<command-name>([^<]+)<\/command-name>/);
+      if (cmd) lastBareCommand = cmd[1].trim();
+      else if (!fallback && entry.isMeta && lastBareCommand && isNamableUserText(raw)) fallback = lastBareCommand;
     });
   } catch {}
-  return { firstUserMessage, timestamp, slug };
+  return { firstUserMessage: firstUserMessage || fallback, timestamp, slug };
 }
 
 // --- Haiku summaries ---
@@ -1115,8 +1156,11 @@ function flushSaveSummarySync() {
 
 // Summary cache entries: new format is { text, ts }, old format is plain string.
 // Helpers provide backward-compatible access.
+// The "no task yet" sentinel is cached (it paces retries through the stale
+// check) but never shown — callers fall back to the preview.
 function getSummaryText(key) {
   const v = summaryCache[key];
+  if (v && v.text === NO_TASK_TITLE) return null;
   if (!v) return null;
   return typeof v === 'string' ? v : v.text;
 }
@@ -1131,6 +1175,21 @@ function setSummary(key, text) {
   summaryCache[key] = { text, ts: Date.now() };
 }
 
+// Haiku's answer is not always a name: fed scaffolding, an unseen image or a
+// prompt injection it replies conversationally, and a Stop hook configured in
+// the user's settings can append its own output below the name. Keep the first
+// line and treat anything that reads like a reply as "no task yet" — the
+// sentinel the live-title path already understands.
+const NO_TASK_TITLE = 'new session';
+const REPLY_RE = /^(i(?:['’](?:m|d|ll|ve))?\s|i (?:don|can|won)['’]?t\b|i need\b|hello\b|hi[\s,!]|hey\b|sure\b|the image\b|could you\b|what would\b|please\b|there['’]?s no\b|no task\b|it looks like\b|it seems\b|your message\b|you are\b|you['’]?ve\b)/i;
+function normalizeHaikuTitle(raw) {
+  const first = String(raw || '').split('\n').map(l => l.trim()).find(Boolean) || '';
+  const title = first.replace(/^["'`]+|["'`.]+$/g, '').replace(/\s+/g, ' ').trim();
+  if (!title) return null;
+  const isReply = title.split(' ').length > 6 || /[?!]/.test(title) || REPLY_RE.test(title);
+  return isReply ? NO_TASK_TITLE : title;
+}
+
 async function generateSummary(text) {
   if (!claudeBin || !text) return null;
 
@@ -1139,8 +1198,7 @@ async function generateSummary(text) {
     return await new Promise((resolve) => {
       execFile(claudeBin, ['-p', '--no-session-persistence', '--model', 'haiku', prompt], { timeout: 15000 }, (err, stdout) => {
         if (err) return resolve(null);
-        const result = stdout.trim();
-        resolve(result || null);
+        resolve(normalizeHaikuTitle(stdout));
       });
     });
   } catch {
@@ -1157,8 +1215,7 @@ async function generateLiveTitle(text) {
     return await new Promise((resolve) => {
       execFile(claudeBin, ['-p', '--no-session-persistence', '--model', 'haiku', prompt], { timeout: 15000 }, (err, stdout) => {
         if (err) return resolve(null);
-        const result = stdout.trim();
-        resolve(result || null);
+        resolve(normalizeHaikuTitle(stdout));
       });
     });
   } catch {
@@ -1296,10 +1353,11 @@ async function generateMissingSummaries(sessions) {
     await Promise.all(batch.map(async s => {
       const key = summaryCacheKey(s.agent, s.id);
       try {
+        // A Haiku failure (null) is left uncached so the next fetch retries.
         const summary = await generateSummary(getNamingText(s));
         if (summary) {
           setSummary(key, summary);
-          broadcastSummaryUpdate(s.id, s.agent || 'claude', summary);
+          if (summary !== NO_TASK_TITLE) broadcastSummaryUpdate(s.id, s.agent || 'claude', summary);
         }
       } finally {
         summarizing.delete(key);
