@@ -323,6 +323,33 @@ body {
   animation: tab-pulse 2s ease-in-out infinite;
 }
 
+/* Running server-side (with or without a viewer) */
+.session-item.running { position: relative; }
+.session-item.running::before {
+  content: '';
+  position: absolute;
+  left: 26px;
+  top: 50%;
+  width: 5px;
+  height: 5px;
+  margin-top: -2.5px;
+  border-radius: 50%;
+  background: var(--green);
+}
+.session-kill {
+  margin-left: auto;
+  padding: 0 2px;
+  border: none;
+  background: none;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+}
+.session-item:hover .session-kill { opacity: 1; }
+.session-kill:hover { color: var(--red); }
+
 .session-date {
   opacity: 0.6;
   margin-left: 6px;
@@ -655,6 +682,21 @@ body {
   opacity: 0.85;
   pointer-events: none;
 }
+
+/* Another window holds this terminal; click to take it over */
+.terminal-takeover {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-dim);
+  font-size: 12px;
+  z-index: 11;
+  cursor: pointer;
+  background: color-mix(in srgb, var(--bg) 85%, transparent);
+}
+.terminal-takeover:hover { color: var(--accent); }
 
 /* xterm overrides */
 .xterm { flex: 1; min-height: 0; }

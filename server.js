@@ -9,6 +9,24 @@ const { StringDecoder } = require('string_decoder');
 const os = require('os');
 const pty = require('node-pty');
 
+// Headless xterm, pinned to the client's 5.3.0 line so the server parses and
+// reflows exactly like the browser (see "Terminals" below). Both packages
+// decide "am I in Node?" once, at load, via `typeof navigator === 'undefined'`
+// — and Node 21+ defines a global navigator, so they take the browser path and
+// throw on `window` / `document`. Hide it for the duration of the require.
+const { HeadlessTerminal, SerializeAddon } = (() => {
+  const nav = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  if (nav) delete globalThis.navigator;
+  try {
+    return {
+      HeadlessTerminal: require('xterm-headless').Terminal,
+      SerializeAddon: require('xterm-addon-serialize').SerializeAddon,
+    };
+  } finally {
+    if (nav) Object.defineProperty(globalThis, 'navigator', nav);
+  }
+})();
+
 // Parse a .env file into a scoped object (never mutates process.env).
 function loadEnvFile(envPath) {
   const out = {};
@@ -123,14 +141,17 @@ const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocketServer({ noServer: true });
+// Only messages of 64KB+ are compressed — in practice the reattach snapshot
+// (escape-code-heavy text, ~25x smaller deflated). Live output stays
+// uncompressed so its latency is unchanged.
+const wss = new WebSocketServer({ noServer: true, perMessageDeflate: { threshold: 64 * 1024 } });
 
 // Heartbeat: browsers don't always deliver a clean close frame (sleep/wake,
-// crash, network drop, fast refresh). Without pings, the server keeps the PTY
-// alive until TCP keepalive (~2h) notices the dead socket — meanwhile the
-// client's reconnect logic spawns a second PTY for the same session. Result:
-// orphaned zsh/claude processes pile up. 30s pings + one missed pong →
-// terminate → the connection's `close` handler kills the PTY.
+// crash, network drop, fast refresh). Without pings, the server keeps a dead
+// socket as the terminal's viewer until TCP keepalive (~2h) notices — and
+// every automatic reconnect from another page gets `busy` meanwhile. 30s
+// pings + one missed pong → terminate → the connection's `close` handler
+// detaches the viewer (the PTY keeps running).
 wss.on('connection', ws => {
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
@@ -187,10 +208,11 @@ app.use((req, res, next) => {
 
 // C1b: Origin-check state-changing or expensive/side-effectful routes.
 // Also covers expensive idempotent GETs that would otherwise be
-// cross-origin DoS/UX-abuse vectors (token-usage scans all JSONL).
-const GUARDED_GET_PATHS = new Set(['/api/token-usage']);
+// cross-origin DoS/UX-abuse vectors (token-usage scans all JSONL), and the
+// list of running terminals (/api/live), which names their attach ids.
+const GUARDED_GET_PATHS = new Set(['/api/token-usage', '/api/live']);
 app.use((req, res, next) => {
-  const guarded = req.method !== 'GET' || GUARDED_GET_PATHS.has(req.path);
+  const guarded = req.method !== 'GET' || GUARDED_GET_PATHS.has(req.path.replace(/\/+$/, ''));
   if (guarded && !originAllowed(req.headers.origin)) {
     return res.status(403).end();
   }
@@ -2313,17 +2335,534 @@ app.post('/api/local-services/:id/stop', async (req, res) => {
   }
 });
 
-// --- WebSocket terminal (using `script` as PTY wrapper) ---
+// --- Terminals: server-owned PTYs, viewed over WebSocket ---
+//
+// A terminal outlives its viewer. The WebSocket is only a view of it: when
+// the socket drops (reload, lid close, network loss, browser crash) the PTY
+// keeps running, and every chunk it prints is also fed to a headless xterm.
+// A returning viewer gets a serialized snapshot of that screen plus
+// scrollback, then live output. A terminal ends only when its process exits —
+// after ✕ (close code 4001 or DELETE /api/live/:termId), the reaper, or a
+// server shutdown SIGHUPs it. See docs/proposal-persistent-sessions.md.
 
-const terminals = new Map();
+const terminals = new Map(); // termId -> term
 
+// Readability cap on the agent's width, applied at spawn (stty) and attach;
+// narrow terminals keep their real width. Deliberate — do not "fix" it.
+const MAX_COLS = 96;
+// Bounds on client-supplied sizes: the headless buffer is cols x scrollback.
+const MAX_TERM_COLS = 500;
+const MAX_TERM_ROWS = 200;
+const HEADLESS_SCROLLBACK = 10000; // the client's scrollback (app.js createTab)
+// H7: Backpressure. A stalled browser tab can let ws.bufferedAmount grow
+// without bound, OOMing the server and taking every other terminal down.
+// Pause the PTY above 1MB queued to the viewer; resume under 128KB.
+const WS_HIGH_WATER = 1 << 20;
+const WS_LOW_WATER = 1 << 17;
+// headless.write is asynchronous, so a runaway `yes` or build log with no
+// viewer is parsed on the event loop every terminal shares. Same idea on the
+// parse queue, far below xterm's 50MB discard limit.
+const LAG_HIGH_WATER = 4 << 20;
+const LAG_LOW_WATER = 512 << 10;
+const CLOSE_REPLACED = 4000; // server → old viewer: another viewer took over
+const CLOSE_KILL = 4001;     // viewer → server: ✕, kill instead of detaching
+const CLOSE_BUSY = 4002;     // server → client: another viewer holds it
+const PARSER_GROUND = 0;     // xterm ParserState.GROUND
+const ATTACH_CUT_TIMEOUT = 1000;
+
+// Reaper (destructive by design): a detached terminal nobody returns to would
+// otherwise live until the server restarts. Kill it once it has been detached
+// for TTL and has not grown for IDLE, or has been detached for MAX regardless.
+const envNum = (name, dflt) => { const v = parseFloat(process.env[name]); return v > 0 ? v : dflt; };
+const DETACHED_TTL = envNum('HERD_DETACHED_TTL_HOURS', 24) * 3600_000;
+const DETACHED_MAX = envNum('HERD_DETACHED_MAX_HOURS', 72) * 3600_000;
+const DETACHED_IDLE = envNum('HERD_DETACHED_IDLE_MINUTES', 30) * 60_000;
+const REAPER_INTERVAL = Math.min(10 * 60_000,
+  Math.max(1000, Math.min(DETACHED_TTL, DETACHED_MAX, DETACHED_IDLE) / 4));
+
+function sendJson(ws, obj) {
+  try { ws.send(JSON.stringify(obj)); } catch {}
+}
+
+function clampInt(v, dflt, max) {
+  const n = parseInt(v);
+  return n > 0 ? Math.min(n, max) : dflt;
+}
+
+// A killed terminal stays registered until its process exits; route to and
+// list only the ones still running.
+function liveTerm(termId) {
+  const term = termId && terminals.get(termId);
+  return term && !term.killed ? term : null;
+}
+
+function findLiveSession(agent, sessionId) {
+  for (const term of terminals.values()) {
+    if (!term.killed && term.agent === agent && term.sessionId === sessionId) return term;
+  }
+  return null;
+}
+
+// termIds the user killed (✕, sidebar). A tab elsewhere still retrying one of
+// them gets `session-gone` instead of a `--resume` respawn that would undo the
+// kill. Reaper kills are not remembered: returning to a reaped session
+// resumes it. In memory, like the registry — after a restart nothing is live
+// and resuming is right.
+const userKilled = new Set();
+
+function killTerminal(term, { byUser = false } = {}) {
+  if (term.killed || term.ended) return;
+  term.killed = true;
+  if (byUser) {
+    userKilled.add(term.termId);
+    if (userKilled.size > 1000) userKilled.delete(userKilled.values().next().value);
+  }
+  // SIGHUP, not SIGTERM: interactive zsh ignores SIGTERM but honors SIGHUP
+  // (terminal-hangup), which also propagates to the foreground process group
+  // (claude/codex/gemini) via the tty.
+  try { term.proc.kill('SIGHUP'); } catch {}
+}
+
+function createTerm({ proc, agent, project, sessionId, cols, rows }) {
+  const term = {
+    termId: crypto.randomUUID(), proc, agent, project, sessionId, title: null,
+    viewer: null, viewerClientId: null, viewerSize: { cols, rows },
+    // Attach handoff (see placeCut)
+    attaching: false, pending: [], cutWaiting: false, cutForced: false, cutTimer: null,
+    // 8ms output coalescer — belongs to the current viewer
+    outBuf: '', outTimer: null,
+    // Backpressure (see updatePause)
+    wsPressure: false, lagPressure: false, paused: false, drainTimer: null, lag: 0,
+    // Headless-side bookkeeping: per-chunk reply tags, chunk rate, growth
+    replyTags: [], chunkTimes: [], scrolled: false, lineHighWater: -1,
+    growth: 0, growthAtDetach: 0, lastGrowthAt: Date.now(), detachedAt: 0,
+    cursorStyle: undefined, killed: false, ended: false, disposed: false, exitCode: 0,
+  };
+  const headless = new HeadlessTerminal({ cols, rows, scrollback: HEADLESS_SCROLLBACK, allowProposedApi: true });
+  term.headless = headless;
+  term.serializer = new SerializeAddon();
+  headless.loadAddon(term.serializer);
+  // With no viewer the buffer only scrolls on growth — including at the
+  // scrollback cap, where the cursor-line high-water mark stops moving.
+  headless.onScroll(() => { term.scrolled = true; });
+  // Terminal query replies (DA, cursor position). A viewer's xterm answers
+  // the chunks it received; the headless one answers only chunks that arrived
+  // with no viewer (replyTags, see onPtyData). Some TUIs wait for the reply.
+  headless.onData(data => {
+    if (term.replyTags[0] === false && !term.ended) {
+      try { proc.write(data); } catch {}
+    }
+  });
+  // DECSCUSR isn't kept anywhere serialize() reads; remember the last one.
+  headless.parser.registerCsiHandler({ intermediates: ' ', final: 'q' }, params => {
+    term.cursorStyle = typeof params[0] === 'number' ? params[0] : 0;
+    return false; // observe only — xterm still handles it
+  });
+  terminals.set(term.termId, term);
+  return term;
+}
+
+// Count arrivals the way the client counts frames: its 8ms coalescer merges
+// anything closer together. ≥4 per rolling 2s is the client's "working" rule
+// (armFinishedTimer in app.js).
+function noteChunk(term, now) {
+  const times = term.chunkTimes;
+  if (times.length && now - times[times.length - 1] < 8) return;
+  times.push(now);
+  if (times.length > 32) term.chunkTimes = times.filter(t => now - t < 2000);
+}
+
+function recentChunks(term, now) {
+  return term.chunkTimes.filter(t => now - t < 2000).length;
+}
+
+// Content growth, by the client's own rule (trackTabActivity in app.js): the
+// cursor line passes its high-water mark or the buffer scrolls. In-place
+// repaints (gemini's ~2s footer, spinners, status lines) are not growth, so
+// an idle TUI does not look busy to the reaper. Alt-screen TUIs have no
+// growth signal; the chunk rate stands in, as on the client.
+function trackGrowth(term) {
+  if (term.disposed) return;
+  const buf = term.headless.buffer.active;
+  const now = Date.now();
+  let grew;
+  if (buf.type === 'alternate') {
+    grew = recentChunks(term, now) >= 4;
+  } else {
+    const line = buf.baseY + buf.cursorY;
+    grew = term.scrolled || line > term.lineHighWater;
+    term.scrolled = false;
+    if (line > term.lineHighWater) term.lineHighWater = line;
+  }
+  if (grew) {
+    term.growth++;
+    term.lastGrowthAt = now;
+  }
+}
+
+// Pause the PTY while either the viewer's socket or the headless parser is
+// backed up; every viewer change re-evaluates. A paused PTY produces no
+// output, and output is what drives these checks — so while the socket is
+// the reason, poll it until it drains.
+function updatePause(term) {
+  if (term.ended) {
+    if (term.drainTimer) { clearInterval(term.drainTimer); term.drainTimer = null; }
+    return;
+  }
+  const queued = term.viewer ? term.viewer.bufferedAmount : 0;
+  if (queued > WS_HIGH_WATER) term.wsPressure = true;
+  else if (queued < WS_LOW_WATER) term.wsPressure = false;
+  if (term.lag > LAG_HIGH_WATER) term.lagPressure = true;
+  else if (term.lag < LAG_LOW_WATER) term.lagPressure = false;
+  const pause = term.wsPressure || term.lagPressure;
+  if (pause !== term.paused) {
+    term.paused = pause;
+    try { pause ? term.proc.pause() : term.proc.resume(); } catch {}
+  }
+  if (term.wsPressure && !term.drainTimer) {
+    term.drainTimer = setInterval(() => updatePause(term), 50);
+  } else if (!term.wsPressure && term.drainTimer) {
+    clearInterval(term.drainTimer);
+    term.drainTimer = null;
+  }
+}
+
+function flushOutput(term) {
+  if (term.outTimer) { clearTimeout(term.outTimer); term.outTimer = null; }
+  if (term.outBuf && term.viewer && !term.attaching) {
+    sendJson(term.viewer, { type: 'output', data: term.outBuf });
+  }
+  term.outBuf = '';
+  updatePause(term);
+}
+
+// Discard the coalescer. It holds bytes the headless screen has already
+// consumed; flushed after an attach marker, they would replay over the
+// snapshot.
+function resetOutput(term) {
+  if (term.outTimer) { clearTimeout(term.outTimer); term.outTimer = null; }
+  term.outBuf = '';
+}
+
+// Control messages (title, ready) reach the viewer once it is live. While it
+// is attaching they are dropped: the `attached` reply carries the latest
+// sessionId and title.
+function termSend(term, obj) {
+  if (term.viewer && !term.attaching) sendJson(term.viewer, obj);
+}
+
+function onPtyData(term, str) {
+  if (term.disposed) return;
+  noteChunk(term, Date.now());
+  // Tag each chunk with whether a viewer was attached when it ARRIVED, not
+  // when it is parsed: under parse lag, a query the browser already answered
+  // would otherwise get a second reply after a detach, landing in the agent's
+  // stdin as typed text. The write callback pops the tag, so replyTags[0] is
+  // always the chunk being parsed.
+  term.replyTags.push(!!term.viewer);
+  term.lag += str.length;
+  term.headless.write(str, () => {
+    term.replyTags.shift();
+    term.lag -= str.length;
+    trackGrowth(term);
+    updatePause(term);
+  });
+  if (term.viewer) {
+    if (term.attaching) {
+      term.pending.push(str);
+      if (term.cutWaiting) {
+        // The cut was waiting for the parser to leave a sequence; this chunk
+        // goes in front of the next marker, so it is part of the snapshot.
+        term.cutWaiting = false;
+        clearTimeout(term.cutTimer);
+        term.pending = [];
+        placeCut(term, term.viewer);
+      }
+    } else {
+      term.outBuf += str;
+      if (!term.outTimer) term.outTimer = setTimeout(() => flushOutput(term), 8);
+    }
+  }
+  updatePause(term);
+}
+
+function resizeHeadlessNow(term, cols, rows) {
+  if (term.disposed) return;
+  const h = term.headless;
+  if (h.cols === cols && h.rows === rows) return;
+  try { h.resize(cols, rows); } catch {}
+  // Reflow renumbers lines; re-baseline so it does not count as growth.
+  const buf = h.buffer.active;
+  term.lineHighWater = buf.baseY + buf.cursorY;
+  term.scrolled = false;
+}
+
+// Through the write queue: chunks the viewer received before it resized were
+// parsed by its xterm at the old size, so the headless one parses them at the
+// old size too.
+function resizeHeadless(term, cols, rows) {
+  if (term.disposed) return;
+  term.headless.write('', () => resizeHeadlessNow(term, cols, rows));
+}
+
+// Make `ws` the terminal's viewer. A fresh spawn starts live; a reattach
+// (snapshot: true) first gets the screen and scrollback via placeCut.
+function attachViewer(term, ws, clientId, { cols, rows, snapshot }) {
+  const prev = term.viewer;
+  if (prev && prev !== ws) {
+    // Another tab or device: tell it, so it shows "opened elsewhere" instead
+    // of auto-reconnecting. The same tab's own previous socket is a ghost (lid
+    // close, network drop) the heartbeat has not reaped yet — just drop it.
+    if (!clientId || term.viewerClientId !== clientId) {
+      sendJson(prev, { type: 'detached', reason: 'opened-elsewhere' });
+    }
+    try { prev.close(CLOSE_REPLACED, 'opened elsewhere'); } catch {}
+  }
+  resetOutput(term);
+  clearTimeout(term.cutTimer);
+  term.viewer = ws;
+  term.viewerClientId = clientId;
+  term.viewerSize = { cols, rows };
+  term.detachedAt = 0;
+  term.attaching = !!snapshot;
+  term.pending = [];
+  term.cutWaiting = false;
+  term.cutForced = false;
+  bindViewer(term, ws);
+  updatePause(term);
+  if (snapshot) {
+    term.attachedFromDetached = !prev;
+    placeCut(term, ws);
+  }
+}
+
+function detachViewer(term) {
+  resetOutput(term);
+  clearTimeout(term.cutTimer);
+  term.viewer = null;
+  term.viewerClientId = null;
+  term.attaching = false;
+  term.pending = [];
+  term.cutWaiting = false;
+  term.cutForced = false;
+  const at = term.detachedAt = Date.now();
+  term.growthAtDetach = term.growth;
+  // Chunks still queued for the parser were seen by the viewer that left.
+  if (!term.disposed) {
+    term.headless.write('', () => {
+      if (!term.viewer && term.detachedAt === at) term.growthAtDetach = term.growth;
+    });
+  }
+  updatePause(term);
+}
+
+function bindViewer(term, ws) {
+  if (ws._herdTerm) return;
+  ws._herdTerm = term;
+  ws.on('message', raw => {
+    // Every viewer-originated event checks identity. A replaced socket can
+    // still deliver queued frames until its close is processed; input or a
+    // kill from it would hit the session the new viewer just attached to.
+    if (term.viewer !== ws) return;
+    let msg;
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
+    if (msg.type === 'input' && typeof msg.data === 'string') {
+      try { term.proc.write(msg.data); } catch {}
+    } else if (msg.type === 'resize') {
+      const cols = clampInt(msg.cols, 0, MAX_TERM_COLS);
+      const rows = clampInt(msg.rows, 0, MAX_TERM_ROWS);
+      if (!cols || !rows) return;
+      term.viewerSize = { cols, rows };
+      // Uncapped, unlike spawn and attach: capping here would reflow every
+      // running agent, a separate decision about a pre-existing inconsistency.
+      try { term.proc.resize(cols, rows); } catch {}
+      resizeHeadless(term, cols, rows);
+    }
+  });
+  ws.on('close', code => {
+    if (term.viewer !== ws) return;
+    detachViewer(term);
+    if (code === CLOSE_KILL) killTerminal(term, { byUser: true });
+  });
+}
+
+// Cut the output stream for a snapshot, at a parser boundary. Until the cut,
+// PTY output for the new viewer collects in term.pending. write('', cb) runs
+// cb once the parser has consumed every chunk queued before it — but node-pty
+// splits output anywhere, so the parser may be mid-CSI, or inside a several-
+// hundred-KB OSC 1337 image. Cutting there would have the client print the
+// tail as text (`;240m`, a screenful of base64). So while the parser is not
+// in GROUND, move the cut forward: chunks that arrived since the last marker
+// are in the snapshot after all, and a new marker goes in behind them.
+// Sequences terminate, so this ends within a few chunks. The parser state is
+// private API; xterm is pinned (syncViewport in app.js makes the same trade).
+function placeCut(term, ws) {
+  if (term.disposed) return;
+  term.headless.write('', () => {
+    if (term.viewer !== ws || !term.attaching) return; // replaced or gone
+    const state = term.headless._core._inputHandler._parser.currentState;
+    if (state !== PARSER_GROUND && !term.cutForced && !term.ended) {
+      if (term.pending.length) {
+        term.pending = [];
+        placeCut(term, ws);
+      } else {
+        // Nothing queued behind the marker: wait for the next chunk instead
+        // of spinning. An agent stalled mid-sequence would hang the attach,
+        // so after a second take the cut as it is.
+        term.cutWaiting = true;
+        term.cutTimer = setTimeout(() => {
+          if (term.viewer !== ws || !term.cutWaiting) return;
+          term.cutWaiting = false;
+          term.cutForced = true;
+          placeCut(term, ws);
+        }, ATTACH_CUT_TIMEOUT);
+      }
+      return;
+    }
+    finishAttach(term, ws);
+  });
+}
+
+function finishAttach(term, ws) {
+  const { cols, rows } = term.viewerSize;
+  // Measured at the cut, so it covers everything the snapshot carries that no
+  // viewer saw live — including chunks still queued for the parser at attach.
+  const grewWhileDetached = term.attachedFromDetached && term.growth > term.growthAtDetach;
+  // After the drain, so output queued at the old size was parsed at it.
+  resizeHeadlessNow(term, cols, rows);
+  sendJson(ws, {
+    type: 'attached', termId: term.termId, sessionId: term.sessionId, title: term.title,
+    working: recentChunks(term, Date.now()) >= 4, grewWhileDetached,
+  });
+  sendJson(ws, { type: 'snapshot', data: snapshotOf(term) });
+  term.attaching = false;
+  term.cutForced = false;
+  const pending = term.pending.join('');
+  term.pending = [];
+  if (pending) sendJson(ws, { type: 'output', data: pending });
+  if (term.ended) {
+    sendJson(ws, { type: 'exit', code: term.exitCode });
+    return;
+  }
+  // Same cap as spawn, so a reconnect behaves like a fresh spawn and does
+  // not widen the agent. Its SIGWINCH redraw, if the size changed, arrives
+  // through the live stream.
+  try { term.proc.resize(Math.min(cols, MAX_COLS), rows); } catch {}
+  updatePause(term);
+}
+
+// serialize() emits the normal buffer, the alt buffer when active, and the
+// modes it knows (DECCKM, keypad, bracketed paste, insert, origin, reverse
+// wrap, focus, wraparound, mouse tracking). Appended here: what it misses.
+// No images: the headless terminal has no image addon (see the proposal).
+function snapshotOf(term) {
+  const h = term.headless;
+  let data = term.serializer.serialize();
+  const core = h._core;
+  try {
+    // Mouse encoding: without it the client sends X10 reports to an app
+    // expecting SGR.
+    const enc = core.coreMouseService.activeEncoding;
+    if (enc === 'SGR') data += '\x1b[?1006h';
+    else if (enc === 'SGR_PIXELS') data += '\x1b[?1016h';
+  } catch {}
+  try { if (core.coreService.isCursorHidden) data += '\x1b[?25l'; } catch {}
+  if (term.cursorStyle !== undefined) data += `\x1b[${term.cursorStyle} q`;
+  try {
+    // Scroll region: inline-viewport TUIs set one around each history insert.
+    // DECSTBM homes the cursor, so put it back.
+    const b = core.buffer;
+    if (b.scrollTop !== 0 || b.scrollBottom !== h.rows - 1) {
+      const row = (h.modes.originMode ? b.y - b.scrollTop : b.y) + 1;
+      data += `\x1b[${b.scrollTop + 1};${b.scrollBottom + 1}r\x1b[${row};${b.x + 1}H`;
+    }
+  } catch {}
+  try {
+    // Saved cursor (DECSC, ESC 7): a TUI that restores it after the attach
+    // would otherwise write at the home position. Save it in place, then
+    // return to the live cursor.
+    const b = core.buffer;
+    if (b.savedX || b.savedY) {
+      const top = h.modes.originMode ? b.scrollTop : 0;
+      data += `\x1b[${b.savedY - top + 1};${b.savedX + 1}H\x1b7\x1b[${b.y - top + 1};${b.x + 1}H`;
+    }
+  } catch {}
+  return data;
+}
+
+function onTerminalExit(term, exitCode) {
+  term.ended = true;
+  term.exitCode = exitCode || 0;
+  terminals.delete(term.termId);
+  if (term.viewer && !term.attaching) {
+    flushOutput(term);
+    sendJson(term.viewer, { type: 'exit', code: term.exitCode });
+  } else if (term.viewer && term.cutWaiting) {
+    // The rest of the sequence will never come; finishAttach sends the exit.
+    term.cutWaiting = false;
+    clearTimeout(term.cutTimer);
+    placeCut(term, term.viewer);
+  }
+  updatePause(term);
+  // Dispose once the parser drains: an attach in progress still needs it.
+  term.headless.write('', () => {
+    term.disposed = true;
+    try { term.headless.dispose(); } catch {}
+  });
+}
+
+const reaper = setInterval(() => {
+  const now = Date.now();
+  for (const term of terminals.values()) {
+    if (term.killed || term.viewer || !term.detachedAt) continue;
+    const detachedFor = now - term.detachedAt;
+    if ((detachedFor >= DETACHED_TTL && now - term.lastGrowthAt >= DETACHED_IDLE) || detachedFor >= DETACHED_MAX) {
+      console.log(`[reaper] killing detached ${term.agent} terminal ${term.sessionId || term.termId}`);
+      killTerminal(term);
+    }
+  }
+}, REAPER_INTERVAL);
+
+app.get('/api/live', (req, res) => {
+  res.json([...terminals.values()].filter(t => !t.killed).map(t => ({
+    termId: t.termId, pid: t.proc.pid, agent: t.agent, sessionId: t.sessionId,
+    project: t.project, title: t.title, attached: !!t.viewer, lastGrowthAt: t.lastGrowthAt,
+  })));
+});
+
+// ?client=<tab id>: a tab closing while its socket is down kills only a
+// terminal nobody else is viewing — another window may have attached during
+// its reconnect backoff. Without it (sidebar kill), unconditional.
+app.delete('/api/live/:termId', (req, res) => {
+  const term = SESSION_ID_RE.test(req.params.termId) && liveTerm(req.params.termId);
+  if (!term) return res.status(404).json({ error: 'not found' });
+  const client = req.query.client;
+  if (client && term.viewer && term.viewerClientId !== client) {
+    return res.status(409).json({ error: 'held by another viewer' });
+  }
+  killTerminal(term, { byUser: true });
+  res.json({ killed: true });
+});
+
+// Routing: /ws?attach=<termId>&resume=<sessionId>&client=<pageId>&steal=0|1
+//            &project&agent&cols&rows
+// `client` is a random id per browser tab: a reconnect from the same tab may
+// always replace its own previous socket, even a ghost the heartbeat has not
+// reaped yet. `steal=1` comes only from explicit user actions (opening
+// a tab, clicking a sidebar entry or "take over"); automatic reconnects never
+// displace a live viewer — otherwise a phone that unlocks, or a laptop window
+// that wakes, would grab the session from whichever device is in use.
 wss.on('connection', (ws, req) => {
   const params = new URL(req.url, 'http://localhost').searchParams;
   const projectPath = params.get('project');
   const resume = params.get('resume');  // session ID to resume
+  const attach = params.get('attach');  // termId of a running terminal
+  const client = params.get('client');
+  const clientId = client && SESSION_ID_RE.test(client) ? client : null;
+  const steal = params.get('steal') === '1';
   const agent = params.get('agent') || 'claude';
-  const cols = parseInt(params.get('cols')) || 120;
-  const rows = parseInt(params.get('rows')) || 30;
+  const cols = clampInt(params.get('cols'), 120, MAX_TERM_COLS);
+  const rows = clampInt(params.get('rows'), 30, MAX_TERM_ROWS);
 
   // Validate agent
   const agentDef = AGENTS[agent];
@@ -2338,18 +2877,18 @@ wss.on('connection', (ws, req) => {
     return;
   }
 
-  // B6: Validate resume parameter format
-  if (resume && !SESSION_ID_RE.test(resume)) {
+  // B6: Validate resume and attach parameter format
+  if ((resume && !SESSION_ID_RE.test(resume)) || (attach && !SESSION_ID_RE.test(attach))) {
     ws.send(JSON.stringify({ type: 'error', message: 'Invalid session ID format' }));
     ws.close();
     return;
   }
 
   // B8: Validate project path and capture encoded directory name.
-  // `let`, not `const`: for a brand-new project the encoded dir doesn't exist
-  // until the agent creates it, so the session-id poller below re-resolves it.
+  // For a brand-new project the encoded dir doesn't exist until the agent
+  // creates it, so the session-id poller re-resolves it.
   const resolvedProject = projectPath && path.resolve(projectPath);
-  let encodedDir = resolvedProject ? findEncodedDir(resolvedProject) : null;
+  const encodedDir = resolvedProject ? findEncodedDir(resolvedProject) : null;
 
   // For Claude resume, we need the encoded dir to find the session file
   if (resume && agent === 'claude' && !encodedDir) {
@@ -2366,29 +2905,43 @@ wss.on('connection', (ws, req) => {
     return;
   }
 
-  // Dedup: if an existing terminal is still registered for this (agent, sessionId),
-  // its old WebSocket is likely a ghost (sleep/wake, crash) that we haven't reaped
-  // yet. Kill it before spawning a replacement, otherwise both run in parallel.
-  // The old client must be told it was taken over BEFORE the socket closes —
-  // an abrupt terminate looks like a network drop, so a still-live client
-  // auto-reconnects and kills THIS terminal, and the two windows kill each
-  // other's PTYs forever. A `takenover` message (plus graceful close) lets the
-  // client mark the tab dead instead of reconnecting; true ghosts never read
-  // it and get reaped by the heartbeat.
-  if (resume) {
-    for (const [oldId, oldTerm] of terminals) {
-      if (oldTerm.sessionId === resume && oldTerm.agent === agent) {
-        try { oldTerm.ws.send(JSON.stringify({ type: 'takenover' })); } catch {}
-        // SIGHUP, not SIGTERM: interactive zsh ignores SIGTERM but honors SIGHUP
-        // (terminal-hangup), which also propagates to the foreground process group
-        // (claude/codex/gemini) via the tty.
-        try { oldTerm.proc.kill('SIGHUP'); } catch {}
-        try { oldTerm.ws.close(4000, 'session taken over'); } catch {}
-        terminals.delete(oldId);
-      }
+  // 1. A running terminal, by termId or by (agent, sessionId): attach to it.
+  // Matching by sessionId means clicking a running session in the sidebar,
+  // or opening Herd on a second device, attaches instead of respawning.
+  const byId = liveTerm(attach);
+  const live = (byId && byId.agent === agent ? byId : null) || (resume && findLiveSession(agent, resume));
+  if (live) {
+    if (!live.viewer || (clientId && live.viewerClientId === clientId) || steal) {
+      attachViewer(live, ws, clientId, { cols, rows, snapshot: true });
+    } else {
+      // termId: the retrying tab attaches to this terminal only, so a kill
+      // elsewhere ends in `session-gone` rather than a respawn
+      sendJson(ws, { type: 'busy', termId: live.termId });
+      ws.close(CLOSE_BUSY, 'busy');
     }
+    return;
   }
 
+  // 2. A new session whose id was never detected, and whose PTY is gone
+  // (typically a server restart): nothing can be resumed, and silently
+  // spawning a fresh session in its place would be worse. Likewise a terminal
+  // the user killed: resuming it here would undo the kill.
+  if (attach && (!resume || userKilled.has(attach))) {
+    sendJson(ws, { type: 'error', code: 'session-gone', message: 'Session ended' });
+    ws.close();
+    return;
+  }
+
+  // 3. Spawn: `--resume` when there is a session id, a new session otherwise.
+  try {
+    spawnTerminal({ ws, clientId, agent, agentDef, resume, resolvedProject, projectPath, projectDirExists, encodedDir, cols, rows });
+  } catch (err) {
+    ws.send(JSON.stringify({ type: 'error', message: `Failed to spawn: ${err.message}` }));
+    ws.close();
+  }
+});
+
+function spawnTerminal({ ws, clientId, agent, agentDef, resume, resolvedProject, projectPath, projectDirExists, encodedDir, cols, rows }) {
   // Spawn an interactive shell in a real PTY via node-pty.
   // The agent is launched as a command inside the shell so that when it exits,
   // the user drops back to a live shell prompt in the same tab.
@@ -2415,47 +2968,43 @@ wss.on('connection', (ws, req) => {
     } catch {}
   }
 
-  let proc;
-  try {
-    proc = pty.spawn(shell, ['-li'], {
-      name: 'xterm-256color',
-      cols: cols || 80,
-      rows: rows || 24,
-      cwd: projectDirExists ? projectPath : os.homedir(),
-      env: {
-        ...agentEnv(agent),
-        TERM: 'xterm-256color',
-        COLORTERM: 'truecolor',
-        // Present as iTerm2 so agent CLIs emit inline images (OSC 1337 IIP),
-        // which the xterm.js image addon renders. Claude Code additionally
-        // gates iTerm features on TERM_PROGRAM_VERSION >= 3.6.6. This also
-        // overrides whatever TERM_PROGRAM leaked from the terminal that
-        // launched the server. Note: LC_TERMINAL rides ssh's default
-        // `SendEnv LANG LC_*`, so remote hosts see it too — accepted, since
-        // remote IIP output renders fine in these tabs.
-        TERM_PROGRAM: 'iTerm.app',
-        TERM_PROGRAM_VERSION: '3.7.0',
-        LC_TERMINAL: 'iTerm2',
-      },
-    });
-  } catch (err) {
-    ws.send(JSON.stringify({ type: 'error', message: `Failed to spawn: ${err.message}` }));
-    ws.close();
-    return;
-  }
+  const proc = pty.spawn(shell, ['-li'], {
+    name: 'xterm-256color',
+    cols,
+    rows,
+    cwd: projectDirExists ? projectPath : os.homedir(),
+    env: {
+      ...agentEnv(agent),
+      TERM: 'xterm-256color',
+      COLORTERM: 'truecolor',
+      // Present as iTerm2 so agent CLIs emit inline images (OSC 1337 IIP),
+      // which the xterm.js image addon renders. Claude Code additionally
+      // gates iTerm features on TERM_PROGRAM_VERSION >= 3.6.6. This also
+      // overrides whatever TERM_PROGRAM leaked from the terminal that
+      // launched the server. Note: LC_TERMINAL rides ssh's default
+      // `SendEnv LANG LC_*`, so remote hosts see it too — accepted, since
+      // remote IIP output renders fine in these tabs.
+      TERM_PROGRAM: 'iTerm.app',
+      TERM_PROGRAM_VERSION: '3.7.0',
+      LC_TERMINAL: 'iTerm2',
+    },
+  });
 
-  const termId = crypto.randomUUID();
-  terminals.set(termId, { proc, ws, sessionId, agent });
-
-  ws.send(JSON.stringify({ type: 'ready', termId, sessionId }));
+  const term = createTerm({ proc, agent, project: resolvedProject, sessionId, cols, rows });
+  const termId = term.termId;
+  attachViewer(term, ws, clientId, { cols, rows, snapshot: false });
+  sendJson(ws, { type: 'ready', termId, sessionId });
+  const sendTitle = title => {
+    term.title = title;
+    termSend(term, { type: 'title', title });
+  };
 
   // Launch agent inside the shell. `node-pty` already applied cols/rows via
   // TIOCSWINSZ at spawn and `proc.resize()` handles later client resizes, so
-  // `stty` isn't needed for sizing. We do cap width at 96 cols for readability
-  // on wide terminals (narrow ones keep their actual width — no forced wrap).
-  const MAX_COLS = 96;
-  const effectiveCols = Math.min(cols || 80, MAX_COLS);
-  const setSize = effectiveCols < (cols || 80)
+  // `stty` isn't needed for sizing. We do cap width at MAX_COLS for
+  // readability on wide terminals (narrow ones keep their actual width).
+  const effectiveCols = Math.min(cols, MAX_COLS);
+  const setSize = effectiveCols < cols
     ? `stty cols ${effectiveCols} 2>/dev/null; clear; `
     : 'clear; ';
 
@@ -2550,9 +3099,8 @@ wss.on('connection', (ws, req) => {
     } catch {}
     if (found) {
       sessionId = found;
-      const entry = terminals.get(termId);
-      if (entry) entry.sessionId = sessionId;
-      try { ws.send(JSON.stringify({ type: 'ready', termId, sessionId })); } catch {}
+      term.sessionId = sessionId;
+      termSend(term, { type: 'ready', termId, sessionId });
     }
     return sessionId;
   }
@@ -2591,7 +3139,7 @@ wss.on('connection', (ws, req) => {
       const key = summaryCacheKey('grok', sid);
       if (getSummaryText(key) === title) return;
       renameCount++;
-      try { ws.send(JSON.stringify({ type: 'title', title })); } catch {}
+      sendTitle(title);
       setSummary(key, title);
       scheduleSaveSummary();
       broadcastSummaryUpdate(sid, 'grok', title);
@@ -2624,7 +3172,7 @@ wss.on('connection', (ws, req) => {
     if (!normalized || normalized === 'new session') return;
 
     renameCount++;
-    try { ws.send(JSON.stringify({ type: 'title', title })); } catch {}
+    sendTitle(title);
     // Persist live title to summary cache
     const sid = detectSessionId();
     if (sid) {
@@ -2653,7 +3201,7 @@ wss.on('connection', (ws, req) => {
       preview = findAgentSession(agent, resume)?.preview || null;
     }
     const title = getSummaryText(summaryCacheKey(agent, resume)) || (preview && preview.slice(0, 60));
-    if (title) ws.send(JSON.stringify({ type: 'title', title }));
+    if (title) sendTitle(title);
   } else {
     // First rename after 1 minute
     renameTimer = setTimeout(generateTitle, INITIAL_DELAY);
@@ -2662,9 +3210,9 @@ wss.on('connection', (ws, req) => {
   // Detect the session ID as soon as the agent writes its JSONL, independent of
   // the title-generation cadence. Without this, detectSessionId() first runs at
   // INITIAL_DELAY (90s) inside generateTitle(); a browser reload before then
-  // never receives a `ready` with the real sessionId, so the client can't
-  // persist the tab (saveTabState filters on sessionId) and the session vanishes
-  // on reload. Poll until found, then stop.
+  // never receives a `ready` with the real sessionId, so the tab is restored
+  // by termId only — and after a server restart that is `session-gone`, not a
+  // resume. Poll until found, then stop.
   let sessionDetectTimer = null;
   if (!resume) {
     const SESSION_DETECT_INTERVAL = 1000;
@@ -2689,34 +3237,7 @@ wss.on('connection', (ws, req) => {
     sessionDetectTimer = setTimeout(pollSessionId, SESSION_DETECT_INTERVAL);
   }
 
-  // PTY output → WebSocket + buffer for auto-naming
-  // Coalesce rapid output chunks into fewer, larger WebSocket frames.
-  // node-pty emits already-decoded utf8 strings and handles multi-byte
-  // boundaries internally, so no StringDecoder is needed here.
-  let wsSendBuf = '';
-  let wsSendTimer = null;
-  // H7: Backpressure. A stalled browser tab can let ws.bufferedAmount grow
-  // without bound, OOMing the server and taking every other terminal down.
-  // Pause the PTY when the queue exceeds HIGH_WATER; resume under LOW_WATER.
-  const HIGH_WATER = 1 << 20;  // 1 MB queued to client
-  const LOW_WATER  = 1 << 17;  // 128 KB
-  let ptyPaused = false;
-  const maybeResume = () => {
-    if (ptyPaused && ws.bufferedAmount < LOW_WATER) {
-      try { proc.resume(); } catch {}
-      ptyPaused = false;
-    }
-  };
-  const flushWsBuf = () => {
-    wsSendTimer = null;
-    if (wsSendBuf) {
-      const chunk = wsSendBuf;
-      wsSendBuf = '';
-      try { ws.send(JSON.stringify({ type: 'output', data: chunk })); } catch {}
-    }
-    maybeResume();
-  };
-
+  // PTY output → headless screen and viewer (onPtyData), plus the naming buffer
   proc.onData(str => {
     // Image payloads are excluded from naming input AND from the rename
     // gate — a 500KB base64 blob must not count as "new content".
@@ -2724,44 +3245,20 @@ wss.on('connection', (ws, req) => {
     outputBuffer += nameStr;
     if (outputBuffer.length > 2048) outputBuffer = outputBuffer.slice(-2048);
     charsSinceLastRename += nameStr.length;
-    wsSendBuf += str;
-    if (!ptyPaused && ws.bufferedAmount > HIGH_WATER) {
-      try { proc.pause(); } catch {}
-      ptyPaused = true;
-    }
-    if (!wsSendTimer) wsSendTimer = setTimeout(flushWsBuf, 8);
+    onPtyData(term, str);
   });
 
+  // The only place a terminal ends. A viewer leaving does not stop naming
+  // or detection: the session keeps running without it.
   proc.onExit(({ exitCode }) => {
     sessionEnded = true;
     if (renameTimer) clearTimeout(renameTimer);
     if (sessionDetectTimer) clearTimeout(sessionDetectTimer);
-    if (wsSendTimer) { clearTimeout(wsSendTimer); flushWsBuf(); } else if (wsSendBuf) { flushWsBuf(); }
-    try { ws.send(JSON.stringify({ type: 'exit', code: exitCode || 0 })); } catch {}
-    terminals.delete(termId);
+    onTerminalExit(term, exitCode);
   });
 
-  // WebSocket → stdin + resize
-  ws.on('message', raw => {
-    try {
-      const msg = JSON.parse(raw.toString());
-      if (msg.type === 'input') {
-        try { proc.write(msg.data); } catch {}
-      } else if (msg.type === 'resize' && msg.cols && msg.rows) {
-        try { proc.resize(msg.cols, msg.rows); } catch {}
-      }
-    } catch {}
-  });
-
-  ws.on('close', () => {
-    sessionEnded = true;
-    if (renameTimer) clearTimeout(renameTimer);
-    if (sessionDetectTimer) clearTimeout(sessionDetectTimer);
-    // SIGHUP, not SIGTERM: interactive zsh ignores SIGTERM.
-    try { proc.kill('SIGHUP'); } catch {}
-    terminals.delete(termId);
-  });
-});
+  return term;
+}
 
 // P7: Graceful shutdown
 function cleanup() {

@@ -100,6 +100,7 @@ class Herd {
     this.geminiAvailable = false;
     this.piAvailable = false;
     this.grokAvailable = false;
+    this.live = [];
     // Diagnostic ring buffer for the unread/finished pipeline. Dump with
     // __herd.dumpLog() in the console when tabs pulse green spuriously.
     this._log = [];
@@ -118,7 +119,7 @@ class Herd {
   async init() {
     // Bump when debugging client-side state issues: confirms in the console
     // which build the browser actually loaded after a fix.
-    console.log('[herd] build 2026-07-10b — unread (blue) also input-gated');
+    console.log('[herd] build 2026-10-03 — sessions outlive their viewer');
     this.initTheme();
     await this.loadProjects();
     await this.loadRecentSessions();
@@ -129,6 +130,8 @@ class Herd {
     this.setupAddProject();
     this.setupLocalServices();
     this.listenForSummaryUpdates();
+    this.refreshLive();
+    setInterval(() => this.refreshLive(), 10000);
     document.getElementById('new-tab-btn').addEventListener('click', () => this.newSessionInLastProject());
     // Window resize is handled per-terminal by ResizeObserver in createTab
 
@@ -188,14 +191,6 @@ class Herd {
     setInterval(wakeCheck, 5000);
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible') wakeCheck();
-    });
-
-    // P9: Warn before closing page with active sessions
-    window.addEventListener('beforeunload', e => {
-      if ([...this.tabs.values()].some(t => t.alive)) {
-        e.preventDefault();
-        e.returnValue = '';
-      }
     });
 
     // xterm WebGL atlas LRU eviction can corrupt individual glyph slots in
@@ -300,12 +295,17 @@ class Herd {
 
   // ── Tab persistence ──
 
+  // A tab is restorable by its terminal (still running server-side) or by
+  // its session (resumable). A new session has only a termId for up to 5
+  // minutes, until the server detects its session id.
   saveTabState() {
     const tabs = [...this.tabs.values()]
-      .filter(t => t.sessionId)
-      .map(t => ({ sessionId: t.sessionId, projectPath: t.projectPath, name: t.name, agent: t.agent }));
-    const activeSession = this.activeTabId ? this.tabs.get(this.activeTabId)?.sessionId : null;
-    localStorage.setItem('herd-tabs', JSON.stringify({ tabs, activeSessionId: activeSession }));
+      .filter(t => t.termId || t.sessionId)
+      .map(t => ({ termId: t.termId, sessionId: t.sessionId, projectPath: t.projectPath, name: t.name, agent: t.agent }));
+    const active = this.activeTabId ? this.tabs.get(this.activeTabId) : null;
+    localStorage.setItem('herd-tabs', JSON.stringify({
+      tabs, activeTermId: active?.termId || null, activeSessionId: active?.sessionId || null,
+    }));
   }
 
   restoreTabState() {
@@ -315,15 +315,21 @@ class Herd {
       const state = JSON.parse(raw);
       if (!state.tabs?.length) return;
 
-      let activeTabId = null;
-      for (const saved of state.tabs) {
-        this.createTab(saved.projectPath, saved.name, saved.sessionId, saved.agent || 'claude');
-        if (saved.sessionId === state.activeSessionId) {
-          for (const [id, tab] of this.tabs) {
-            if (tab.sessionId === saved.sessionId) { activeTabId = id; break; }
-          }
-        }
-      }
+      const activeIdx = state.tabs.findIndex(s =>
+        (state.activeTermId && s.termId === state.activeTermId) ||
+        (state.activeSessionId && s.sessionId === state.activeSessionId));
+      // Attach the active tab first and the rest ~150ms apart: the server
+      // serializes each snapshot synchronously, so a reload or wake that
+      // attaches 10-15 tabs at once would block every terminal's event loop.
+      // steal:false — restoring is automatic, so it never displaces another
+      // window's viewer.
+      let activeTabId = null, rank = 0;
+      state.tabs.forEach((saved, i) => {
+        const tabId = this.createTab(saved.projectPath, saved.name, saved.sessionId || null, saved.agent || 'claude', {
+          termId: saved.termId || null, steal: false, connectDelay: i === activeIdx ? 0 : 150 * ++rank,
+        });
+        if (i === activeIdx) activeTabId = tabId;
+      });
       if (activeTabId) this.switchTab(activeTabId);
     } catch {}
   }
@@ -647,6 +653,7 @@ class Herd {
     `;
 
     el.prepend(section);
+    this.applyLiveMarks();
 
     // Toggle expand/collapse
     section.querySelector('.recent-header').addEventListener('click', () => {
@@ -866,6 +873,8 @@ class Herd {
       });
     });
 
+    this.applyLiveMarks();
+
     // Re-apply filter to show/hide individual sessions after async load
     if (this.searchQuery) {
       clearTimeout(this._filterDebounce);
@@ -875,11 +884,18 @@ class Herd {
 
   // ── Tabs ──
 
-  createTab(projectPath, name, resumeId, agent = 'claude') {
-    // Don't open duplicate resume
-    if (resumeId) {
+  // termId attaches to a terminal still running server-side. steal: whether
+  // opening this tab may displace another window's viewer — true for every
+  // user click, false for automatic restores.
+  createTab(projectPath, name, resumeId, agent = 'claude', { termId = null, steal = true, connectDelay = 0 } = {}) {
+    // Don't open a session or terminal twice: a second tab would attach a
+    // second viewer and show "opened elsewhere" on the tab that owns it.
+    if (resumeId || termId) {
       for (const [id, tab] of this.tabs) {
-        if (tab.sessionId === resumeId && tab.agent === agent) { this.switchTab(id); return; }
+        if (tab.agent === agent && ((resumeId && tab.sessionId === resumeId) || (termId && tab.termId === termId))) {
+          this.switchTab(id);
+          return id;
+        }
       }
     }
 
@@ -927,13 +943,19 @@ class Herd {
 
     const tab = {
       id: tabId, name: name || 'new session', terminal, fitAddon, ws: null,
-      projectPath, sessionId: resumeId, agent, alive: true, unread: false,
+      projectPath, sessionId: resumeId, termId, agent, alive: true, unread: false,
       finished: false, idleTimer: null, outputSinceViewed: 0,
       _closeRequested: 0, _inactiveSince: 0,
       _writeBuf: '', _writeRaf: 0,
       _chunkTimes: [], _scrolled: false, _lineWatermark: undefined,
       _resizeObserver: null, _suppressUntil: 0, _sawOutput: false,
       _awaitingInput: true,
+      _steal: steal, _holdsSlot: false, _busy: false, _yielded: false,
+      // Identifies this tab's viewer to the server: its own reconnect may
+      // replace its previous socket (a ghost after lid close) without
+      // counting as another window. Per tab, not per page — two tabs on one
+      // terminal must not silently replace each other back and forth.
+      clientId: crypto.randomUUID(),
     };
     this.tabs.set(tabId, tab);
 
@@ -1112,19 +1134,32 @@ class Herd {
 
       try { fitAddon.fit(); } catch {}
       if (hidden) wrapper.classList.remove('measuring');
-      this.connectWebSocket(tab);
+      if (connectDelay) {
+        setTimeout(() => { if (!tab._destroyed) this.connectWebSocket(tab); }, connectDelay);
+      } else {
+        this.connectWebSocket(tab);
+      }
       if (this.activeTabId === tabId) terminal.focus();
     });
+    return tabId;
   }
 
-  // F2: WebSocket connection (extracted for reconnection support)
+  // F2: WebSocket connection (extracted for reconnection support). The
+  // socket is a viewer of a server-owned terminal: the server attaches it to
+  // the running terminal (`attached` + `snapshot`) or spawns one (`ready`).
   connectWebSocket(tab) {
-    const { id: tabId, terminal, fitAddon, projectPath, sessionId: resumeId } = tab;
+    const { id: tabId, terminal, fitAddon, projectPath } = tab;
 
     const wsUrl = new URL(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws`);
     wsUrl.searchParams.set('project', projectPath);
     wsUrl.searchParams.set('agent', tab.agent || 'claude');
+    if (tab.termId) wsUrl.searchParams.set('attach', tab.termId);
     if (tab.sessionId) wsUrl.searchParams.set('resume', tab.sessionId);
+    wsUrl.searchParams.set('client', tab.clientId);
+    // One-shot: only the explicit action that opened this connection may
+    // displace another window's viewer. Reconnects never do.
+    wsUrl.searchParams.set('steal', tab._steal ? '1' : '0');
+    tab._steal = false;
     wsUrl.searchParams.set('cols', terminal.cols);
     wsUrl.searchParams.set('rows', terminal.rows);
 
@@ -1132,33 +1167,41 @@ class Herd {
     tab.ws = ws;
     tab.alive = true;
 
-    ws.onopen = () => {
+    // The first `ready` (spawned) or `attached` (reattached) reply: this page
+    // now holds the terminal's viewer slot.
+    let established = false;
+    const establish = () => {
+      established = true;
       tab._reconnectAttempt = 0;
-      // Suppress finished/unread tracking for 15s after (re)connect. On page
-      // refresh or WS reconnect, `claude --resume` replays session history as
-      // a burst of output — indistinguishable from a real completed run
-      // (output, then quiet), which used to mark every restored background
-      // tab with the green "finished" pulse.
-      tab._suppressUntil = Date.now() + 15000;
-      tab._sawOutput = false;
-      // A (re)connected session was respawned via `--resume` (or is brand
-      // new) and sits at a prompt: it cannot be doing work, so nothing it
-      // prints — replay, MCP banners, trailing startup hints, error dumps —
-      // is ever "work finished". The green pulse stays disabled until the
-      // user actually types into this tab (terminal.onData clears the flag).
-      tab._awaitingInput = true;
-      this._dbg('ws-open', { tab: tabId, name: tab.name });
+      tab._holdsSlot = true;
+      tab._busy = false;
+      tab._yielded = false;
+      this.hideTakeover(tab);
       // Clear any stale finished-tracking from the prior connection
       if (tab.idleTimer) { clearTimeout(tab.idleTimer); tab.idleTimer = null; }
       tab.outputSinceViewed = 0;
       tab._scrolled = false;
-      // Remove loading/reconnect overlay
+      requestAnimationFrame(() => { fitAddon.fit(); terminal.scrollToBottom(); });
+      this.renderTabs();
+    };
+    const setSessionId = sessionId => {
+      if (!sessionId) return;
+      tab.sessionId = sessionId;
+      const sidebarItem = document.querySelector(`.session-item[data-tab-id="${tabId}"]`);
+      if (sidebarItem) sidebarItem.dataset.sid = sessionId;
+    };
+
+    ws.onopen = () => {
+      if (tab.ws !== ws) return;
+      this._dbg('ws-open', { tab: tabId, name: tab.name });
+      // Remove the loading overlay
       const overlay = document.getElementById(`term-${tabId}`)?.querySelector('.terminal-overlay');
       if (overlay) overlay.remove();
-      requestAnimationFrame(() => { fitAddon.fit(); terminal.scrollToBottom(); });
     };
 
     ws.onmessage = e => {
+      // A replaced socket (take over, reconnect) may still deliver frames.
+      if (tab.ws !== ws) return;
       try {
         const msg = JSON.parse(e.data);
         switch (msg.type) {
@@ -1209,10 +1252,93 @@ class Herd {
             tab._lastChunkAt = _now;
             break;
           case 'ready':
-            tab.sessionId = msg.sessionId;
-            const sidebarItem = document.querySelector(`.session-item[data-tab-id="${tabId}"]`);
-            if (sidebarItem) sidebarItem.dataset.sid = msg.sessionId;
+            // Sent at spawn, and again when the session id is detected (up to
+            // 5 minutes later) — only the first one, before any output, may
+            // reset the activity gates, or it would re-arm the input gate
+            // after the user had typed.
+            if (!established) {
+              establish();
+              // Suppress finished/unread tracking for 15s after a spawn. When
+              // it is `--resume` (the terminal was gone, e.g. after a server
+              // restart), the agent replays session history as a burst of
+              // output — indistinguishable from a real completed run (output,
+              // then quiet), which used to mark every restored background tab
+              // with the green "finished" pulse.
+              tab._suppressUntil = Date.now() + 15000;
+              tab._sawOutput = false;
+              // A spawned session is brand new or resumed, and sits at a
+              // prompt: it cannot be doing work, so nothing it prints — replay,
+              // MCP banners, trailing startup hints, error dumps — is ever
+              // "work finished". The green pulse stays disabled until the user
+              // actually types into this tab (terminal.onData clears the flag).
+              tab._awaitingInput = true;
+              this._dbg('spawned', { tab: tabId, name: tab.name });
+            }
+            if (msg.termId) tab.termId = msg.termId;
+            setSessionId(msg.sessionId);
             this.saveTabState();
+            break;
+          case 'attached': {
+            // Reattached to a terminal that kept running server-side; the
+            // `snapshot` that follows restores its screen and scrollback.
+            establish();
+            tab.termId = msg.termId;
+            setSessionId(msg.sessionId);
+            if (msg.title && msg.title !== tab.name) {
+              tab.name = msg.title;
+              this.updateSidebarSession(tabId, msg.title);
+            }
+            // Turn state, from the server's view of the output (heuristics
+            // until hooks report turns):
+            // - working: a turn is in flight; normal tracking takes over and
+            //   the tab goes green when it finishes.
+            // - grew while detached, now quiet: the turn finished while nobody
+            //   was watching — a background tab is green right away.
+            // - neither: the session sat idle; gate on typing, as after a
+            //   spawn.
+            // Not working: mute the first burst (the agent's SIGWINCH redraw
+            // if the size changed). Working: no mute — the window slides while
+            // output streams, so it would swallow the whole turn.
+            const background = tabId !== this.activeTabId;
+            if (msg.working) {
+              tab._awaitingInput = false;
+              tab._suppressUntil = 0;
+              tab._sawOutput = true;
+              // The turn may end inside the snapshot, with no output after
+              // it to drive trackTabActivity; the timer still sees it go quiet.
+              if (background) this.armFinishedTimer(tabId, tab);
+            } else {
+              tab._suppressUntil = Math.max(tab._suppressUntil || 0, Date.now() + 3000);
+              tab._sawOutput = false;
+              tab._awaitingInput = !msg.grewWhileDetached;
+              if (msg.grewWhileDetached && background) {
+                tab.finished = true;
+                tab.unread = false;
+                this.updateSidebarFinished(tabId, true);
+              }
+            }
+            this._dbg('attached', {
+              tab: tabId, name: tab.name, working: !!msg.working,
+              grewWhileDetached: !!msg.grewWhileDetached, background,
+            });
+            this.renderTabs();
+            this.saveTabState();
+            break;
+          }
+          case 'snapshot':
+            // Pending rAF output is from before the disconnect (the rAF batch
+            // freezes in hidden pages) and would land on top of the restored
+            // screen. RIS goes in-stream rather than terminal.reset(), so
+            // anything xterm still has queued is parsed first, then wiped.
+            if (tab._writeRaf) { cancelAnimationFrame(tab._writeRaf); tab._writeRaf = 0; }
+            tab._writeBuf = '';
+            // Bypasses trackTabActivity: restored content is not new output.
+            terminal.write('\x1bc' + msg.data, () => {
+              tab._lineWatermark = undefined;
+              tab._scrolled = false;
+              terminal.scrollToBottom();
+              this.syncViewport(terminal);
+            });
             break;
           case 'title':
             tab.name = msg.title;
@@ -1227,16 +1353,34 @@ class Herd {
             }
             this.saveTabState();
             break;
-          case 'takenover':
-            // This session was resumed elsewhere (another window/browser); the
-            // server killed our PTY. alive=false stops onclose from
-            // auto-reconnecting, which would kill the new window's PTY in turn.
+          case 'busy':
+            // Another window is viewing this terminal. Don't take it: retry
+            // quietly (onclose) and attach once it leaves, or on a click.
+            // Retries name the terminal, so if it is killed meanwhile the
+            // server answers session-gone instead of resuming the session.
+            if (msg.termId) tab.termId = msg.termId;
             tab.alive = false;
-            terminal.write('\r\n\x1b[38;5;240m[session opened in another window]\x1b[0m\r\n');
+            tab._busy = true;
+            tab._holdsSlot = false;
+            tab._yielded = true;
+            this.showTakeover(tab, 'Open in another window');
+            this._dbg('busy', { tab: tabId, name: tab.name });
+            this.renderTabs();
+            break;
+          case 'detached':
+            // Another window took this terminal over (opened-elsewhere).
+            // alive=false: no auto-reconnect, which would take it back.
+            tab.alive = false;
+            tab._holdsSlot = false;
+            tab._yielded = true;
+            this.showTakeover(tab, 'Opened in another window');
+            this._dbg('detached', { tab: tabId, name: tab.name, reason: msg.reason });
             this.renderTabs();
             break;
           case 'exit':
             tab.alive = false;
+            tab.termId = null;
+            tab._holdsSlot = false;
             terminal.write('\r\n\x1b[38;5;240m[shell exited]\x1b[0m\r\n');
             this._dbg('exit-msg', { tab: tabId, name: tab.name, awaitingInput: tab._awaitingInput });
             // Only pulse green if the user engaged this session since its
@@ -1248,24 +1392,42 @@ class Herd {
               this.updateSidebarFinished(tabId, true);
             }
             this.renderTabs();
+            this.saveTabState();
             break;
           case 'error':
             terminal.write(`\r\n\x1b[31m${msg.message}\x1b[0m\r\n`);
+            // A new session whose terminal is gone (server restart) before
+            // its id was detected: nothing to resume. Mark the tab dead and
+            // stop restoring it.
+            if (msg.code === 'session-gone') {
+              tab.alive = false;
+              tab.termId = null;
+              tab._holdsSlot = false;
+              tab._busy = false;
+              this.hideTakeover(tab);
+              this.renderTabs();
+              this.saveTabState();
+            }
             break;
         }
       } catch {}
     };
 
     ws.onclose = () => {
-      if (tab._destroyed) return;
-      this._dbg('ws-close', { tab: tabId, name: tab.name, alive: tab.alive });
+      if (tab._destroyed || tab.ws !== ws) return;
+      this._dbg('ws-close', { tab: tabId, name: tab.name, alive: tab.alive, busy: tab._busy });
+      if (tab._busy) {
+        if (tab.termId || tab.sessionId) this.scheduleReconnect(tab, { quiet: true });
+        return;
+      }
       if (tab.alive) {
         tab.alive = false;
         terminal.write('\r\n\x1b[38;5;240m[disconnected]\x1b[0m\r\n');
         this.renderTabs();
 
-        // F2: Auto-reconnect for sessions that can be resumed
-        if (tab.sessionId) {
+        // F2: Auto-reconnect: reattach to the running terminal, or resume
+        // the session if the terminal is gone
+        if (tab.termId || tab.sessionId) {
           this.scheduleReconnect(tab);
         }
       }
@@ -1274,21 +1436,52 @@ class Herd {
   }
 
   // F2: Reconnection with exponential backoff. The attempt counter lives on
-  // the tab (reset in ws.onopen) — passing it positionally meant every onclose
-  // restarted the sequence at attempt 0, i.e. a permanent ~1s retry loop while
-  // the server was down. Each failed attempt fires its own onclose, which
-  // calls back into here, so no separate "still disconnected?" poll is needed.
-  scheduleReconnect(tab) {
+  // the tab (reset when a connection is established) — passing it
+  // positionally meant every onclose restarted the sequence at attempt 0,
+  // i.e. a permanent ~1s retry loop while the server was down. Each failed
+  // attempt fires its own onclose, which calls back into here, so no separate
+  // "still disconnected?" poll is needed. quiet: retries while another window
+  // holds the terminal, behind the take-over overlay.
+  scheduleReconnect(tab, { quiet = false } = {}) {
     if (tab._destroyed) return;
     if (tab._reconnectTimer) clearTimeout(tab._reconnectTimer);
     const attempt = tab._reconnectAttempt || 0;
     tab._reconnectAttempt = attempt + 1;
     const delay = Math.min(1000 * Math.pow(2, attempt), 30000);
     tab._reconnectTimer = setTimeout(() => {
+      tab._reconnectTimer = null;
       if (tab._destroyed) return;
-      tab.terminal.write(`\r\n\x1b[38;5;240m[reconnecting...]\x1b[0m\r\n`);
+      if (!quiet) tab.terminal.write(`\r\n\x1b[38;5;240m[reconnecting...]\x1b[0m\r\n`);
       this.connectWebSocket(tab);
     }, delay);
+  }
+
+  // Overlay on a tab whose terminal another window holds; a click takes it
+  // over (steal=1), which is the only way this page displaces that viewer.
+  showTakeover(tab, text) {
+    const wrapper = document.getElementById(`term-${tab.id}`);
+    if (!wrapper) return;
+    let el = wrapper.querySelector('.terminal-takeover');
+    if (!el) {
+      el = document.createElement('div');
+      el.className = 'terminal-takeover';
+      el.addEventListener('click', () => this.takeOver(tab));
+      wrapper.appendChild(el);
+    }
+    el.textContent = `${text}. Click to take over.`;
+  }
+
+  hideTakeover(tab) {
+    document.getElementById(`term-${tab.id}`)?.querySelector('.terminal-takeover')?.remove();
+  }
+
+  takeOver(tab) {
+    if (tab._destroyed) return;
+    if (tab._reconnectTimer) { clearTimeout(tab._reconnectTimer); tab._reconnectTimer = null; }
+    tab._busy = false;
+    tab._reconnectAttempt = 0;
+    tab._steal = true;
+    this.connectWebSocket(tab);
   }
 
   // Unread/finished detection, run after each batched write completes (buffer
@@ -1456,7 +1649,7 @@ class Herd {
     if (tab.idleTimer) clearTimeout(tab.idleTimer);
     if (tab._writeRaf) cancelAnimationFrame(tab._writeRaf);
     if (tab._resizeObserver) tab._resizeObserver.disconnect();
-    try { tab.ws?.close(); } catch {}
+    this.killTerminal(tab);
     try { tab.terminal.dispose(); } catch {}
     document.getElementById(`term-${tabId}`)?.remove();
     const sidebarEl = document.querySelector(`.session-item[data-tab-id="${tabId}"]`);
@@ -1475,6 +1668,31 @@ class Herd {
     }
     this.renderTabs();
     this.saveTabState();
+  }
+
+  // ✕ kills the terminal; only unintended disconnects (reload, lid close,
+  // network loss) leave it running. A close code arrives atomically with the
+  // close itself, so it cannot be lost or reordered like a separate message.
+  // After `busy` or `opened-elsewhere`, another window is using the session:
+  // close the tab locally only.
+  killTerminal(tab) {
+    const ws = tab.ws;
+    if (tab._yielded) {
+      try { ws?.close(); } catch {}
+      return;
+    }
+    if (ws?.readyState === WebSocket.OPEN) {
+      try { ws.close(4001, 'closed'); } catch {}
+    } else if (ws?.readyState === WebSocket.CONNECTING) {
+      // The server may spawn or attach before it sees this page leave
+      ws.onmessage = null;
+      ws.onopen = () => { try { ws.close(4001, 'closed'); } catch {} };
+    } else if (tab.termId) {
+      // No socket: in reconnect backoff, or a restored tab still waiting for
+      // its staggered connect. Kill over HTTP — the server refuses if another
+      // window is viewing it (it may have attached during the backoff).
+      fetch(`/api/live/${tab.termId}?client=${tab.clientId}`, { method: 'DELETE' }).catch(() => {});
+    }
   }
 
   renderTabs() {
@@ -1590,6 +1808,70 @@ class Herd {
         `;
       }
     });
+  }
+
+  // ── Running terminals (server-side, with or without a viewer) ──
+
+  async refreshLive() {
+    try {
+      const res = await fetch('/api/live');
+      if (!res.ok) return;
+      this.live = await res.json();
+    } catch { return; }
+    this.applyLiveMarks();
+  }
+
+  // Sessions running server-side get a "running" mark and a kill action.
+  // Terminals whose session id is not detected yet are listed as "running
+  // (unnamed)" under their (expanded) project and attach by termId.
+  applyLiveMarks() {
+    const running = new Map(this.live.filter(t => t.sessionId).map(t => [`${t.agent}:${t.sessionId}`, t]));
+    document.querySelectorAll('.session-item[data-sid]').forEach(el => {
+      const t = running.get(`${el.dataset.agent || 'claude'}:${el.dataset.sid}`);
+      el.classList.toggle('running', !!t);
+      this.setKillButton(el, t);
+    });
+    document.querySelectorAll('.live-unnamed').forEach(el => el.remove());
+    const openTermIds = new Set([...this.tabs.values()].map(t => t.termId).filter(Boolean));
+    for (const t of this.live) {
+      if (t.sessionId || openTermIds.has(t.termId)) continue;
+      const projectEl = [...document.querySelectorAll('.project-item:not(.recent-section)')]
+        .find(el => el.dataset.path === t.project);
+      if (!projectEl?.classList.contains('expanded')) continue;
+      const container = projectEl.querySelector('.project-sessions');
+      const name = t.title || 'running (unnamed)';
+      const item = document.createElement('div');
+      item.className = 'session-item live-unnamed running';
+      item.dataset.agent = t.agent;
+      item.innerHTML = `<span class="badge-${t.agent}"></span>${this.esc(this.truncate(name, 38))}`;
+      item.addEventListener('click', e => {
+        e.stopPropagation();
+        this.createTab(t.project, name, null, t.agent, { termId: t.termId });
+      });
+      this.setKillButton(item, t);
+      const first = container.querySelector('.session-item');
+      if (first) first.before(item);
+      else container.append(item);
+    }
+  }
+
+  setKillButton(el, t) {
+    let btn = el.querySelector('.session-kill');
+    if (!t) { btn?.remove(); return; }
+    if (!btn) {
+      btn = document.createElement('button');
+      btn.className = 'session-kill';
+      btn.title = 'Stop this running session';
+      btn.setAttribute('aria-label', 'Stop this running session');
+      btn.textContent = '\u00d7';
+      el.appendChild(btn);
+    }
+    btn.onclick = async e => {
+      e.stopPropagation();
+      if (!confirm('Stop this running session?')) return;
+      try { await fetch(`/api/live/${t.termId}`, { method: 'DELETE' }); } catch {}
+      setTimeout(() => this.refreshLive(), 500);
+    };
   }
 
   updateSidebarFinished(tabId, finished) {

@@ -6,12 +6,15 @@
     "start": "node server.js",
     "restart": "lsof -ti:3456 | xargs kill -9 2>/dev/null; node server.js",
     "test": "node test/hub.test.mjs",
+    "test:persistent": "node test/persistent.test.mjs",
     "postinstall": "node scripts/patch-node-pty.js && (chmod +x node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper node_modules/node-pty/prebuilds/darwin-x64/spawn-helper 2>/dev/null || true)"
   },
   "dependencies": {
     "express": "^4.21.0",
     "node-pty": "^1.1.0",
-    "ws": "^8.18.0"
+    "ws": "^8.18.0",
+    "xterm-addon-serialize": "0.11.0",
+    "xterm-headless": "5.3.0"
   },
   "devDependencies": {
     "playwright": "^1.59.1"
