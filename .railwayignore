@@ -1,0 +1,10 @@
+.git/
+node_modules/
+.claude/
+.env
+.env.*
+summaries.json
+server.log
+test/
+security-audit/
+docs/media/

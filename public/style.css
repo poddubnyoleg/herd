@@ -623,7 +623,7 @@ body {
   background: rgba(248, 81, 73, 0.1);
 }
 
-#new-tab-btn {
+#new-tab-btn, #files-btn {
   background: none;
   border: none;
   border-left: 1px solid var(--border);
@@ -638,7 +638,7 @@ body {
   transition: color 0.1s, background 0.1s;
 }
 
-#new-tab-btn:hover {
+#new-tab-btn:hover, #files-btn:hover {
   color: var(--accent);
   background: var(--bg-hover);
 }
@@ -944,3 +944,24 @@ body {
   border-color: var(--accent);
   background: var(--bg-hover);
 }
+
+/* Files panel (deployments) */
+#files-btn[hidden] { display: none; }
+.files-popup { width: min(560px, calc(100vw - 32px)); padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; }
+.files-head { display: flex; align-items: center; gap: 8px; }
+.files-path { flex: 1; font-size: 11px; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.files-list { max-height: 55vh; overflow-y: auto; border: 1px solid var(--border); border-radius: 4px; }
+.files-row { display: grid; grid-template-columns: 20px 1fr auto; align-items: center; gap: 6px; padding: 3px 8px; font-size: 12px; }
+.files-row:hover { background: var(--bg-hover); }
+.files-row-head { font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); border-bottom: 1px solid var(--border); cursor: pointer; }
+.files-row-head:hover { background: none; }
+.files-name { cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.files-name:hover { text-decoration: underline; }
+.files-name.is-dir { color: var(--accent); }
+.files-size { color: var(--text-muted); font-size: 11px; }
+.files-empty { padding: 16px; text-align: center; color: var(--text-muted); font-size: 12px; }
+.files-actions { display: flex; align-items: center; gap: 8px; }
+.files-status { flex: 1; font-size: 11px; color: var(--text-dim); }
+.files-btn { font: inherit; font-size: 11px; padding: 4px 10px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg); color: var(--text); cursor: pointer; }
+.files-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.files-btn:disabled { opacity: 0.4; cursor: default; }

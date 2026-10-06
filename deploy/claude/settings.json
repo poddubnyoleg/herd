@@ -1,0 +1,9 @@
+{
+  "statusLine": {
+    "type": "command",
+    "command": "bash /app/deploy/claude/statusline-command.sh"
+  },
+  "model": "opus",
+  "effortLevel": "xhigh",
+  "tui": "default"
+}

@@ -101,6 +101,7 @@ class Herd {
     this.piAvailable = false;
     this.grokAvailable = false;
     this.live = [];
+    this.host = { native: true, workspace: null }; // see /api/host
     // Diagnostic ring buffer for the unread/finished pipeline. Dump with
     // __herd.dumpLog() in the console when tabs pulse green spuriously.
     this._log = [];
@@ -121,6 +122,7 @@ class Herd {
     // which build the browser actually loaded after a fix.
     console.log('[herd] build 2026-10-03 — sessions outlive their viewer');
     this.initTheme();
+    try { this.host = await (await fetch('/api/host')).json(); } catch {}
     await this.loadProjects();
     await this.loadRecentSessions();
     this.loadTokenUsage();
@@ -128,6 +130,7 @@ class Herd {
     this.setupResize();
     this.setupSearch();
     this.setupAddProject();
+    this.setupFiles();
     this.setupLocalServices();
     this.listenForSummaryUpdates();
     this.refreshLive();
@@ -426,18 +429,209 @@ class Herd {
   setupAddProject() {
     const btn = document.getElementById('add-project-btn');
     if (!btn) return;
+    if (!this.host.native && !this.host.workspace) { btn.hidden = true; return; }
 
     btn.addEventListener('click', async () => {
       if (btn.disabled) return;
       btn.disabled = true;
       try {
-        const res = await fetch('/api/pick-folder', { method: 'POST' });
+        let res;
+        if (this.host.native) {
+          res = await fetch('/api/pick-folder', { method: 'POST' });
+        } else {
+          const name = prompt(`Project folder under ${this.host.workspace}/ (created if missing):`);
+          if (!name) return;
+          res = await fetch('/api/create-project', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name }),
+          });
+          if (!res.ok) { alert(`Could not open project: ${(await res.json().catch(() => ({}))).error || res.status}`); return; }
+        }
         const data = await res.json();
         if (data.cancelled || !data.path) return;
         this.createTab(data.path, data.name);
       } catch {}
       finally { btn.disabled = false; }
     });
+  }
+
+  // ── Files (deployments: what Finder does for a local Herd) ──
+
+  setupFiles() {
+    const btn = document.getElementById('files-btn');
+    if (!btn || !this.host.files) return;
+    btn.hidden = false;
+    btn.addEventListener('click', () => {
+      const tab = this.tabs.get(this.activeTabId);
+      this.showFilesPanel(tab?.projectPath || this.host.workspace);
+    });
+  }
+
+  async uploadFile(dir, name, file) {
+    const res = await fetch(`/api/upload?dir=${encodeURIComponent(dir)}&name=${encodeURIComponent(name)}`, { method: 'PUT', body: file });
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `HTTP ${res.status}`);
+    return (await res.json()).path;
+  }
+
+  // Pasted files — a screenshot, or files copied in Finder. Claude in the
+  // container can't read this machine's clipboard, so they go to
+  // <project>/uploads and their paths are typed, as dragging into iTerm does.
+  async pasteFiles(e, tab) {
+    const files = [...(e.clipboardData?.files || [])];
+    if (!files.length) return;
+    // Rich copies (Excel, Numbers, Keynote) carry an image rendering beside
+    // their text — that's a text paste. Finder copies carry the file names.
+    const text = e.clipboardData.getData('text/plain');
+    if (text && !files.every(f => text.includes(f.name))) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const now = new Date();
+    const stamp = new Date(now - now.getTimezoneOffset() * 60000).toISOString().slice(0, 19).replace(/[-:T]/g, '');
+    const paths = [];
+    for (const [i, f] of files.entries()) {
+      const ext = (f.type.split('/')[1] || 'bin').replace('jpeg', 'jpg');
+      const name = f.name && f.name !== 'image.png' ? f.name : `paste-${stamp}${files.length > 1 ? `-${i + 1}` : ''}.${ext}`;
+      try { paths.push(await this.uploadFile(tab.projectPath, `uploads/${name}`, f)); }
+      catch (err) { console.warn('[herd] paste upload failed', err); }
+    }
+    if (paths.length) tab.terminal.paste(paths.map(p => p.replace(/([^\w@%+=:,./-])/g, '\\$1')).join(' ') + ' ');
+  }
+
+  // Browse a folder, upload through the system file dialog, download a
+  // selection — several entries arrive as one .tar.gz.
+  showFilesPanel(startDir) {
+    document.getElementById('files-popup')?.remove();
+    const overlay = document.createElement('div');
+    overlay.id = 'files-popup';
+    overlay.className = 'usage-overlay';
+    overlay.innerHTML = `
+      <div class="usage-popup files-popup">
+        <div class="files-head">
+          <button class="files-btn" data-act="up" title="Parent folder">&#x2191;</button>
+          <span class="files-path"></span>
+          <button class="files-btn" data-act="close" title="Close">&#x2715;</button>
+        </div>
+        <div class="files-list"></div>
+        <div class="files-actions">
+          <span class="files-status"></span>
+          <button class="files-btn" data-act="upload">Upload files</button>
+          <button class="files-btn" data-act="upload-dir">Upload folder</button>
+          <button class="files-btn" data-act="download" disabled>Download</button>
+        </div>
+        <input type="file" multiple hidden data-input="files">
+        <input type="file" webkitdirectory hidden data-input="dir">
+      </div>`;
+    document.body.appendChild(overlay);
+    const $ = s => overlay.querySelector(s);
+    const status = $('.files-status');
+    const downloadBtn = $('[data-act="download"]');
+    let cwd = startDir, parent = null;
+    const selected = new Set();
+
+    const close = () => { overlay.remove(); document.removeEventListener('keydown', onKey); };
+    const onKey = e => { if (e.key === 'Escape') close(); };
+    document.addEventListener('keydown', onKey);
+    overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
+
+    const fmtSize = n => n < 1024 ? `${n} B` : n < 1048576 ? `${Math.round(n / 1024)} KB` : `${(n / 1048576).toFixed(1)} MB`;
+    const syncSelection = () => {
+      downloadBtn.disabled = !selected.size;
+      downloadBtn.textContent = selected.size > 1 ? `Download ${selected.size}` : 'Download';
+      const all = $('.files-all');
+      if (all) all.checked = selected.size > 0 && selected.size === overlay.querySelectorAll('.files-row input[data-path]').length;
+    };
+    // One path is a plain link; a selection is a form POST, since hundreds of
+    // paths would overflow a URL.
+    const download = paths => {
+      const el = document.createElement(paths.length === 1 ? 'a' : 'form');
+      if (paths.length === 1) {
+        el.href = '/api/download?path=' + encodeURIComponent(paths[0]);
+        el.download = '';
+      } else {
+        // Into a hidden frame: an error response (a vanished file, an expired
+        // login) must not replace the whole page.
+        let frame = document.querySelector('iframe[name="herd-download"]');
+        if (!frame) {
+          frame = Object.assign(document.createElement('iframe'), { name: 'herd-download', hidden: true });
+          document.body.appendChild(frame);
+        }
+        el.target = 'herd-download';
+        el.method = 'POST';
+        el.action = '/api/download';
+        for (const p of paths) el.append(Object.assign(document.createElement('input'), { type: 'hidden', name: 'path', value: p }));
+      }
+      document.body.appendChild(el);
+      paths.length === 1 ? el.click() : el.submit();
+      el.remove();
+    };
+
+    const load = async dir => {
+      let data;
+      try {
+        const res = await fetch('/api/files?path=' + encodeURIComponent(dir));
+        if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `HTTP ${res.status}`);
+        data = await res.json();
+      } catch (err) { status.textContent = `Can't open ${dir}: ${err.message}`; return; }
+      cwd = data.path;
+      parent = data.parent;
+      selected.clear();
+      $('.files-path').textContent = cwd;
+      $('[data-act="up"]').disabled = !parent;
+      const join = name => (cwd.endsWith('/') ? cwd : cwd + '/') + name;
+      $('.files-list').innerHTML = data.entries.length ? `
+        <label class="files-row files-row-head"><input type="checkbox" class="files-all"><span>Name</span><span>Size</span></label>
+        ${data.entries.map(e => `
+          <div class="files-row">
+            <input type="checkbox" data-path="${this.esc(join(e.name))}">
+            <span class="files-name${e.dir ? ' is-dir' : ''}" data-path="${this.esc(join(e.name))}" data-dir="${e.dir}">${this.esc(e.name)}${e.dir ? '/' : ''}</span>
+            <span class="files-size">${e.dir ? '' : fmtSize(e.size)}</span>
+          </div>`).join('')}`
+        : '<div class="files-empty">Empty folder</div>';
+      syncSelection();
+    };
+
+    overlay.addEventListener('change', e => {
+      const t = e.target;
+      if (t.classList.contains('files-all')) {
+        overlay.querySelectorAll('.files-row input[data-path]').forEach(cb => {
+          cb.checked = t.checked;
+          t.checked ? selected.add(cb.dataset.path) : selected.delete(cb.dataset.path);
+        });
+      } else if (t.dataset.path) {
+        t.checked ? selected.add(t.dataset.path) : selected.delete(t.dataset.path);
+      } else if (t.dataset.input) {
+        upload([...t.files]);
+        t.value = '';
+        return;
+      }
+      syncSelection();
+    });
+    overlay.addEventListener('click', e => {
+      const name = e.target.closest('.files-name');
+      if (name) return name.dataset.dir === 'true' ? load(name.dataset.path) : download([name.dataset.path]);
+      const act = e.target.closest('[data-act]')?.dataset.act;
+      if (act === 'close') close();
+      else if (act === 'up' && parent) load(parent);
+      else if (act === 'upload') $('[data-input="files"]').click();
+      else if (act === 'upload-dir') $('[data-input="dir"]').click();
+      else if (act === 'download' && selected.size) download([...selected]);
+    });
+
+    const upload = async files => {
+      if (!files.length) return;
+      const dest = cwd; // fixed for the batch: browsing on mid-upload must not move it
+      let done = 0, failed = 0;
+      for (const f of files) {
+        status.textContent = `Uploading ${done + failed + 1}/${files.length}…`;
+        try { await this.uploadFile(dest, f.webkitRelativePath || f.name, f); done++; }
+        catch { failed++; }
+      }
+      await load(cwd);
+      status.textContent = failed ? `${done} uploaded, ${failed} failed` : `${done} uploaded`;
+    };
+
+    load(cwd);
   }
 
   // ── Local services (llama.cpp model server, STT dictation daemon) ──
@@ -560,7 +754,8 @@ class Herd {
           <span class="project-chevron">&#x25B8;</span>
           <span class="project-name" title="${this.esc(p.path)}">${this.esc(this.lastName(p.path))}</span>
           <span class="project-count">${p.sessionCount}</span>
-          ${p.exists ? `<button class="project-finder-btn" title="Reveal in Finder" aria-label="Reveal in Finder">&#x29C9;</button>` : ''}
+          ${p.exists && this.host.native ? `<button class="project-finder-btn" title="Reveal in Finder" aria-label="Reveal in Finder">&#x29C9;</button>` : ''}
+          ${p.exists && this.host.files ? `<button class="project-finder-btn project-files-btn" title="Files" aria-label="Files">&#x21C5;</button>` : ''}
         </div>
         <div class="project-sessions"></div>
       </div>
@@ -602,6 +797,7 @@ class Herd {
         e.stopPropagation();
         const p = btn.closest('.project-item').dataset.path;
         if (!p) return;
+        if (btn.classList.contains('project-files-btn')) return this.showFilesPanel(p);
         try {
           await fetch('/api/open-in-finder', {
             method: 'POST',
@@ -958,6 +1154,7 @@ class Herd {
       clientId: crypto.randomUUID(),
     };
     this.tabs.set(tabId, tab);
+    if (this.host.files) wrapper.addEventListener('paste', e => this.pasteFiles(e, tab), true);
 
     // Buffer-scroll = content growth even at the scrollback cap, where the
     // cursor-line watermark stops moving. Feeds trackTabActivity.
@@ -1947,6 +2144,17 @@ class Herd {
     if (ms < 604800000) return Math.floor(ms / 86400000) + 'd';
     return new Date(d).toLocaleDateString([], { month: 'short', day: 'numeric' });
   }
+}
+
+// Behind HERD_PASSWORD an expired cookie turns every API call into a 401;
+// send the page back to the login form instead of failing silently.
+{
+  const fetch0 = window.fetch.bind(window);
+  window.fetch = async (...args) => {
+    const res = await fetch0(...args);
+    if (res.status === 401) location.href = '/login';
+    return res;
+  };
 }
 
 window.__herd = new Herd();

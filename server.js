@@ -6,6 +6,7 @@ const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
 const { StringDecoder } = require('string_decoder');
+const { pipeline } = require('stream');
 const os = require('os');
 const pty = require('node-pty');
 
@@ -112,8 +113,12 @@ function agentEnv(agent) {
   base.CLICOLOR = '1';
   base.COLORTERM = 'truecolor';
   for (const k of AGENT_API_KEYS) delete base[k];
+  delete base.HERD_PASSWORD;
   if (agent === 'codex'  && process.env.OPENAI_API_KEY)    base.OPENAI_API_KEY    = process.env.OPENAI_API_KEY;
   if (agent === 'claude' && process.env.ANTHROPIC_API_KEY) base.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+  // Subscription token from `claude setup-token` (the deployed Herd's login).
+  // stripAgentSessionEnv drops every CLAUDE* var, so it has to come back here.
+  if (agent === 'claude' && process.env.CLAUDE_CODE_OAUTH_TOKEN) base.CLAUDE_CODE_OAUTH_TOKEN = process.env.CLAUDE_CODE_OAUTH_TOKEN;
   if (agent === 'gemini') Object.assign(base, geminiEnv); // Gemini key lives in ~/.gemini/.env
   if (agent === 'pi') { // pi's openrouter provider reads OPENROUTER_API_KEY from env
     const orKey = localEnv.OPENROUTER_API_KEY || process.env.OPENROUTER_API_KEY;
@@ -138,6 +143,19 @@ const PI_SESSIONS_DIR = path.join(PI_DIR, 'sessions');
 const GROK_HOME = process.env.GROK_HOME || path.join(os.homedir(), '.grok');
 const GROK_SESSIONS_DIR = path.join(GROK_HOME, 'sessions');
 const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// Deployment knobs (Railway: see Dockerfile). All unset locally, which keeps
+// today's behavior: no password, state next to server.js, native folder picker.
+const HOST = process.env.HOST || '127.0.0.1';
+const HERD_PASSWORD = process.env.HERD_PASSWORD || '';
+const HERD_DATA_DIR = process.env.HERD_DATA_DIR || __dirname;
+const HERD_WORKSPACE = process.env.HERD_WORKSPACE ? path.resolve(process.env.HERD_WORKSPACE) : null;
+// Any client that reaches the port can spawn a shell, so a non-loopback bind
+// without a password is refused rather than warned about.
+if (!HERD_PASSWORD && !['127.0.0.1', 'localhost', '::1'].includes(HOST) && process.env.HERD_INSECURE_NO_AUTH !== '1') {
+  console.error(`Refusing to listen on ${HOST} without HERD_PASSWORD (set HERD_INSECURE_NO_AUTH=1 to override).`);
+  process.exit(1);
+}
 
 const app = express();
 const server = http.createServer(app);
@@ -179,20 +197,74 @@ function allowedOriginList() {
   if (process.env.ALLOWED_ORIGINS) {
     return process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim()).filter(Boolean);
   }
-  return [`http://localhost:${PORT}`, `http://127.0.0.1:${PORT}`];
+  const list = [`http://localhost:${PORT}`, `http://127.0.0.1:${PORT}`];
+  // Railway exposes the service's generated domain; a custom domain needs ALLOWED_ORIGINS.
+  if (process.env.RAILWAY_PUBLIC_DOMAIN) list.push(`https://${process.env.RAILWAY_PUBLIC_DOMAIN}`);
+  return list;
 }
 function originAllowed(origin) {
   if (!origin) return true; // curl/CLI send no Origin; 'null' is attacker-reachable (opaque origin) — never allowlist
   return allowedOriginList().some(a => origin === a); // exact match, not startsWith
 }
 
+// Password gate, on only when HERD_PASSWORD is set. Unlike the Origin check it
+// covers clients that send no Origin, so with it on, every route and the WS
+// upgrade need the cookie. The cookie is `<issued unix s>.<hmac>`, keyed off
+// the password: changing the password logs every browser out.
+const AUTH_COOKIE = 'herd_auth';
+const AUTH_MAX_AGE_S = 30 * 24 * 3600;
+const authKey = crypto.createHash('sha256').update(`herd-auth:${HERD_PASSWORD}`).digest();
+const authSig = ts => crypto.createHmac('sha256', authKey).update(String(ts)).digest('base64url');
+function authed(req) {
+  if (!HERD_PASSWORD) return true;
+  const m = new RegExp(`(?:^|;\\s*)${AUTH_COOKIE}=(\\d+)\\.([\\w-]+)`).exec(req.headers.cookie || '');
+  if (!m) return false;
+  const age = Date.now() / 1000 - Number(m[1]);
+  if (!(age >= 0 && age < AUTH_MAX_AGE_S)) return false;
+  const got = Buffer.from(m[2]), want = Buffer.from(authSig(m[1]));
+  return got.length === want.length && crypto.timingSafeEqual(got, want);
+}
+function passwordMatches(given) {
+  const h = s => crypto.createHash('sha256').update(String(s)).digest();
+  return crypto.timingSafeEqual(h(given), h(HERD_PASSWORD));
+}
+// Each failure costs a second. There is deliberately no lockout: a shared cap
+// would let anyone with the URL block your logins, and a per-IP one would mean
+// trusting X-Forwarded-For. A long random password makes guessing pointless.
+
+function loginPage(failed) {
+  return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Herd</title>
+<style>
+  :root { --bg:#fafafa; --fg:#222; --muted:#888; --line:#ccc; --red:#c33; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#1a1a1a; --fg:#ddd; --muted:#777; --line:#444; --red:#e66; } }
+  body { margin:0; min-height:100vh; display:grid; place-items:center; background:var(--bg); color:var(--fg);
+         font:14px ui-monospace, SFMono-Regular, Menlo, monospace; }
+  form { display:flex; flex-direction:column; gap:10px; width:min(280px, calc(100vw - 32px)); }
+  input, button { font:inherit; padding:8px 10px; border:1px solid var(--line); border-radius:4px; background:transparent; color:inherit; }
+  button { cursor:pointer; }
+  .logo { font-size:20px; } .err { color:var(--red); }
+</style></head><body>
+<form method="POST" action="/login">
+  <span class="logo">&gt;_</span>
+  <input type="text" name="username" value="herd" autocomplete="username" hidden>
+  <input type="password" name="password" placeholder="password" autocomplete="current-password" autofocus required>
+  <button type="submit">Sign in</button>
+  ${failed ? '<span class="err">Wrong password</span>' : ''}
+</form></body></html>`;
+}
+
 // B4 + C1: Only upgrade WebSocket on /ws path, and reject disallowed origins.
 server.on('upgrade', (req, socket, head) => {
-  if (new URL(req.url, 'http://localhost').pathname !== '/ws') {
+  // A malformed target (e.g. `//[`) makes new URL throw, and an exception in
+  // this listener would take the server, and every PTY, down with it.
+  let pathname = null;
+  try { pathname = new URL(req.url, 'http://localhost').pathname; } catch {}
+  if (pathname !== '/ws') {
     socket.destroy();
     return;
   }
-  if (!originAllowed(req.headers.origin)) {
+  if (!originAllowed(req.headers.origin) || !authed(req)) {
     socket.destroy();
     return;
   }
@@ -205,6 +277,31 @@ app.use((req, res, next) => {
   res.setHeader('X-Frame-Options', 'DENY');
   next();
 });
+
+// Unauthenticated liveness probe for the Railway healthcheck.
+app.get('/healthz', (req, res) => res.type('text').send('ok'));
+
+if (HERD_PASSWORD) {
+  app.get('/login', (req, res) => {
+    if (authed(req)) return res.redirect(303, '/');
+    res.type('html').send(loginPage(false));
+  });
+  app.post('/login', express.urlencoded({ extended: false, limit: '4kb' }), async (req, res) => {
+    if (!passwordMatches(req.body?.password ?? '')) {
+      await new Promise(r => setTimeout(r, 1000));
+      return res.status(401).type('html').send(loginPage(true));
+    }
+    const ts = Math.floor(Date.now() / 1000);
+    const secure = req.secure || req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : '';
+    res.setHeader('Set-Cookie', `${AUTH_COOKIE}=${ts}.${authSig(ts)}; Path=/; Max-Age=${AUTH_MAX_AGE_S}; HttpOnly; SameSite=Lax${secure}`);
+    res.redirect(303, '/');
+  });
+  app.use((req, res, next) => {
+    if (authed(req)) return next();
+    if (req.method === 'GET' && (req.path === '/' || req.path === '/index.html')) return res.redirect(302, '/login');
+    res.status(401).end();
+  });
+}
 
 // C1b: Origin-check state-changing or expensive/side-effectful routes.
 // Also covers expensive idempotent GETs that would otherwise be
@@ -828,7 +925,9 @@ const AGENTS = {
     bin: claudeBin,
     summaryKey: id => id, // plain id for backward compat with old caches
     launch(resume) {
-      const flags = `--settings '{"sandbox":{"enabled":true}}'`;
+      // In a container the sandbox would need bubblewrap and user namespaces,
+      // which Railway doesn't grant; the container is the boundary there.
+      const flags = process.env.HERD_CLAUDE_SANDBOX === '0' ? '' : `--settings '{"sandbox":{"enabled":true}}'`;
       return resume ? `${claudeBin} ${flags} --resume ${resume}` : `${claudeBin} ${flags}`;
     },
     snapshotKeys({ encodedDir }) {
@@ -1137,7 +1236,8 @@ function readSessionInfo(jsonlPath) {
 
 // --- Haiku summaries ---
 
-const SUMMARY_CACHE_PATH = path.join(__dirname, 'summaries.json');
+const SUMMARY_CACHE_PATH = path.join(HERD_DATA_DIR, 'summaries.json');
+try { fs.mkdirSync(HERD_DATA_DIR, { recursive: true }); } catch {}
 let summaryCache = {};
 try { summaryCache = JSON.parse(fs.readFileSync(SUMMARY_CACHE_PATH, 'utf8')); } catch {}
 
@@ -1879,8 +1979,9 @@ app.get('/api/projects', (req, res) => {
     // summaries were pruned and re-generated (real Haiku calls) on every load.
     const allSessionKeys = new Set();
 
-    // Claude projects from ~/.claude/projects/
-    const dirs = fs.readdirSync(PROJECTS_DIR).filter(d => {
+    // Claude projects from ~/.claude/projects/ (absent until the first session
+    // on a fresh HOME, e.g. a new deployment's volume)
+    const dirs = readdirSafe(PROJECTS_DIR).filter(d => {
       try { return fs.statSync(path.join(PROJECTS_DIR, d)).isDirectory(); }
       catch { return false; }
     });
@@ -2164,6 +2265,104 @@ function serveSessions(res, projectPath) {
   // Background: generate missing summaries
   generateMissingSummaries(sessions).catch(() => {});
 }
+
+// The folder picker and Finder reveal are macOS-only. Elsewhere (the Railway
+// container) projects are folders under HERD_WORKSPACE, named in the browser.
+app.get('/api/host', (req, res) => {
+  res.json({ native: process.platform === 'darwin', workspace: HERD_WORKSPACE, files: Boolean(HERD_WORKSPACE) });
+});
+
+// Files panel (deployments only, with HERD_WORKSPACE): list, upload, download —
+// what Finder does for a local Herd. The roots are not a security boundary
+// (whoever has the password has a shell); they keep a typo from serving /proc.
+if (HERD_WORKSPACE) {
+  const realOr = p => { try { return fs.realpathSync(p); } catch { return null; } };
+  const FILE_ROOTS = [HERD_WORKSPACE, os.homedir(), os.tmpdir()].map(realOr).filter(Boolean);
+  const UPLOAD_MAX_BYTES = 500 * 1024 * 1024;
+  const inRoots = p => FILE_ROOTS.some(r => p === r || p.startsWith(r + path.sep));
+  // An existing absolute path inside the roots, symlinks resolved; else null.
+  const filePath = p => {
+    if (typeof p !== 'string' || !path.isAbsolute(p)) return null;
+    const real = realOr(p);
+    return real && inRoots(real) ? real : null;
+  };
+
+  app.get('/api/files', (req, res) => {
+    const dir = filePath(req.query.path);
+    if (!dir) return res.status(404).json({ error: 'not found' });
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+    catch (e) { return res.status(400).json({ error: e.code || e.message }); }
+    const list = entries.map(e => {
+      let st = null;
+      try { st = fs.statSync(path.join(dir, e.name)); } catch {}
+      return { name: e.name, dir: Boolean(st?.isDirectory()), size: st?.size ?? 0, mtime: st?.mtimeMs ?? 0 };
+    }).sort((a, b) => (b.dir - a.dir) || a.name.localeCompare(b.name));
+    res.json({ path: dir, parent: inRoots(path.dirname(dir)) && dir !== path.dirname(dir) ? path.dirname(dir) : null, entries: list });
+  });
+
+  // One file per request, raw body: `name` may carry subfolders (a folder
+  // upload). Never overwrites — a taken name becomes "name (1).ext".
+  app.put('/api/upload', (req, res) => {
+    const dir = filePath(req.query.dir);
+    const parts = String(req.query.name || '').split('/').filter(Boolean);
+    if (!dir || !parts.length || parts.some(s => s === '.' || s === '..')) return res.status(400).json({ error: 'bad target' });
+    const len = Number(req.headers['content-length']);
+    if (!(len >= 0)) return res.status(411).json({ error: 'length required' });
+    if (len > UPLOAD_MAX_BYTES) return res.status(413).json({ error: 'too large' });
+    const parent = path.join(dir, ...parts.slice(0, -1));
+    try { fs.mkdirSync(parent, { recursive: true }); } catch (e) { return res.status(500).json({ error: e.code }); }
+    if (!filePath(parent)) return res.status(400).json({ error: 'bad target' });
+    const { name, ext } = path.parse(parts.at(-1));
+    let target = path.join(parent, parts.at(-1));
+    for (let i = 1; fs.existsSync(target); i++) target = path.join(parent, `${name} (${i})${ext}`);
+    const out = fs.createWriteStream(target, { flags: 'wx' });
+    out.on('error', e => { if (!res.headersSent) res.status(500).json({ error: e.code }); });
+    out.on('finish', () => res.json({ path: target }));
+    req.on('close', () => { if (!req.complete) { out.destroy(); fs.rm(target, () => {}); } });
+    req.pipe(out);
+  });
+
+  // One file downloads as itself; a folder or several entries stream as one
+  // .tar.gz, paths relative to their common parent. GET for a single link,
+  // POST for a selection (a query string tops out around 250 paths).
+  const download = (req, res) => {
+    const paths = [].concat(req.body?.path ?? req.query.path ?? []).map(filePath);
+    if (!paths.length || paths.includes(null)) return res.status(404).end();
+    const st = paths.length === 1 ? fs.statSync(paths[0]) : null;
+    if (st?.isFile()) {
+      // Streamed by hand: res.download's send() 404s dotfiles (.env, .gitignore).
+      res.attachment(path.basename(paths[0]));
+      res.setHeader('Content-Length', st.size);
+      return pipeline(fs.createReadStream(paths[0]), res, () => {}); // closes the file on abort
+    }
+    let base = path.dirname(paths[0]);
+    while (!paths.every(p => p.startsWith(base === path.sep ? base : base + path.sep))) base = path.dirname(base);
+    res.attachment(`${paths.length === 1 ? path.basename(paths[0]) : (path.basename(base) || 'files')}.tar.gz`);
+    const tar = spawn('tar', ['-czf', '-', '-C', base, ...paths.map(p => './' + path.relative(base, p))],
+      { stdio: ['ignore', 'pipe', 'pipe'] });
+    // Unread, tar's warnings fill the pipe and stall it. Exit 1 is "file
+    // changed as we read it" (the archive is whole); anything worse aborts the
+    // response, so the browser shows a failed download, not a truncated one.
+    tar.stderr.resume();
+    tar.stdout.pipe(res, { end: false });
+    tar.on('error', () => res.destroy());
+    tar.on('close', code => (code === 0 || code === 1 ? res.end() : res.destroy()));
+    res.on('close', () => tar.kill());
+  };
+  app.get('/api/download', download);
+  app.post('/api/download', express.urlencoded({ extended: false, limit: '8mb', parameterLimit: 100000 }), download);
+}
+app.post('/api/create-project', express.json(), (req, res) => {
+  if (!HERD_WORKSPACE) return res.status(404).json({ error: 'no workspace' });
+  const name = typeof req.body?.name === 'string' ? req.body.name.trim().replace(/^\/+|\/+$/g, '') : '';
+  if (!/^[\w.-]+(\/[\w.-]+)*$/.test(name) || name.split('/').some(s => /^\.+$/.test(s))) {
+    return res.status(400).json({ error: 'invalid name' });
+  }
+  const dir = path.join(HERD_WORKSPACE, name);
+  try { fs.mkdirSync(dir, { recursive: true }); } catch (e) { return res.status(500).json({ error: e.message }); }
+  res.json({ path: dir, name: getProjectName(dir) });
+});
 
 // C1b: POST (state-changing: invokes osascript to pop a native dialog).
 // The generic middleware above origin-checks all non-GET requests.
@@ -3275,7 +3474,6 @@ process.on('SIGINT', cleanup);
 process.on('SIGTERM', cleanup);
 
 // S1: Bind to localhost only — no auth, so don't expose on all interfaces
-const HOST = process.env.HOST || '127.0.0.1';
 server.listen(PORT, HOST, () => {
   console.log(`\n  Herd → http://${HOST}:${PORT}\n`);
 });

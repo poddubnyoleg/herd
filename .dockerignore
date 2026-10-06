@@ -1,0 +1,15 @@
+# COPY . . would otherwise bake local state and secrets into the image.
+node_modules
+.git
+.claude
+.env
+.env.*
+summaries.json
+groups.json
+server.log
+test
+test-gemini*.js
+security-audit
+docs
+vendor-patches
+*.md
