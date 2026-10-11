@@ -274,6 +274,7 @@ function loginPage(failed) {
   form { display:flex; flex-direction:column; gap:10px; width:min(280px, calc(100vw - 32px)); }
   input, button { font:inherit; padding:8px 10px; border:1px solid var(--line); border-radius:4px; background:transparent; color:inherit; }
   button { cursor:pointer; }
+  @media (pointer: coarse) { input, button { font-size:16px; } } /* iOS zooms into fields under 16px */
   .logo { font-size:20px; } .err { color:var(--red); }
 </style></head><body>
 <form method="POST" action="/login">

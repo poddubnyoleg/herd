@@ -48,18 +48,28 @@
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
 
+html { -webkit-text-size-adjust: 100%; touch-action: manipulation; }
+
 body {
   background: var(--bg);
   color: var(--text);
   font-family: 'JetBrains Mono', 'Fira Code', 'SF Mono', 'Cascadia Code', Menlo, Monaco, 'Courier New', monospace;
   font-size: 13px;
-  height: 100vh;
+  height: 100dvh;
   overflow: hidden;
+  overscroll-behavior: none;
 }
 
+/* --app-top/--app-height track the visual viewport on touch devices
+   (setupViewport): an on-screen keyboard shrinks only that, so a 100dvh
+   layout would leave the terminal's input line under the keyboard. */
 #app {
   display: flex;
-  height: 100vh;
+  position: fixed;
+  left: 0;
+  right: 0;
+  top: var(--app-top, 0px);
+  height: var(--app-height, 100dvh);
 }
 
 /* ── Sidebar ── */
@@ -336,11 +346,16 @@ body {
   border-radius: 50%;
   background: var(--green);
 }
+/* Out of flow, in place of the date on hover: hidden, it must not push
+   the date column of running rows left */
 .session-kill {
-  margin-left: auto;
-  padding: 0 2px;
+  position: absolute;
+  right: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  padding: 2px 4px;
   border: none;
-  background: none;
+  background: inherit; /* the row's: covers a name that runs under it */
   color: var(--text-muted);
   font-size: 12px;
   line-height: 1;
@@ -348,6 +363,9 @@ body {
   opacity: 0;
 }
 .session-item:hover .session-kill { opacity: 1; }
+@media (hover: hover) {
+  .session-item.running:hover .session-date { visibility: hidden; }
+}
 .session-kill:hover { color: var(--red); }
 
 .session-date {
@@ -623,7 +641,7 @@ body {
   background: rgba(248, 81, 73, 0.1);
 }
 
-#new-tab-btn, #files-btn {
+#menu-btn, #new-tab-btn, #files-btn {
   background: none;
   border: none;
   border-left: 1px solid var(--border);
@@ -638,10 +656,12 @@ body {
   transition: color 0.1s, background 0.1s;
 }
 
-#new-tab-btn:hover, #files-btn:hover {
+#menu-btn:hover, #new-tab-btn:hover, #files-btn:hover {
   color: var(--accent);
   background: var(--bg-hover);
 }
+
+#menu-btn { display: none; border-left: none; border-right: 1px solid var(--border); }
 
 /* ── Terminal ── */
 
@@ -703,6 +723,7 @@ body {
 .xterm .xterm-viewport {
   overflow-y: scroll !important;
   scrollbar-width: thin;
+  overscroll-behavior: contain;
 }
 .xterm-viewport::-webkit-scrollbar { width: 8px; }
 .xterm-viewport::-webkit-scrollbar-track { background: var(--bg); }
@@ -764,7 +785,7 @@ body {
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 20px 24px;
-  width: 360px;
+  width: min(360px, calc(100vw - 32px));
   max-height: 80vh;
   overflow-y: auto;
 }
@@ -972,3 +993,109 @@ body {
 .pw-input { font: inherit; font-size: 12px; padding: 7px 9px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg); color: var(--text); }
 .pw-input:focus { outline: none; border-color: var(--accent); }
 .pw-note { font-size: 11px; color: var(--text-muted); }
+
+/* ── Terminal key bar (touch) ──
+   Keys a phone keyboard lacks. Shown on touch devices while a terminal is
+   open; it sits at the bottom of #app, so above the on-screen keyboard. */
+
+#keybar { display: none; }
+
+#keybar {
+  gap: 4px;
+  padding: 4px;
+  background: var(--bg-alt);
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+#keybar button {
+  flex: 1 1 0;
+  min-width: 0;
+  height: 36px;
+  font-family: inherit;
+  font-size: 13px;
+  color: var(--text-dim);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+
+#keybar button:active { background: var(--bg-active); }
+#keybar button.on { color: var(--accent); border-color: var(--accent); }
+#keybar button[hidden] { display: none; }
+#keybar .keybar-wide { flex-grow: 1.6; }
+
+/* ── Touch ── */
+
+@media (pointer: coarse) {
+  #terminal-area.has-tabs ~ #keybar { display: flex; }
+
+  /* No hover: show what is otherwise revealed on hover */
+  .project-finder-btn { opacity: 1; padding: 4px 8px; font-size: 15px; }
+  .session-kill { position: static; transform: none; margin-left: auto; opacity: 1; padding: 4px 8px; font-size: 16px; }
+  /* ✕ kills the session: only on the active tab, where a stray tap meant
+     to switch tabs cannot reach it */
+  .tab-close { padding: 6px; font-size: 16px; }
+  .tab:not(.active) .tab-close { display: none; }
+
+  /* Touch-sized targets */
+  #tab-bar { min-height: 40px; }
+  .tab { height: 40px; font-size: 12px; max-width: 180px; }
+  #menu-btn, #new-tab-btn, #files-btn { height: 40px; padding: 0 14px; font-size: 18px; }
+  #add-project-btn, #refresh-btn, .local-svc-btn { padding: 6px 10px; }
+  .usage-badge { padding: 6px 8px; }
+  .project-header { padding: 11px 16px; font-size: 14px; }
+  .session-item { padding: 9px 16px 9px 36px; font-size: 13px; }
+  .recent-project-label { font-size: 11px; max-width: 80px; }
+  .session-date { font-size: 11px; }
+  .new-session-btn { padding: 7px 12px; font-size: 13px; }
+  .theme-btn, .footer-btn { padding: 9px 0; font-size: 12px; }
+  .files-row { padding: 8px; font-size: 13px; }
+  .files-btn { padding: 8px 12px; font-size: 13px; }
+
+  /* iOS zooms the page into any focused field under 16px */
+  #project-search, .pw-input { font-size: 16px; padding: 8px 10px; }
+  .xterm .xterm-helper-textarea { font-size: 16px; }
+}
+
+/* ── Narrow screens: the sidebar becomes a drawer ──
+   Keep in sync with Herd.NARROW in app.js. */
+
+@media (max-width: 760px), (pointer: coarse) and (max-height: 500px) {
+  #menu-btn { display: block; }
+  #resize-handle { display: none; }
+
+  /* Within the visual viewport, like #app: with the keyboard up for the
+     project filter, the bottom of the list must stay reachable */
+  #sidebar {
+    position: fixed;
+    top: var(--app-top, 0px);
+    height: var(--app-height, 100dvh);
+    left: 0;
+    z-index: 50;
+    width: min(320px, 85vw) !important;
+    transform: translateX(-100%);
+    transition: transform 0.2s ease;
+  }
+
+  body.sidebar-open #sidebar {
+    transform: none;
+    box-shadow: 0 0 24px rgba(0, 0, 0, 0.4);
+  }
+
+  #sidebar-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 40;
+    background: rgba(0, 0, 0, 0.45);
+    display: none;
+  }
+
+  body.sidebar-open #sidebar-backdrop { display: block; }
+
+  #empty-state { cursor: pointer; }
+  .model-detail { grid-template-columns: repeat(2, 1fr); }
+}

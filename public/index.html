@@ -3,6 +3,9 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Herd">
   <title>&#8203;</title>
   <link rel="icon" media="(prefers-color-scheme: light)" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90' fill='black'>%3E_</text></svg>">
   <link rel="icon" media="(prefers-color-scheme: dark)" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90' fill='white'>%3E_</text></svg>">
@@ -30,13 +33,27 @@
       </div>
     </aside>
     <div id="resize-handle"></div>
+    <div id="sidebar-backdrop"></div>
     <main id="main">
       <div id="tab-bar">
+        <button id="menu-btn" title="Projects" aria-label="Projects">&#x2630;</button>
         <div id="tabs"></div>
         <button id="new-tab-btn" title="New session in active project (Ctrl+T)">+</button>
         <button id="files-btn" title="Files in the active project" hidden>&#x21C5;</button>
       </div>
       <div id="terminal-area"></div>
+      <div id="keybar">
+        <button data-key="esc">esc</button>
+        <button data-key="tab" aria-label="Tab">&#x21E5;</button>
+        <button data-key="backtab" aria-label="Shift+Tab">&#x21E7;&#x21E5;</button>
+        <button data-key="ctrl" aria-label="Ctrl, applies to the next key">ctrl</button>
+        <button data-key="left" aria-label="Left">&#x2190;</button>
+        <button data-key="up" aria-label="Up">&#x2191;</button>
+        <button data-key="down" aria-label="Down">&#x2193;</button>
+        <button data-key="right" aria-label="Right">&#x2192;</button>
+        <button data-key="enter" aria-label="Enter">&#x23CE;</button>
+        <button data-key="paste" class="keybar-wide">paste</button>
+      </div>
       <div id="empty-state">
         <div class="empty-content">
           <pre class="ascii-logo">

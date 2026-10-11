@@ -39,6 +39,9 @@ class Herd {
     return out.join('\n');
   }
 
+  // Below this the sidebar is a drawer. Keep in sync with style.css.
+  static NARROW = '(max-width: 760px), (pointer: coarse) and (max-height: 500px)';
+
   static THEMES = {
     dark: {
       background: '#0a0e14',
@@ -102,6 +105,9 @@ class Herd {
     this.grokAvailable = false;
     this.live = [];
     this.host = { native: true, workspace: null }; // see /api/host
+    this.narrow = window.matchMedia(Herd.NARROW);
+    this.touch = window.matchMedia('(pointer: coarse)');
+    this._ctrlArmed = false; // key bar's sticky ctrl
     // Diagnostic ring buffer for the unread/finished pipeline. Dump with
     // __herd.dumpLog() in the console when tabs pulse green spuriously.
     this._log = [];
@@ -122,11 +128,13 @@ class Herd {
     // which build the browser actually loaded after a fix.
     console.log('[herd] build 2026-10-03 — sessions outlive their viewer');
     this.initTheme();
+    this.setupMobile();
     try { this.host = await (await fetch('/api/host')).json(); } catch {}
     await this.loadProjects();
     await this.loadRecentSessions();
     this.loadTokenUsage();
     this.restoreTabState();
+    if (this.narrow.matches && !this.tabs.size) this.toggleSidebar(true);
     this.setupResize();
     this.setupSearch();
     this.setupAddProject();
@@ -1139,6 +1147,7 @@ class Herd {
   // opening this tab may displace another window's viewer — true for every
   // user click, false for automatic restores.
   createTab(projectPath, name, resumeId, agent = 'claude', { termId = null, steal = true, connectDelay = 0 } = {}) {
+    this.toggleSidebar(false);
     // Don't open a session or terminal twice: a second tab would attach a
     // second viewer and show "opened elsewhere" on the tab that owns it.
     if (resumeId || termId) {
@@ -1267,6 +1276,13 @@ class Herd {
 
     // Register terminal I/O handlers once (they reference tab.ws dynamically)
     terminal.onData(data => {
+      // Sticky ctrl from the key bar applies to the next typed character.
+      // ESC-prefixed data (focus reports, arrows) passes through and leaves
+      // it armed: tapping the terminal to raise the keyboard sends one.
+      if (this._ctrlArmed && !data.startsWith('\x1b')) {
+        if (/^[a-zA-Z@[\\\]^_ ]$/.test(data)) data = String.fromCharCode(data.charCodeAt(0) & 0x1f);
+        this.armCtrl(false);
+      }
       // First keystroke since (re)connect: only now can this session start
       // real work, so only now may it later earn the green finished pulse.
       // onData also carries data the user never typed — focus reports
@@ -1391,7 +1407,7 @@ class Herd {
       } else {
         this.connectWebSocket(tab);
       }
-      if (this.activeTabId === tabId) terminal.focus();
+      if (this.activeTabId === tabId && !this.touch.matches) terminal.focus();
     });
     return tabId;
   }
@@ -1855,9 +1871,11 @@ class Herd {
         this.fitTab(tab);
         tab.terminal.scrollToBottom();
         this.syncViewport(tab.terminal);
-        tab.terminal.focus();
+        // On touch, focus raises the keyboard over what you came to read
+        if (!this.touch.matches) tab.terminal.focus();
       });
     }
+    this.armCtrl(false);
     this.renderTabs();
     // F8: Highlight active project in sidebar
     this.highlightActiveProject();
@@ -1916,6 +1934,7 @@ class Herd {
         this.activeTabId = null;
         document.getElementById('terminal-area').classList.remove('has-tabs');
         document.getElementById('empty-state').classList.remove('hidden');
+        if (this.narrow.matches) this.toggleSidebar(true);
       }
     }
     this.renderTabs();
@@ -2167,6 +2186,91 @@ class Herd {
       // P3: Persist sidebar width
       localStorage.setItem('herd-sidebar-width', parseInt(sidebar.style.width));
     });
+  }
+
+  // ── Mobile ──
+
+  setupMobile() {
+    document.getElementById('menu-btn').addEventListener('click', () => this.toggleSidebar());
+    document.getElementById('sidebar-backdrop').addEventListener('click', () => this.toggleSidebar(false));
+    document.getElementById('empty-state').addEventListener('click', () => {
+      if (this.narrow.matches) this.toggleSidebar(true);
+    });
+    this.narrow.addEventListener('change', () => this.toggleSidebar(false));
+    this.setupViewport();
+    this.setupKeybar();
+  }
+
+  // The drawer is a body class; outside the narrow layout it does nothing.
+  toggleSidebar(open = !document.body.classList.contains('sidebar-open')) {
+    document.body.classList.toggle('sidebar-open', open);
+    // A focused terminal would keep the on-screen keyboard over the drawer
+    if (open) document.activeElement?.blur?.();
+  }
+
+  // An on-screen keyboard shrinks only the visual viewport (iOS, and Android
+  // by default), and the browser pans that viewport to the focused field.
+  // Pin #app and the drawer to the visible area so the terminal refits
+  // above the keyboard rather than running under it. Resizing the layout
+  // instead (interactive-widget=resizes-content) would also change the
+  // height media queries, flipping a landscape tablet into the drawer
+  // layout whenever the keyboard opens.
+  setupViewport() {
+    const vv = window.visualViewport;
+    if (!vv || !this.touch.matches) return;
+    const style = document.documentElement.style;
+    const apply = () => {
+      if (Math.abs(vv.scale - 1) > 0.01) return; // pinch zoom, not a keyboard
+      style.setProperty('--app-height', `${vv.height}px`);
+      style.setProperty('--app-top', `${vv.offsetTop}px`);
+    };
+    vv.addEventListener('resize', apply);
+    vv.addEventListener('scroll', apply);
+    apply();
+  }
+
+  // Keys a phone keyboard lacks. Sent as if typed — through onData — so the
+  // input gate, sticky ctrl, and scroll-to-bottom work as for real keys.
+  setupKeybar() {
+    const bar = document.getElementById('keybar');
+    const seqs = { esc: '\x1b', tab: '\t', backtab: '\x1b[Z', enter: '\r' };
+    const arrows = { up: 'A', down: 'B', right: 'C', left: 'D' };
+    const press = async key => {
+      const tab = this.tabs.get(this.activeTabId);
+      if (!tab) return;
+      if (key === 'ctrl') return this.armCtrl(!this._ctrlArmed);
+      this.armCtrl(false); // ctrl modifies typed characters only
+      if (key === 'paste') {
+        try { tab.terminal.paste(await navigator.clipboard.readText()); } catch {}
+        return;
+      }
+      // Arrows follow the app's cursor-key mode (DECCKM), as xterm's own do
+      const data = seqs[key] ?? `\x1b${tab.terminal.modes.applicationCursorKeysMode ? 'O' : '['}${arrows[key]}`;
+      // Private API: xterm is vendored and pinned, and 5.3 has no public way
+      // to inject input as user input
+      tab.terminal._core.coreService.triggerDataEvent(data, true);
+    };
+    for (const btn of bar.querySelectorAll('button')) {
+      // Cancelling touchstart/mousedown keeps focus in the terminal, so the
+      // keyboard stays up. Act on touchend: a clipboard read needs user
+      // activation, which touchstart does not grant. A touch that slid off
+      // the key is not a press (a brushed ⏎ would submit a half-typed prompt).
+      btn.addEventListener('touchstart', e => e.preventDefault(), { passive: false });
+      btn.addEventListener('touchend', e => {
+        e.preventDefault();
+        const t = e.changedTouches[0];
+        if (document.elementFromPoint(t.clientX, t.clientY)?.closest('button') === btn) press(btn.dataset.key);
+      });
+      btn.addEventListener('mousedown', e => e.preventDefault());
+      btn.addEventListener('click', () => press(btn.dataset.key));
+    }
+    // navigator.clipboard exists only in secure contexts (https, localhost)
+    if (!navigator.clipboard?.readText) bar.querySelector('[data-key="paste"]').hidden = true;
+  }
+
+  armCtrl(on) {
+    this._ctrlArmed = on;
+    document.querySelector('#keybar [data-key="ctrl"]').classList.toggle('on', on);
   }
 
   // ── Helpers ──
