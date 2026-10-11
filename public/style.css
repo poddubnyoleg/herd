@@ -641,7 +641,7 @@ body {
   background: rgba(248, 81, 73, 0.1);
 }
 
-#menu-btn, #new-tab-btn, #files-btn {
+#menu-btn, #new-tab-btn, #files-btn, #mic-btn {
   background: none;
   border: none;
   border-left: 1px solid var(--border);
@@ -656,7 +656,7 @@ body {
   transition: color 0.1s, background 0.1s;
 }
 
-#menu-btn:hover, #new-tab-btn:hover, #files-btn:hover {
+#menu-btn:hover, #new-tab-btn:hover, #files-btn:hover, #mic-btn:hover {
   color: var(--accent);
   background: var(--bg-hover);
 }
@@ -1029,6 +1029,20 @@ body {
 #keybar button[hidden] { display: none; }
 #keybar .keybar-wide { flex-grow: 1.6; }
 
+/* Dictation: tab bar on desktop, key bar on touch. Red while recording,
+   pulsing accent while the mic opens or the text is on its way. */
+#mic-btn[hidden] { display: none; }
+/* An icon needs less than a word; an 11th key still fits "ctrl" at 360px */
+#keybar [data-key="mic"] { flex-grow: 0.8; }
+@media (max-width: 380px) { #keybar button { font-size: 11px; } }
+#mic-btn svg, #keybar svg { display: block; margin: auto; }
+#mic-btn.recording, #keybar button.recording { color: var(--red); }
+#keybar button.recording { border-color: var(--red); }
+#mic-btn.busy, #keybar button.busy { color: var(--accent); }
+#mic-btn.recording, #mic-btn.busy, #keybar button.recording, #keybar button.busy {
+  animation: local-svc-pulse 1.2s ease-in-out infinite;
+}
+
 /* Text view: a terminal's buffer as plain text, for native touch selection */
 
 .text-view {
@@ -1095,6 +1109,8 @@ body {
   #tab-bar { min-height: 40px; }
   .tab { height: 40px; font-size: 12px; max-width: 180px; }
   #menu-btn, #new-tab-btn, #files-btn { height: 40px; padding: 0 14px; font-size: 18px; }
+  /* The key bar carries its own */
+  #mic-btn { display: none; }
   #add-project-btn, #refresh-btn, .local-svc-btn { padding: 6px 10px; }
   .usage-badge { padding: 6px 8px; }
   .project-header { padding: 11px 16px; font-size: 14px; }

@@ -142,6 +142,7 @@ class Herd {
     this.setupSearch();
     this.setupAddProject();
     this.setupFiles();
+    this.setupDictation();
     this.setupPassword();
     this.setupLocalServices();
     this.listenForSummaryUpdates();
@@ -698,6 +699,95 @@ class Herd {
     };
 
     load(cwd);
+  }
+
+  // ── Dictation (wherever the server has OPENAI_API_KEY) ──
+  // Click to record, click again to transcribe. The text is pasted into the
+  // terminal active at the stop, as the hotkey daemon pastes into the focused
+  // app; nothing is submitted.
+
+  setupDictation() {
+    if (!this.host.stt || !window.MediaRecorder || !navigator.mediaDevices?.getUserMedia) return;
+    const btn = document.getElementById('mic-btn');
+    btn.hidden = false;
+    document.querySelector('#keybar [data-key="mic"]').hidden = false;
+    btn.addEventListener('mousedown', e => e.preventDefault()); // focus stays in the terminal
+    btn.addEventListener('click', () => this.toggleDictation());
+  }
+
+  async toggleDictation() {
+    const d = this._dictation;
+    if (d) {
+      // While the mic opens or the text is on its way, a click does nothing
+      if (d.recorder?.state === 'recording') d.recorder.stop();
+      return;
+    }
+    if (!this.tabs.get(this.activeTabId)) return;
+    const state = this._dictation = {};
+    this.showDictation('opening');
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // Chrome and Firefox record Opus in WebM, Safari AAC in MP4. 32 kbps
+      // keeps the API's 25 MB cap ~100 minutes away.
+      const mimeType = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/ogg;codecs=opus'].find(t => MediaRecorder.isTypeSupported(t));
+      const recorder = new MediaRecorder(stream, { mimeType, audioBitsPerSecond: 32000 });
+      const chunks = [];
+      recorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+      recorder.onstop = async () => {
+        stream.getTracks().forEach(t => t.stop()); // turns the mic indicator off
+        clearTimeout(state.timer);
+        const targetId = this.activeTabId;
+        const blob = new Blob(chunks, { type: recorder.mimeType || chunks[0]?.type || '' });
+        // A double tap, not a dictation
+        if (Date.now() - state.started < 500 || !blob.size) return this.endDictation();
+        state.recorder = null;
+        this.showDictation('transcribing');
+        const text = await this.transcribe(blob);
+        const tab = this.tabs.get(targetId) || this.tabs.get(this.activeTabId);
+        if (text && tab) tab.terminal.paste(text);
+        this.endDictation();
+      };
+      recorder.start();
+      state.recorder = recorder;
+      state.started = Date.now();
+      state.timer = setTimeout(() => recorder.state === 'recording' && recorder.stop(), 15 * 60 * 1000);
+      this.showDictation('recording');
+    } catch (err) {
+      stream?.getTracks().forEach(t => t.stop());
+      this.endDictation();
+      alert(`Microphone unavailable: ${err.message}`);
+    }
+  }
+
+  // A failed request keeps the recording until the user gives up on it
+  async transcribe(blob) {
+    for (;;) {
+      try {
+        const res = await fetch('/api/transcribe', { method: 'POST', headers: { 'Content-Type': blob.type }, body: blob });
+        if (res.status === 401) return ''; // on its way to /login
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+        return data.text;
+      } catch (err) {
+        if (!confirm(`Transcription failed: ${err.message}\n\nRetry? Cancel discards the recording.`)) return '';
+      }
+    }
+  }
+
+  endDictation() {
+    this._dictation = null;
+    this.showDictation('');
+  }
+
+  showDictation(phase) {
+    const btn = document.getElementById('mic-btn');
+    for (const b of [btn, document.querySelector('#keybar [data-key="mic"]')]) {
+      b.classList.toggle('recording', phase === 'recording');
+      b.classList.toggle('busy', phase === 'opening' || phase === 'transcribing');
+    }
+    btn.title = { opening: 'Opening the microphone…', recording: 'Recording — click to transcribe', transcribing: 'Transcribing…' }[phase]
+      || 'Dictate into the active terminal';
   }
 
   // ── Local services (llama.cpp model server, STT dictation daemon) ──
@@ -2372,6 +2462,7 @@ class Herd {
         try { tab.terminal.paste(await navigator.clipboard.readText()); } catch {}
         return;
       }
+      if (key === 'mic') return this.toggleDictation();
       // Arrows follow the app's cursor-key mode (DECCKM), as xterm's own do
       const data = seqs[key] ?? `\x1b${tab.terminal.modes.applicationCursorKeysMode ? 'O' : '['}${arrows[key]}`;
       // Private API: xterm is vendored and pinned, and 5.3 has no public way

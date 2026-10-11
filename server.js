@@ -2299,7 +2299,59 @@ function serveSessions(res, projectPath) {
 // The folder picker and Finder reveal are macOS-only. Elsewhere (the Railway
 // container) projects are folders under HERD_WORKSPACE, named in the browser.
 app.get('/api/host', (req, res) => {
-  res.json({ native: process.platform === 'darwin', workspace: HERD_WORKSPACE, files: Boolean(HERD_WORKSPACE), password: Boolean(HERD_PASSWORD) });
+  res.json({ native: process.platform === 'darwin', workspace: HERD_WORKSPACE, files: Boolean(HERD_WORKSPACE), password: Boolean(HERD_PASSWORD), stt: Boolean(STT_KEY) });
+});
+
+// Dictation in the browser, wherever OPENAI_API_KEY is set (a deployment has
+// no hotkey daemon): the page records with MediaRecorder and posts the audio
+// here, which relays it to the model the stt project's daemon uses. The key
+// stays in this process — agentEnv strips it from every PTY but Codex's.
+const STT_KEY = process.env.OPENAI_API_KEY || '';
+const STT_MODEL = process.env.HERD_STT_MODEL || 'gpt-transcribe';
+const envList = v => (v || '').split(',').map(s => s.trim()).filter(Boolean);
+// `languages` names the possible languages (listing English as well keeps
+// English terms spelled as English inside the other); unset, the model
+// detects. `keywords` is a vocabulary prior, not forced output.
+const STT_LANGUAGES = envList(process.env.HERD_STT_LANGUAGES);
+const STT_KEYWORDS = process.env.HERD_STT_KEYWORDS !== undefined ? envList(process.env.HERD_STT_KEYWORDS) : [
+  'Claude', 'Anthropic', 'Codex', 'OpenAI', 'GitHub', 'repo', 'prompt', 'commit',
+  'Python', 'TypeScript', 'npm', 'Postgres', 'PyTorch', 'NumPy', 'pandas', 'embedding', 'fine-tune',
+];
+const STT_EXT = { 'audio/webm': 'webm', 'audio/ogg': 'ogg', 'audio/mp4': 'm4a', 'audio/mpeg': 'mp3', 'audio/wav': 'wav', 'audio/x-wav': 'wav', 'audio/flac': 'flac' };
+
+app.post('/api/transcribe', express.raw({ type: () => true, limit: '25mb' }), async (req, res) => {
+  if (!STT_KEY) return res.status(404).json({ error: 'OPENAI_API_KEY is not set' });
+  const type = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+  if (!STT_EXT[type]) return res.status(415).json({ error: `unsupported audio type: ${type || 'none'}` });
+  if (!req.body?.length) return res.status(400).json({ error: 'no audio' });
+  // The API picks the decoder by file extension. Arrays go as `name[]`, as
+  // the OpenAI SDK sends them.
+  const form = new FormData();
+  form.append('model', STT_MODEL);
+  form.append('file', new Blob([req.body], { type }), `dictation.${STT_EXT[type]}`);
+  for (const l of STT_LANGUAGES) form.append('languages[]', l);
+  for (const k of STT_KEYWORDS) form.append('keywords[]', k);
+  try {
+    // Retried as the SDK does: connection errors, 429 and 5xx, twice.
+    let r;
+    for (let attempt = 0; ; attempt++) {
+      r = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${STT_KEY}` },
+        body: form,
+        signal: AbortSignal.timeout(300_000),
+      }).catch(e => e);
+      const retry = r instanceof Error ? r.name !== 'TimeoutError' : r.status === 429 || r.status >= 500;
+      if (!retry || attempt === 2) break;
+      await new Promise(ok => setTimeout(ok, 1000 * 2 ** attempt));
+    }
+    if (r instanceof Error) throw r;
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) return res.status(502).json({ error: data.error?.message || `OpenAI HTTP ${r.status}` });
+    res.json({ text: String(data.text ?? '').trim() });
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
 });
 
 // The user replaces the deployment's password with their own (see AUTH_FILE).
