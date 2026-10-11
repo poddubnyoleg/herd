@@ -131,6 +131,7 @@ class Herd {
     this.setupSearch();
     this.setupAddProject();
     this.setupFiles();
+    this.setupPassword();
     this.setupLocalServices();
     this.listenForSummaryUpdates();
     this.refreshLive();
@@ -453,6 +454,60 @@ class Herd {
         this.createTab(data.path, data.name);
       } catch {}
       finally { btn.disabled = false; }
+    });
+  }
+
+  // ── Password (deployments): the user swaps the one they were given for their own ──
+
+  setupPassword() {
+    const btn = document.getElementById('password-btn');
+    if (!btn || !this.host.password) return;
+    btn.hidden = false;
+    btn.addEventListener('click', () => this.showPasswordForm());
+  }
+
+  showPasswordForm() {
+    if (document.getElementById('password-popup')) return;
+    const overlay = document.createElement('div');
+    overlay.id = 'password-popup';
+    overlay.className = 'usage-overlay';
+    overlay.innerHTML = `
+      <form class="usage-popup pw-popup">
+        <span class="usage-title">Change password</span>
+        <input type="text" name="username" value="herd" autocomplete="username" hidden>
+        <input class="pw-input" type="password" name="current" placeholder="current password" autocomplete="current-password" required>
+        <input class="pw-input" type="password" name="next" placeholder="new password, 12+ characters" autocomplete="new-password" minlength="12" required>
+        <input class="pw-input" type="password" name="confirm" placeholder="new password again" autocomplete="new-password" required>
+        <span class="pw-note">Only a hash is stored. Every other browser gets signed out.</span>
+        <div class="files-actions">
+          <span class="files-status"></span>
+          <button class="files-btn" type="button" data-act="cancel">Cancel</button>
+          <button class="files-btn" type="submit">Change</button>
+        </div>
+      </form>`;
+    document.body.appendChild(overlay);
+    const form = overlay.querySelector('form');
+    const status = overlay.querySelector('.files-status');
+    const close = () => { overlay.remove(); document.removeEventListener('keydown', onKey); };
+    const onKey = e => { if (e.key === 'Escape') close(); };
+    document.addEventListener('keydown', onKey);
+    overlay.addEventListener('click', e => { if (e.target === overlay || e.target.dataset.act === 'cancel') close(); });
+    form.current.focus();
+    form.addEventListener('submit', async e => {
+      e.preventDefault();
+      if (form.next.value !== form.confirm.value) { status.textContent = "New passwords don't match"; return; }
+      status.textContent = 'Changing…';
+      try {
+        const res = await fetch('/api/password', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ current: form.current.value, next: form.next.value }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) { status.textContent = data.error || `HTTP ${res.status}`; return; }
+        status.textContent = 'Password changed';
+        setTimeout(close, 1200);
+      } catch (err) { status.textContent = err.message; }
     });
   }
 

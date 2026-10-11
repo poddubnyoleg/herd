@@ -210,11 +210,36 @@ function originAllowed(origin) {
 // Password gate, on only when HERD_PASSWORD is set. Unlike the Origin check it
 // covers clients that send no Origin, so with it on, every route and the WS
 // upgrade need the cookie. The cookie is `<issued unix s>.<hmac>`, keyed off
-// the password: changing the password logs every browser out.
+// the current password: changing it logs every browser out.
+// HERD_PASSWORD is only the initial password. Once the user picks their own
+// (POST /api/password) its scrypt hash lives in HERD_DATA_DIR/auth.json and the
+// variable stops working, so whoever set the variable no longer knows the
+// password. Deleting auth.json brings HERD_PASSWORD back (the reset path).
 const AUTH_COOKIE = 'herd_auth';
 const AUTH_MAX_AGE_S = 30 * 24 * 3600;
-const authKey = crypto.createHash('sha256').update(`herd-auth:${HERD_PASSWORD}`).digest();
+const AUTH_FILE = path.join(HERD_DATA_DIR, 'auth.json');
+const scryptAsync = require('util').promisify(crypto.scrypt);
+let authHash = null; // { salt, hash } in base64, once the user has set their own
+if (HERD_PASSWORD) {
+  try {
+    const rec = JSON.parse(fs.readFileSync(AUTH_FILE, 'utf8'));
+    if (typeof rec.salt === 'string' && typeof rec.hash === 'string') authHash = rec;
+    else console.error(`${AUTH_FILE} is malformed; using HERD_PASSWORD`);
+  } catch (e) {
+    if (e.code !== 'ENOENT') console.error(`${AUTH_FILE} unreadable (${e.message}); using HERD_PASSWORD`);
+  }
+}
+let authKey;
+const rekey = () => {
+  authKey = crypto.createHash('sha256').update(`herd-auth:${authHash ? authHash.hash : HERD_PASSWORD}`).digest();
+};
+rekey();
 const authSig = ts => crypto.createHmac('sha256', authKey).update(String(ts)).digest('base64url');
+function setAuthCookie(req, res) {
+  const ts = Math.floor(Date.now() / 1000);
+  const secure = req.secure || req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : '';
+  res.setHeader('Set-Cookie', `${AUTH_COOKIE}=${ts}.${authSig(ts)}; Path=/; Max-Age=${AUTH_MAX_AGE_S}; HttpOnly; SameSite=Lax${secure}`);
+}
 function authed(req) {
   if (!HERD_PASSWORD) return true;
   const m = new RegExp(`(?:^|;\\s*)${AUTH_COOKIE}=(\\d+)\\.([\\w-]+)`).exec(req.headers.cookie || '');
@@ -224,8 +249,14 @@ function authed(req) {
   const got = Buffer.from(m[2]), want = Buffer.from(authSig(m[1]));
   return got.length === want.length && crypto.timingSafeEqual(got, want);
 }
-function passwordMatches(given) {
-  const h = s => crypto.createHash('sha256').update(String(s)).digest();
+async function passwordMatches(given) {
+  given = String(given);
+  if (authHash) {
+    const want = Buffer.from(authHash.hash, 'base64');
+    const got = await scryptAsync(given, Buffer.from(authHash.salt, 'base64'), want.length);
+    return crypto.timingSafeEqual(got, want);
+  }
+  const h = s => crypto.createHash('sha256').update(s).digest();
   return crypto.timingSafeEqual(h(given), h(HERD_PASSWORD));
 }
 // Each failure costs a second. There is deliberately no lockout: a shared cap
@@ -287,13 +318,11 @@ if (HERD_PASSWORD) {
     res.type('html').send(loginPage(false));
   });
   app.post('/login', express.urlencoded({ extended: false, limit: '4kb' }), async (req, res) => {
-    if (!passwordMatches(req.body?.password ?? '')) {
+    if (!(await passwordMatches(req.body?.password ?? ''))) {
       await new Promise(r => setTimeout(r, 1000));
       return res.status(401).type('html').send(loginPage(true));
     }
-    const ts = Math.floor(Date.now() / 1000);
-    const secure = req.secure || req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : '';
-    res.setHeader('Set-Cookie', `${AUTH_COOKIE}=${ts}.${authSig(ts)}; Path=/; Max-Age=${AUTH_MAX_AGE_S}; HttpOnly; SameSite=Lax${secure}`);
+    setAuthCookie(req, res);
     res.redirect(303, '/');
   });
   app.use((req, res, next) => {
@@ -2269,8 +2298,35 @@ function serveSessions(res, projectPath) {
 // The folder picker and Finder reveal are macOS-only. Elsewhere (the Railway
 // container) projects are folders under HERD_WORKSPACE, named in the browser.
 app.get('/api/host', (req, res) => {
-  res.json({ native: process.platform === 'darwin', workspace: HERD_WORKSPACE, files: Boolean(HERD_WORKSPACE) });
+  res.json({ native: process.platform === 'darwin', workspace: HERD_WORKSPACE, files: Boolean(HERD_WORKSPACE), password: Boolean(HERD_PASSWORD) });
 });
+
+// The user replaces the deployment's password with their own (see AUTH_FILE).
+// A wrong current password is 403, not 401: the client sends 401s to /login.
+if (HERD_PASSWORD) {
+  app.post('/api/password', express.json({ limit: '4kb' }), async (req, res) => {
+    const { current = '', next = '' } = req.body || {};
+    if (!(await passwordMatches(current))) {
+      await new Promise(r => setTimeout(r, 1000));
+      return res.status(403).json({ error: 'Current password is wrong' });
+    }
+    if (typeof next !== 'string' || next.length < 12) return res.status(400).json({ error: 'Use at least 12 characters' });
+    const salt = crypto.randomBytes(16);
+    const rec = { salt: salt.toString('base64'), hash: (await scryptAsync(next, salt, 64)).toString('base64') };
+    try {
+      fs.writeFileSync(AUTH_FILE + '.tmp', JSON.stringify(rec) + '\n', { mode: 0o600 });
+      fs.renameSync(AUTH_FILE + '.tmp', AUTH_FILE);
+    } catch (e) { return res.status(500).json({ error: e.code || e.message }); }
+    authHash = rec;
+    rekey();
+    setAuthCookie(req, res); // this browser stays signed in; every other one is out
+    res.json({ ok: true });
+    // An open terminal socket outlives the cookie it was opened with. Drop every
+    // viewer (the PTYs keep running): only this browser, holding the new
+    // cookie, can reconnect.
+    setImmediate(() => { for (const ws of wss.clients) ws.terminate(); });
+  });
+}
 
 // Files panel (deployments only, with HERD_WORKSPACE): list, upload, download —
 // what Finder does for a local Herd. The roots are not a security boundary
@@ -2405,7 +2461,7 @@ const LOCAL_MODEL_CMD = process.env.LOCAL_MODEL_CMD || path.join(os.homedir(), '
 const LOCAL_MODEL_LOG = '/tmp/llama-gemma.log';
 const STT_LAUNCHER = process.env.STT_LAUNCHER
   || path.join(os.homedir(), 'Documents', 'Personal', 'stt', 'scripts', 'stt-dictate.command');
-const STT_PATTERN = 'python.*dictate\\.py';
+const STT_PATTERN = 'python.*dictate(_mlx)?\\.py';  // also the offline fallback daemon
 
 const pgrepUp = pattern => new Promise(resolve => {
   execFile('pgrep', ['-f', pattern], { timeout: 5000 }, err => resolve(!err));
@@ -2463,6 +2519,9 @@ const LOCAL_SERVICES = {
       });
     },
   },
+  // Push-to-talk daemon (the sibling stt project's dictate.py). It transcribes
+  // through OpenAI's gpt-transcribe and holds no local model, so this toggle
+  // gates the mic and hotkey rather than memory.
   stt: {
     label: 'Dictation (STT)',
     icon: '⊙',

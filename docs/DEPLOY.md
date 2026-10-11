@@ -20,7 +20,7 @@ volumes were created through the GraphQL `volumeCreate` mutation.
 
 | Variable | |
 |---|---|
-| `HERD_PASSWORD` | Required, long and random (`openssl rand -base64 24`): there is no lockout, only a 1s delay per failure. Without it the server refuses to bind `0.0.0.0`. Changing it logs every browser out. |
+| `HERD_PASSWORD` | Required, long and random (`openssl rand -base64 24`): there is no lockout, only a 1s delay per failure. Without it the server refuses to bind `0.0.0.0`. It is the *initial* password — see below. |
 | `CLAUDE_CODE_OAUTH_TOKEN` | From `claude setup-token` (subscription, not API). Unset → run `/login` in a Claude tab; the credentials land on the volume. |
 | `TZ` | Optional IANA zone (e.g. `America/New_York`); the status line's reset time uses it. Default UTC. |
 | `ALLOWED_ORIGINS` | Only for a custom domain. The Railway domain is allowed automatically via `RAILWAY_PUBLIC_DOMAIN`. |
@@ -35,6 +35,18 @@ Claude settings: at boot `deploy/claude/settings.json` is merged into
 `~/.claude/statusline-command.sh` with a GNU `date` fallback; re-copy it after
 changing the local one. A `setup-token` token can't read the plan, so without the
 `model` default Claude would start on Sonnet.
+
+## Handing a deployment to someone
+
+Give them the `HERD_PASSWORD` value; they sign in and use **password** in the
+sidebar footer to pick their own. Only its scrypt hash is kept, in
+`/data/herd/auth.json` on their volume, and from then on the variable no longer
+works and every other browser is signed out — so you don't know their password.
+If they forget it, delete `auth.json` (`railway ssh`) and the variable works again.
+
+This keeps the password from you, not access: as the Railway project owner you can
+still reset it, open a shell in the container, or deploy code that captures it.
+For real privacy they need their own Railway account (and their own Claude login).
 
 ## How it differs from local
 

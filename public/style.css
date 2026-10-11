@@ -921,7 +921,7 @@ body {
   gap: 4px;
 }
 
-.theme-btn {
+.theme-btn, .footer-btn {
   flex: 1;
   padding: 4px 0;
   cursor: pointer;
@@ -934,7 +934,7 @@ body {
   transition: color 0.1s, background 0.1s, border-color 0.1s;
 }
 
-.theme-btn:hover {
+.theme-btn:hover, .footer-btn:hover {
   color: var(--text-dim);
   background: var(--bg-hover);
 }
@@ -965,3 +965,10 @@ body {
 .files-btn { font: inherit; font-size: 11px; padding: 4px 10px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg); color: var(--text); cursor: pointer; }
 .files-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
 .files-btn:disabled { opacity: 0.4; cursor: default; }
+
+/* Change password (deployments) */
+.footer-btn[hidden] { display: none; }
+.pw-popup { width: min(320px, calc(100vw - 32px)); display: flex; flex-direction: column; gap: 10px; }
+.pw-input { font: inherit; font-size: 12px; padding: 7px 9px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg); color: var(--text); }
+.pw-input:focus { outline: none; border-color: var(--accent); }
+.pw-note { font-size: 11px; color: var(--text-muted); }
