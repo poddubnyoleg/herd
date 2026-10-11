@@ -24,7 +24,7 @@ volumes were created through the GraphQL `volumeCreate` mutation.
 | `CLAUDE_CODE_OAUTH_TOKEN` | From `claude setup-token` (subscription, not API). Unset → run `/login` in a Claude tab; the credentials land on the volume. |
 | `TZ` | Optional IANA zone (e.g. `America/New_York`); the status line's reset time uses it. Default UTC. |
 | `ALLOWED_ORIGINS` | Only for a custom domain. The Railway domain is allowed automatically via `RAILWAY_PUBLIC_DOMAIN`. |
-| `OPENAI_API_KEY` | Optional; turns on dictation. The server relays recordings to OpenAI's `gpt-transcribe` (`HERD_STT_MODEL` overrides); the key never reaches a terminal. `HERD_STT_LANGUAGES` (e.g. `en,de`) names the languages you speak — listing English as well keeps English terms spelled as English inside the other; unset, the model detects. `HERD_STT_KEYWORDS` (comma-separated) replaces the default vocabulary hints. |
+| `OPENAI_API_KEY` | Optional; turns on dictation. The server relays recordings to OpenAI's `gpt-transcribe` (`HERD_STT_MODEL` overrides); it is kept out of terminals' environment, but a shell runs as the server's user and can read it from `/proc` — on someone else's deployment, use a restricted project key with a budget. `HERD_STT_LANGUAGES` (e.g. `en,de`) names the languages you speak — listing English as well keeps English terms spelled as English inside the other; unset, the model detects. `HERD_STT_KEYWORDS` (comma-separated) replaces the default vocabulary hints. |
 
 Set by the Dockerfile: `HOST=0.0.0.0`, `HOME=/data/home`, `HERD_DATA_DIR=/data/herd`
 (summary cache), `HERD_WORKSPACE=/data/work` (projects), `HERD_CLAUDE_SANDBOX=0`,

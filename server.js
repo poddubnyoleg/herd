@@ -2304,8 +2304,9 @@ app.get('/api/host', (req, res) => {
 
 // Dictation in the browser, wherever OPENAI_API_KEY is set (a deployment has
 // no hotkey daemon): the page records with MediaRecorder and posts the audio
-// here, which relays it to the model the stt project's daemon uses. The key
-// stays in this process — agentEnv strips it from every PTY but Codex's.
+// here, which relays it to the model the stt project's daemon uses. agentEnv
+// keeps the key out of every PTY but Codex's — but PTYs run as the server's
+// user and can read it from /proc, so a shared deployment wants its own key.
 const STT_KEY = process.env.OPENAI_API_KEY || '';
 const STT_MODEL = process.env.HERD_STT_MODEL || 'gpt-transcribe';
 const envList = v => (v || '').split(',').map(s => s.trim()).filter(Boolean);

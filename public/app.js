@@ -740,12 +740,15 @@ class Herd {
         const targetId = this.activeTabId;
         const blob = new Blob(chunks, { type: recorder.mimeType || chunks[0]?.type || '' });
         // A double tap, not a dictation
-        if (Date.now() - state.started < 500 || !blob.size) return this.endDictation();
+        if (state.discard || Date.now() - state.started < 500 || !blob.size) return this.endDictation();
         state.recorder = null;
         this.showDictation('transcribing');
         const text = await this.transcribe(blob);
-        const tab = this.tabs.get(targetId) || this.tabs.get(this.activeTabId);
-        if (text && tab) tab.terminal.paste(text);
+        // Input to a disconnected terminal is dropped, and another tab is
+        // another session: rather than lose the text, hand it over to copy
+        const tab = this.tabs.get(targetId);
+        if (text && tab?.ws?.readyState === WebSocket.OPEN) tab.terminal.paste(text);
+        else if (text) prompt('The terminal is gone or not connected. Your dictation:', text);
         this.endDictation();
       };
       recorder.start();
@@ -2054,6 +2057,8 @@ class Herd {
         this.switchTab(remaining[remaining.length - 1]);
       } else {
         this.activeTabId = null;
+        // The key bar goes with the last tab, and with it the way to stop
+        if (this._dictation?.recorder) { this._dictation.discard = true; this._dictation.recorder.stop(); }
         document.getElementById('terminal-area').classList.remove('has-tabs');
         document.getElementById('empty-state').classList.remove('hidden');
         if (this.narrow.matches) this.toggleSidebar(true);
