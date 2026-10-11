@@ -15,14 +15,17 @@ class Herd {
     const minIndent = Math.min(...nonEmpty.map(l => l.match(/^ */)[0].length));
     if (minIndent) lines = lines.map(l => l.slice(minIndent));
     const maxLen = Math.max(...lines.map(l => l.length));
-    if (maxLen < 60) return lines.join('\n'); // too narrow to be wrapped prose
+    // Too narrow to be wrapped prose (relative to a phone's ~50 columns)
+    if (maxLen < Math.min(60, cols - 12)) return lines.join('\n');
     // A soft-wrapped line must physically reach near the wrap column
     // (minus the TUI's own margins and ragged-right slack from long
     // words). The wrap column is NOT terminal.cols on wide windows: the
     // server caps every PTY at MAX_COLS=96 via stty, so xterm can be 140+
     // cols while content wraps at 96 — clamp, or nothing ever joins. The
-    // maxLen term is a fallback for narrower content (e.g. resized since).
-    const threshold = Math.max(Math.min(cols, 96) - 22, maxLen - 16);
+    // maxLen term is a fallback for narrower content (e.g. resized since),
+    // capped at cols: a soft-wrapped line rejoined by xterm's selection or
+    // the text view runs past the width and would block every other join.
+    const threshold = Math.max(Math.min(cols, 96) - 22, Math.min(maxLen, cols) - 16);
     const noJoin = /^\s*([-*+•·●○◦‣›❯>]\s|\d+[.)]\s|[│┃┆┊┌└├┬┴┤─═║╔╚╠#])/;
     const out = [];
     let cur = null, prevLen = -1;
@@ -1855,6 +1858,7 @@ class Herd {
     }
     this.activeTabId = tabId;
     document.querySelectorAll('.terminal-wrapper').forEach(w => w.classList.remove('active'));
+    document.querySelector('.text-view')?.remove();
 
     const tab = this.tabs.get(tabId);
     if (tab) {
@@ -2199,6 +2203,84 @@ class Herd {
     this.narrow.addEventListener('change', () => this.toggleSidebar(false));
     this.setupViewport();
     this.setupKeybar();
+    this.setupLongPress();
+  }
+
+  // Long-press a terminal for its text view: xterm 5.3 has no touch
+  // selection (a drag scrolls), so there is no other way to copy on a phone.
+  setupLongPress() {
+    const area = document.getElementById('terminal-area');
+    let timer = 0, fired = false, x0 = 0, y0 = 0;
+    area.addEventListener('touchstart', e => {
+      clearTimeout(timer);
+      fired = false;
+      if (e.touches.length !== 1 || e.target.closest('.text-view, .terminal-takeover')) return;
+      ({ clientX: x0, clientY: y0 } = e.touches[0]);
+      timer = setTimeout(() => {
+        const tab = this.tabs.get(this.activeTabId);
+        if (tab) { fired = true; this.showTextView(tab); }
+      }, 500);
+    }, { passive: true });
+    area.addEventListener('touchmove', e => {
+      const t = e.touches[0];
+      if (Math.hypot(t.clientX - x0, t.clientY - y0) > 10) clearTimeout(timer);
+    }, { passive: true });
+    area.addEventListener('touchend', e => {
+      clearTimeout(timer);
+      // No click after a long-press: it would focus the terminal and raise
+      // the keyboard over the view
+      if (fired) e.preventDefault();
+    }, { passive: false });
+    area.addEventListener('touchcancel', () => clearTimeout(timer));
+  }
+
+  // The terminal's buffer as plain text the browser can select natively.
+  // Soft-wrapped rows are rejoined; Copy reflows the selection as Cmd+C
+  // does, unless "keep line breaks" is ticked.
+  showTextView(tab) {
+    document.querySelector('.text-view')?.remove();
+    document.activeElement?.blur?.();
+    const buf = tab.terminal.buffer.active;
+    const lines = [];
+    for (let i = 0; i < buf.length; i++) {
+      const line = buf.getLine(i);
+      if (!line) continue;
+      // Keep trailing spaces on a row that wraps: they are part of the line
+      const text = line.translateToString(!buf.getLine(i + 1)?.isWrapped);
+      if (line.isWrapped && lines.length) lines[lines.length - 1] += text;
+      else lines.push(text);
+    }
+    while (lines.length && !lines[lines.length - 1]) lines.pop(); // empty rows below the cursor
+
+    const view = document.createElement('div');
+    view.className = 'text-view';
+    view.innerHTML = `
+      <div class="text-view-bar">
+        <label><input type="checkbox"> keep line breaks</label>
+        <button class="files-btn" type="button">Done</button>
+      </div>
+      <pre></pre>`;
+    const pre = view.querySelector('pre');
+    const keepBreaks = view.querySelector('input');
+    pre.textContent = lines.join('\n');
+    pre.addEventListener('copy', e => {
+      if (keepBreaks.checked) return;
+      const text = Herd.reflowCopiedText(document.getSelection().toString(), tab.terminal.cols);
+      try { e.clipboardData.setData('text/plain', text); e.preventDefault(); } catch {}
+    });
+    view.querySelector('button').addEventListener('click', () => view.remove());
+    document.getElementById('terminal-area').appendChild(view);
+    // xterm rounds its cell width down to whole device pixels, so a
+    // full-width row is wider in plain text than on the terminal and would
+    // wrap; space the text to xterm's grid
+    const screen = tab.terminal.element?.querySelector('.xterm-screen');
+    const probe = Object.assign(document.createElement('span'), { textContent: 'x'.repeat(100) });
+    probe.style.whiteSpace = 'pre';
+    pre.appendChild(probe);
+    const advance = probe.getBoundingClientRect().width / 100;
+    probe.remove();
+    if (screen && advance) pre.style.letterSpacing = `${screen.getBoundingClientRect().width / tab.terminal.cols - advance}px`;
+    pre.scrollTop = pre.scrollHeight;
   }
 
   // The drawer is a body class; outside the narrow layout it does nothing.

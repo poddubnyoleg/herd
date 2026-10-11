@@ -1012,8 +1012,9 @@ body {
   flex: 1 1 0;
   min-width: 0;
   height: 36px;
+  padding: 0;
   font-family: inherit;
-  font-size: 13px;
+  font-size: 12px;
   color: var(--text-dim);
   background: var(--bg);
   border: 1px solid var(--border);
@@ -1027,6 +1028,48 @@ body {
 #keybar button.on { color: var(--accent); border-color: var(--accent); }
 #keybar button[hidden] { display: none; }
 #keybar .keybar-wide { flex-grow: 1.6; }
+
+/* Text view: a terminal's buffer as plain text, for native touch selection */
+
+.text-view {
+  position: absolute;
+  inset: 0;
+  z-index: 12;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+}
+
+.text-view-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-alt);
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.text-view-bar label { display: flex; align-items: center; gap: 6px; }
+
+.text-view pre {
+  flex: 1;
+  overflow: auto;
+  /* Same padding and font as .terminal-wrapper/xterm, so full-width
+     terminal rows fit on one line */
+  padding: 4px;
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.25;
+  color: var(--text);
+  /* Wrap long lines on screen; a copy still gets them whole */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+  -webkit-user-select: text;
+  overscroll-behavior: contain;
+}
 
 /* ── Touch ── */
 
