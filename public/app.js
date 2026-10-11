@@ -1528,6 +1528,8 @@ class Herd {
     tab._steal = false;
     wsUrl.searchParams.set('cols', terminal.cols);
     wsUrl.searchParams.set('rows', terminal.rows);
+    // A spawn from a phone gets Claude's fullscreen renderer (server.js)
+    if (this.touch.matches) wsUrl.searchParams.set('touch', '1');
 
     const ws = new WebSocket(wsUrl);
     tab.ws = ws;
@@ -2327,6 +2329,42 @@ class Herd {
     this.setupViewport();
     this.setupKeybar();
     this.setupLongPress();
+    this.setupTouchWheel();
+  }
+
+  // Drag to scroll where the app owns scrolling. xterm 5.3 scrolls its own
+  // buffer on touch but sends nothing to an app that captures the mouse or
+  // draws on the alternate screen — Claude's fullscreen renderer, which
+  // phones get (server.js, AGENTS.claude.launch), less, vim — so a drag did
+  // nothing. Replay it as wheel events, one line per row dragged, which
+  // xterm reports to the app (or turns into arrow keys) as for a real wheel.
+  setupTouchWheel() {
+    if (!this.touch.matches) return;
+    const area = document.getElementById('terminal-area');
+    let lastY = null, pending = 0;
+    area.addEventListener('touchstart', e => {
+      pending = 0;
+      lastY = e.touches.length === 1 && !e.target.closest('.text-view, .terminal-takeover')
+        ? e.touches[0].clientY : null;
+    }, { passive: true });
+    area.addEventListener('touchmove', e => {
+      const t = this.tabs.get(this.activeTabId)?.terminal;
+      if (lastY === null || !t?.element) return;
+      if (t.modes.mouseTrackingMode === 'none' && t.buffer.active.type !== 'alternate') return;
+      e.preventDefault();
+      const { clientX, clientY } = e.touches[0];
+      pending += lastY - clientY; // finger up = wheel down
+      lastY = clientY;
+      const screen = t.element.querySelector('.xterm-screen');
+      const cellH = screen.offsetHeight / t.rows;
+      while (Math.abs(pending) >= cellH) {
+        const dir = Math.sign(pending);
+        pending -= dir * cellH;
+        screen.dispatchEvent(new WheelEvent('wheel', {
+          deltaY: dir, deltaMode: WheelEvent.DOM_DELTA_LINE, clientX, clientY, bubbles: true, cancelable: true,
+        }));
+      }
+    }, { passive: false });
   }
 
   // Long-press a terminal for its text view: xterm 5.3 has no touch

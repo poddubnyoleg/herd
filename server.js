@@ -954,11 +954,17 @@ const AGENTS = {
   claude: {
     bin: claudeBin,
     summaryKey: id => id, // plain id for backward compat with old caches
-    launch(resume) {
+    launch(resume, project, { touch } = {}) {
       // In a container the sandbox would need bubblewrap and user namespaces,
       // which Railway doesn't grant; the container is the boundary there.
       const flags = process.env.HERD_CLAUDE_SANDBOX === '0' ? '' : `--settings '{"sandbox":{"enabled":true}}'`;
-      return resume ? `${claudeBin} ${flags} --resume ${resume}` : `${claudeBin} ${flags}`;
+      // Spawned from a phone: Claude's fullscreen renderer (alt screen, its
+      // own scrollback). The classic one repaints from the top of the screen
+      // when a frame that outgrew it shrinks, re-showing lines that already
+      // scrolled off — on a 30-row screen every few turns, so scrolling up
+      // shows the header and recent lines twice.
+      const env = touch ? 'CLAUDE_CODE_NO_FLICKER=1 ' : '';
+      return `${env}${claudeBin} ${flags}${resume ? ` --resume ${resume}` : ''}`;
     },
     snapshotKeys({ encodedDir }) {
       if (!encodedDir) return [];
@@ -3172,6 +3178,7 @@ wss.on('connection', (ws, req) => {
   const client = params.get('client');
   const clientId = client && SESSION_ID_RE.test(client) ? client : null;
   const steal = params.get('steal') === '1';
+  const touch = params.get('touch') === '1';  // viewer is a touch device
   const agent = params.get('agent') || 'claude';
   const cols = clampInt(params.get('cols'), 120, MAX_TERM_COLS);
   const rows = clampInt(params.get('rows'), 30, MAX_TERM_ROWS);
@@ -3246,14 +3253,14 @@ wss.on('connection', (ws, req) => {
 
   // 3. Spawn: `--resume` when there is a session id, a new session otherwise.
   try {
-    spawnTerminal({ ws, clientId, agent, agentDef, resume, resolvedProject, projectPath, projectDirExists, encodedDir, cols, rows });
+    spawnTerminal({ ws, clientId, agent, agentDef, resume, resolvedProject, projectPath, projectDirExists, encodedDir, cols, rows, touch });
   } catch (err) {
     ws.send(JSON.stringify({ type: 'error', message: `Failed to spawn: ${err.message}` }));
     ws.close();
   }
 });
 
-function spawnTerminal({ ws, clientId, agent, agentDef, resume, resolvedProject, projectPath, projectDirExists, encodedDir, cols, rows }) {
+function spawnTerminal({ ws, clientId, agent, agentDef, resume, resolvedProject, projectPath, projectDirExists, encodedDir, cols, rows, touch }) {
   // Spawn an interactive shell in a real PTY via node-pty.
   // The agent is launched as a command inside the shell so that when it exits,
   // the user drops back to a live shell prompt in the same tab.
@@ -3321,7 +3328,7 @@ function spawnTerminal({ ws, clientId, agent, agentDef, resume, resolvedProject,
     : 'clear; ';
 
   // launch() may be async (pi probes the local model server to pick a default)
-  Promise.resolve(agentDef.launch(resume, resolvedProject))
+  Promise.resolve(agentDef.launch(resume, resolvedProject, { touch }))
     .then(cmd => proc.write(`${setSize}${cmd}\n`));
 
   // --- Auto-naming ---
