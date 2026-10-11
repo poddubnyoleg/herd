@@ -56,3 +56,20 @@ Note: the patch was generated against `package/out/` compiled JS (the published
 tarball has no TypeScript sources; the 0.5.0 gitHead commit was never pushed to
 the public repo). Verify after build: the bundle should contain
 `devicePixelRatio` and `resizeQuality`.
+
+## xterm-addon-webgl: cursor row when scrolled
+
+`public/vendor/xterm-addon-webgl.js` is stock `xterm-addon-webgl@0.16.0` with
+one token changed. Its `_updateModel` finds the cursor's cell by viewport row
+`r` but records `y: buffer.active.cursorY` — the row the cursor would have
+with the viewport at the bottom. Scrolled up into history, the cursor was
+drawn that many rows above its line. Later upstream releases record the
+viewport-relative row, which is what the patch does.
+
+```sh
+curl -sSL -o public/vendor/xterm-addon-webgl.js \
+  https://cdn.jsdelivr.net/npm/xterm-addon-webgl@0.16.0/lib/xterm-addon-webgl.js
+sed -i '' 's/this\._model\.cursor={x:L,y:this\._terminal\.buffer\.active\.cursorY,/this._model.cursor={x:L,y:r,/' \
+  public/vendor/xterm-addon-webgl.js
+grep -c 'this._model.cursor={x:L,y:r,' public/vendor/xterm-addon-webgl.js  # 1
+```

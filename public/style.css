@@ -1076,6 +1076,13 @@ body {
 @media (pointer: coarse) {
   #terminal-area.has-tabs ~ #keybar { display: flex; }
 
+  /* The on-screen keyboard must not resize the PTY (setupViewport): the
+     wrapper keeps its full height under the keyboard and panTerminal
+     slides it up. clip, not hidden: a hidden overflow is still a scroll
+     container, which focusing the terminal's textarea can scroll. */
+  #terminal-area { overflow: clip; }
+  .terminal-wrapper { bottom: calc(-1 * var(--kb-height, 0px)); }
+
   /* No hover: show what is otherwise revealed on hover */
   .project-finder-btn { opacity: 1; padding: 4px 8px; font-size: 15px; }
   .session-kill { position: static; transform: none; margin-left: auto; opacity: 1; padding: 4px 8px; font-size: 16px; }

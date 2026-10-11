@@ -1228,6 +1228,8 @@ class Herd {
     terminal.onScroll(() => { tab._scrolled = true; });
     // Reflow after a resize shifts absolute line numbers; re-baseline.
     terminal.onResize(() => { tab._lineWatermark = undefined; });
+    // Keyboard up: follow the cursor as output arrives (panTerminal)
+    terminal.onRender(() => { if (this._kbHeight) this.panTerminal(tab); });
 
     // macOS keyboard navigation: Option+Arrow for word jump, Cmd+Arrow for line jump
     terminal.attachCustomKeyEventHandler(e => {
@@ -1875,6 +1877,7 @@ class Herd {
         this.fitTab(tab);
         tab.terminal.scrollToBottom();
         this.syncViewport(tab.terminal);
+        this.panTerminal(tab);
         // On touch, focus raises the keyboard over what you came to read
         if (!this.touch.matches) tab.terminal.focus();
       });
@@ -1912,6 +1915,31 @@ class Herd {
   // would fire onScroll into the tab-activity tracking.
   syncViewport(terminal) {
     try { terminal._core?.viewport?.syncScrollArea(true); } catch {}
+  }
+
+  // With the on-screen keyboard up, the wrapper runs under it
+  // (setupViewport). Slide it up until the lowest non-blank row — Claude's
+  // status line, below its input box — sits on the keyboard, but never so
+  // far that the cursor leaves the top.
+  panTerminal(tab) {
+    const { terminal } = tab;
+    const wrapper = terminal.element?.parentElement;
+    if (!wrapper) return;
+    let shift = 0;
+    if (this._kbHeight > 0 && wrapper.classList.contains('active')) {
+      const cellH = terminal.element.querySelector('.xterm-screen').offsetHeight / terminal.rows;
+      const buf = terminal.buffer.active;
+      const cursorRow = buf.baseY + buf.cursorY - buf.viewportY;
+      let last = Math.min(cursorRow, terminal.rows - 1);
+      for (let y = terminal.rows - 1; y > last; y--) {
+        if (buf.getLine(buf.viewportY + y)?.translateToString(true).trim()) { last = y; break; }
+      }
+      const top = terminal.element.offsetTop;
+      shift = Math.max(0, top + (last + 1) * cellH - wrapper.parentElement.clientHeight);
+      if (cursorRow < terminal.rows) shift = Math.min(shift, top + cursorRow * cellH);
+    }
+    const transform = shift ? `translateY(${-shift}px)` : '';
+    if (wrapper.style.transform !== transform) wrapper.style.transform = transform;
   }
 
   closeTab(tabId) {
@@ -2292,19 +2320,37 @@ class Herd {
 
   // An on-screen keyboard shrinks only the visual viewport (iOS, and Android
   // by default), and the browser pans that viewport to the focused field.
-  // Pin #app and the drawer to the visible area so the terminal refits
-  // above the keyboard rather than running under it. Resizing the layout
+  // Pin #app and the drawer to the visible area so the keybar and the
+  // terminal's input line stay above the keyboard. Resizing the layout
   // instead (interactive-widget=resizes-content) would also change the
   // height media queries, flipping a landscape tablet into the drawer
   // layout whenever the keyboard opens.
+  //
+  // The terminal keeps its rows, though: a PTY resize makes the agent
+  // repaint, and Claude Code repaints by reprinting the whole transcript
+  // under the old rendering, so every keyboard toggle left a stale copy in
+  // scrollback (scrolling up showed a doubled header). --kb-height extends
+  // the wrapper under the keyboard (style.css) and panTerminal slides it up
+  // instead. The keyboard height is the shrink from the last height seen
+  // with no field focused — only a focused field raises a keyboard.
   setupViewport() {
     const vv = window.visualViewport;
     if (!vv || !this.touch.matches) return;
     const style = document.documentElement.style;
+    let fullHeight = 0, width = 0;
     const apply = () => {
       if (Math.abs(vv.scale - 1) > 0.01) return; // pinch zoom, not a keyboard
+      const typing = document.activeElement?.matches('input, textarea, [contenteditable]');
+      if (!typing || vv.height > fullHeight || vv.width !== width) {
+        fullHeight = vv.height;
+        width = vv.width;
+      }
+      this._kbHeight = fullHeight - vv.height;
       style.setProperty('--app-height', `${vv.height}px`);
       style.setProperty('--app-top', `${vv.offsetTop}px`);
+      style.setProperty('--kb-height', `${this._kbHeight}px`);
+      const tab = this.tabs.get(this.activeTabId);
+      if (tab) this.panTerminal(tab);
     };
     vv.addEventListener('resize', apply);
     vv.addEventListener('scroll', apply);
