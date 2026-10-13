@@ -6,6 +6,11 @@ PORT="${PORT:-3456}"
 LOG_FILE="${LOG_FILE:-/tmp/herd.log}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+if [ -n "${RPC_PROXY_DEST_OVERRIDE:-}" ]; then
+  echo "error: restart-herd.sh cannot start Herd inside a sandboxed shell (Seatbelt blocks ~/.claude, ~/.gemini, and Keychain access)" >&2
+  exit 1
+fi
+
 if [ -f "$HOME/.gemini/.env" ]; then
   export $(grep -v '^#' "$HOME/.gemini/.env" | xargs)
 fi
@@ -25,7 +30,29 @@ if [ -n "${existing_pids}" ]; then
   done
 fi
 
-nohup node "${ROOT_DIR}/server.js" >"${LOG_FILE}" 2>&1 </dev/null &
+node -e '
+  const { spawn } = require("child_process");
+  const fs = require("fs");
+  const out = fs.openSync(process.argv[2], "w");
+  const child = spawn(process.execPath, [process.argv[1]], {
+    detached: true,
+    stdio: ["ignore", out, out],
+  });
+  child.unref();
+' "${ROOT_DIR}/server.js" "${LOG_FILE}"
 
-echo "herd restarted on port ${PORT}"
+for _ in {1..20}; do
+  if lsof -tiTCP:${PORT} -sTCP:LISTEN >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.2
+done
+
+new_pid="$(lsof -tiTCP:${PORT} -sTCP:LISTEN 2>/dev/null || true)"
+if [ -z "${new_pid}" ]; then
+  echo "error: herd failed to listen on port ${PORT}" >&2
+  exit 1
+fi
+
+echo "herd restarted on port ${PORT} (pid ${new_pid})"
 echo "log file: ${LOG_FILE}"
