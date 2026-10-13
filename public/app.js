@@ -106,6 +106,7 @@ class Herd {
     this.geminiAvailable = false;
     this.piAvailable = false;
     this.grokAvailable = false;
+    this.agyAvailable = false;
     this.live = [];
     this.host = { native: true, workspace: null }; // see /api/host
     this.narrow = window.matchMedia(Herd.NARROW);
@@ -896,6 +897,7 @@ class Herd {
       this.geminiAvailable = this.projects.some(p => p.geminiAvailable);
       this.piAvailable = this.projects.some(p => p.piAvailable);
       this.grokAvailable = this.projects.some(p => p.grokAvailable);
+      this.agyAvailable = this.projects.some(p => p.agyAvailable);
       this.renderProjects();
       this.loadRecentSessions();
     } catch (err) {
@@ -1196,8 +1198,11 @@ class Herd {
     const grokBtn = this.grokAvailable
       ? '<button class="new-session-btn new-session-grok" data-agent="grok"><span class="badge-grok"></span> grok</button>'
       : '';
+    const agyBtn = this.agyAvailable
+      ? '<button class="new-session-btn new-session-agy" data-agent="agy"><span class="badge-agy"></span> agy</button>'
+      : '';
     container.innerHTML = `
-      ${projectExists ? `<div class="new-session-actions"><button class="new-session-btn new-session-claude" data-agent="claude"><span class="badge-claude"></span> claude</button>${codexBtn}${geminiBtn}${piBtn}${grokBtn}</div>` : ''}
+      ${projectExists ? `<div class="new-session-actions"><button class="new-session-btn new-session-claude" data-agent="claude"><span class="badge-claude"></span> claude</button>${codexBtn}${geminiBtn}${piBtn}${grokBtn}${agyBtn}</div>` : ''}
       ${sessions.map(s => `
         <div class="session-item" data-sid="${s.id}" data-agent="${s.agent || 'claude'}" title="${this.esc(s.preview || '')}">
           <span class="badge-${s.agent || 'claude'}"></span>

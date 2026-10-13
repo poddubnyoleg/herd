@@ -8,7 +8,17 @@ const fs = require('fs');
 const { StringDecoder } = require('string_decoder');
 const { pipeline } = require('stream');
 const os = require('os');
+const { fileURLToPath } = require('url');
 const pty = require('node-pty');
+const DatabaseSync = (() => {
+  const origEmitWarning = process.emitWarning;
+  process.emitWarning = (warning, ...args) => {
+    if (typeof warning === 'string' && warning.includes('SQLite')) return;
+    return origEmitWarning.call(process, warning, ...args);
+  };
+  try { return require('node:sqlite').DatabaseSync; }
+  catch { return null; }
+})();
 
 // Headless xterm, pinned to the client's 5.3.0 line so the server parses and
 // reflows exactly like the browser (see "Terminals" below). Both packages
@@ -89,13 +99,25 @@ function stripDangerousEnv(env) {
 // reload. Strip them so each spawned agent starts a clean top-level session.
 // CLAUDE_CONFIG_DIR is kept — it points at the user's config, not a session.
 function stripAgentSessionEnv(env) {
+  const inExebox = Boolean(env.RPC_PROXY_DEST_OVERRIDE || (env.SSL_CERT_FILE && env.SSL_CERT_FILE.includes('exebox-cert-')));
   for (const key of Object.keys(env)) {
     // Config-dir pointers stay; session-identity markers do not. If Herd is
     // itself started from inside an agent, those markers would make the child
     // treat itself as nested and skip writing its own transcript.
-    if (key === 'CLAUDE_CONFIG_DIR' || key === 'GROK_HOME') continue;
+    if (key === 'CLAUDE_CONFIG_DIR' || key === 'GROK_HOME' || key === 'ANTIGRAVITY_APP_DATA_DIR') continue;
     if (/^CLAUDE/.test(key) || key === 'AI_AGENT') delete env[key];
     if (key === 'GROK_AGENT' || key === 'GROK_SESSION_ID') delete env[key];
+    if (/^ANTIGRAVITY_/.test(key)) delete env[key];
+  }
+  if (inExebox) {
+    for (const k of [
+      'RPC_PROXY_DEST_OVERRIDE', 'RPC_DEFAULT_CAN_USE_UDP', 'RPC_PROXY_HEADER_AS_EXTENSION',
+      'SERVER_AUTHORIZATION_ENABLED_ASK_TO_USE',
+      'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy',
+      'SSL_CERT_FILE', 'CURL_CA_BUNDLE', 'GIT_SSL_CAINFO', 'NODE_EXTRA_CA_CERTS',
+      'AWS_CA_BUNDLE', 'PIP_CERT', 'REQUESTS_CA_BUNDLE', 'GRPC_DEFAULT_SSL_ROOTS_FILE_PATH',
+      'npm_config_cafile',
+    ]) delete env[k];
   }
   return env;
 }
@@ -130,6 +152,16 @@ function agentEnv(agent) {
     if (process.env.XAI_API_KEY) base.XAI_API_KEY = process.env.XAI_API_KEY;
     if (process.env.GROK_CODE_XAI_API_KEY) base.GROK_CODE_XAI_API_KEY = process.env.GROK_CODE_XAI_API_KEY;
   }
+  if (agent === 'agy') {
+    // Ensure agy sessions inherit the AI Studio / GCP project configured in
+    // ~/.gemini/antigravity-cli/settings.json even if Herd was launched from a
+    // shell without GOOGLE_CLOUD_PROJECT exported.
+    try {
+      const cfg = JSON.parse(fs.readFileSync(path.join(AGY_DIR, 'settings.json'), 'utf8'));
+      if (cfg.gcp?.project && !base.GOOGLE_CLOUD_PROJECT) base.GOOGLE_CLOUD_PROJECT = cfg.gcp.project;
+      if (cfg.gcp?.location && !base.GOOGLE_CLOUD_LOCATION) base.GOOGLE_CLOUD_LOCATION = cfg.gcp.location;
+    } catch {}
+  }
   return base;
 }
 
@@ -142,6 +174,10 @@ const PI_DIR = path.join(os.homedir(), '.pi', 'agent');
 const PI_SESSIONS_DIR = path.join(PI_DIR, 'sessions');
 const GROK_HOME = process.env.GROK_HOME || path.join(os.homedir(), '.grok');
 const GROK_SESSIONS_DIR = path.join(GROK_HOME, 'sessions');
+const AGY_DIR = process.env.ANTIGRAVITY_APP_DATA_DIR || path.join(os.homedir(), '.gemini', 'antigravity-cli');
+const AGY_BRAIN_DIR = path.join(AGY_DIR, 'brain');
+const AGY_CONVERSATIONS_DIR = path.join(AGY_DIR, 'conversations');
+const AGY_SUMMARIES_DB = path.join(AGY_DIR, 'conversation_summaries.db');
 const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // Deployment knobs (Railway: see Dockerfile). All unset locally, which keeps
@@ -376,11 +412,18 @@ const grokBin = resolveBin('grok', [
   '/usr/local/bin/grok',
   '/opt/homebrew/bin/grok',
 ]);
+const agyBin = resolveBin('agy', [
+  path.join(os.homedir(), '.local', 'bin', 'agy'),
+  path.join(AGY_DIR, 'bin', 'agy'),
+  '/usr/local/bin/agy',
+  '/opt/homebrew/bin/agy',
+]);
 console.log(`  Claude binary: ${claudeBin}`);
 console.log(`  Codex binary: ${codexBin || '(not installed)'}`);
 console.log(`  Gemini binary: ${geminiBin || '(not installed)'}`);
 console.log(`  Pi binary: ${piBin || '(not installed)'}`);
 console.log(`  Grok binary: ${grokBin || '(not installed)'}`);
+console.log(`  Agy binary: ${agyBin || '(not installed)'}`);
 
 // --- Codex rollout index ---
 // Scans ~/.codex/sessions/**/*.jsonl, reads line 1 (session_meta) to extract cwd/id.
@@ -919,6 +962,118 @@ function grokProjectDir(project) {
 // Initial scan
 scanGrokSessions();
 
+// --- Antigravity CLI (agy) session index ---
+// Metadata lives in ~/.gemini/antigravity-cli/conversation_summaries.db
+// (conversation_summaries table), per-session SQLite state in conversations/<id>.db,
+// and JSONL step logs in brain/<id>/.system_generated/logs/transcript.jsonl.
+
+const agyIndex = new Map(); // id -> { id, cwd, mtime, date, preview, nativeTitle, jsonlPath, cacheMtime }
+
+function agyUserText(entry) {
+  if (!entry || entry.type !== 'USER_INPUT' || typeof entry.content !== 'string') return '';
+  const m = entry.content.match(/<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/);
+  const raw = (m ? m[1] : entry.content.replace(/<[^>]+>[\s\S]*?<\/[^>]+>/g, '')).trim();
+  if (!raw || raw.startsWith('/')) return '';
+  return raw;
+}
+
+function agyNativeTitle(raw) {
+  if (typeof raw !== 'string') return null;
+  const s = raw.replace(/\s+/g, ' ').trim();
+  if (!s || /^new conversation$/i.test(s)) return null;
+  return s.slice(0, 80);
+}
+
+function scanAgySessions() {
+  if (!agyBin || !DatabaseSync) return;
+  const dbMtime = statMtimeSafe(AGY_SUMMARIES_DB);
+  if (!dbMtime) return;
+
+  let rows;
+  let db;
+  try {
+    db = new DatabaseSync(AGY_SUMMARIES_DB, { readOnly: true });
+    rows = db.prepare(
+      'SELECT conversation_id, title, preview, step_count, last_modified_time, workspace_uris, parent_conversation_id, nesting_depth FROM conversation_summaries'
+    ).all();
+  } catch {
+    return;
+  } finally {
+    try { if (db) db.close(); } catch {}
+  }
+
+  const seen = new Set();
+  for (const row of rows) {
+    const id = row.conversation_id;
+    if (!id || !SESSION_ID_RE.test(id)) continue;
+    if (row.parent_conversation_id || row.nesting_depth > 0) continue;
+    if (!(row.step_count > 0)) continue;
+    const convDbPath = path.join(AGY_CONVERSATIONS_DIR, `${id}.db`);
+    const convMtime = statMtimeSafe(convDbPath);
+    if (!convMtime) continue;
+
+    let cwd = null;
+    try {
+      const uris = JSON.parse(row.workspace_uris || '[]');
+      if (Array.isArray(uris)) {
+        for (const u of uris) {
+          if (typeof u === 'string' && u.startsWith('file://')) {
+            cwd = fileURLToPath(u);
+            break;
+          }
+        }
+      }
+    } catch {}
+    if (!cwd) continue;
+
+    seen.add(id);
+    const jsonlPath = path.join(AGY_BRAIN_DIR, id, '.system_generated', 'logs', 'transcript.jsonl');
+    const jsonlMtime = statMtimeSafe(jsonlPath);
+    const rowTs = (typeof row.last_modified_time === 'string' && !row.last_modified_time.startsWith('0001-'))
+      ? Date.parse(row.last_modified_time)
+      : NaN;
+    const mtime = Math.max(Number.isFinite(rowTs) ? rowTs : 0, jsonlMtime, convMtime);
+    const nativeTitle = agyNativeTitle(row.title);
+    const cacheMtime = Math.max(dbMtime, mtime);
+    const cached = agyIndex.get(id);
+    if (cached && cached.cacheMtime === cacheMtime && cached.nativeTitle === nativeTitle) continue;
+
+    let firstMsg = null;
+    if (jsonlMtime > 0) {
+      try {
+        forEachJsonlEntry(jsonlPath, { maxBytes: 64 * 1024 }, entry => {
+          const text = agyUserText(entry);
+          if (text) {
+            firstMsg = text.slice(0, 120).replace(/\n/g, ' ');
+            return false;
+          }
+        });
+      } catch {}
+    }
+
+    const preview = firstMsg || nativeTitle || (typeof row.preview === 'string' && row.preview.trim() ? row.preview.trim().slice(0, 120).replace(/\n/g, ' ') : null);
+    if (!preview) continue;
+
+    agyIndex.set(id, {
+      id,
+      cwd,
+      mtime,
+      date: new Date(mtime).toISOString(),
+      preview,
+      nativeTitle,
+      jsonlPath: jsonlMtime > 0 ? jsonlPath : null,
+      cacheMtime,
+    });
+  }
+
+  for (const key of agyIndex.keys()) {
+    if (!seen.has(key)) agyIndex.delete(key);
+  }
+}
+
+// Initial scan
+scanAgySessions();
+
 // --- Agent registry ---
 // Everything agent-specific lives here: binary, session index + rescan,
 // summary-cache key namespacing, launch command, and new-session detection
@@ -1106,6 +1261,30 @@ const AGENTS = {
         .filter(s => s.mtime >= sessionStart - 5000)
         .sort((a, b) => b.mtime - a.mtime);
       return sessions[0]?.name || null;
+    },
+  },
+  agy: {
+    bin: agyBin,
+    scan: scanAgySessions,
+    sessions: () => agyIndex.values(),
+    summaryKey: id => `agy:${id}`,
+    launch(resume) {
+      const flags = process.env.HERD_AGY_SANDBOX === '0' ? '' : ' --sandbox';
+      const model = process.env.HERD_AGY_MODEL || 'gemini-4-argon-high';
+      return `${agyBin}${flags} --model ${model}${resume ? ` --conversation ${resume}` : ''}`;
+    },
+    snapshotKeys({ project }) {
+      scanAgySessions();
+      const ids = [];
+      for (const s of agyIndex.values()) if (s.cwd === project) ids.push(s.id);
+      return ids;
+    },
+    detect({ project, preexisting, sessionStart }) {
+      scanAgySessions();
+      const session = [...agyIndex.values()]
+        .filter(s => s.cwd === project && s.mtime >= sessionStart - 5000 && !preexisting.has(s.id))
+        .sort((a, b) => b.mtime - a.mtime)[0];
+      return session ? session.id : null;
     },
   },
 };
@@ -1470,6 +1649,21 @@ function getNamingText(session) {
     }
     return session.preview;
   }
+  if (session.agent === 'agy') {
+    if (session.nativeTitle && session.nativeTitle.length >= 3) return session.nativeTitle;
+    if (session.jsonlPath) {
+      const msgs = [];
+      try {
+        forEachJsonlEntry(session.jsonlPath, { maxBytes: 256 * 1024 }, entry => {
+          const text = agyUserText(entry);
+          if (text && text.length > 3) msgs.push(text.slice(0, 300).replace(/\n/g, ' ').trim());
+        });
+      } catch {}
+      const text = joinUpTo(msgs);
+      if (text.length >= 10) return text;
+    }
+    return session.preview;
+  }
   if (session.jsonlPath) {
     const text = joinUpTo(getUserMessages(session.jsonlPath));
     if (text.length >= 10) return text;
@@ -1553,7 +1747,9 @@ const MODEL_PRICING = {
   'gpt-5':                        { input: 1.25,  output: 10,    cache_read: 0.125 }, // also 5.1/codex variants + fallback
   'o3':                           { input: 2,     output: 8,     cache_read: 0.50 },
   'o4-mini':                      { input: 1.10,  output: 4.40,  cache_read: 0.275 },
-  // Google (Gemini CLI); Pro models bill higher above 200k prompt tokens
+  // Google (Gemini CLI / Antigravity); Pro/Argon models bill higher above 200k prompt tokens
+  'gemini-4-argon':               { input: 2,     output: 12,    cache_read: 0.20,
+                                    tier: { threshold: 200_000, input: 4, output: 18, cache_read: 0.40 } },
   'gemini-3.1-pro-preview':       { input: 2,     output: 12,    cache_read: 0.20,
                                     tier: { threshold: 200_000, input: 4, output: 18, cache_read: 0.40 } },
   'gemini-3-flash':               { input: 0.50,  output: 3,     cache_read: 0.05 },
@@ -1598,7 +1794,13 @@ const MODEL_PRICING = {
 const MODEL_ALIASES = {
   'anthropic/claude-4.6-sonnet-20260217': 'claude-sonnet-4-6',
   'anthropic/claude-4.6-opus-20260205': 'claude-opus-4-6',
+  'claude-opus-4.6': 'claude-opus-4-6',
+  'claude-sonnet-4.6': 'claude-sonnet-4-6',
   'claude-mythos-5': 'claude-fable-5',
+  'gemini-3.1-pro': 'gemini-3.1-pro-preview',
+  // Antigravity's "Gemini 3.8 Flash" has no published price; bill it as flash,
+  // not at the Opus default a prefix miss would give it
+  'gemini-3.8-flash': 'gemini-3-flash',
   'gemini-3.1-pro-preview-customtools': 'gemini-3.1-pro-preview',
   // Bare aliases occasionally logged instead of full ids
   'opus': 'claude-opus-4-8',
@@ -1950,6 +2152,69 @@ function scanGrokUsage(acc, cutoff) {
   }
 }
 
+// Antigravity CLI (agy): ~/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript.jsonl.
+// PLANNER_RESPONSE steps carry input_tokens (includes cache_read_tokens),
+// cache_read_tokens, and output_tokens. Subagent conversations are counted for
+// tokens but not as top-level sessions.
+function scanAgyUsage(acc, cutoff) {
+  try { fs.statSync(AGY_BRAIN_DIR); } catch { return; }
+  const subagents = new Set();
+  if (DatabaseSync && statMtimeSafe(AGY_SUMMARIES_DB)) {
+    let db;
+    try {
+      db = new DatabaseSync(AGY_SUMMARIES_DB, { readOnly: true });
+      const rows = db.prepare(
+        "SELECT conversation_id FROM conversation_summaries WHERE parent_conversation_id != '' OR nesting_depth > 0"
+      ).all();
+      for (const r of rows) if (r.conversation_id) subagents.add(r.conversation_id);
+    } catch {} finally {
+      try { if (db) db.close(); } catch {}
+    }
+  }
+  for (const id of readdirSafe(AGY_BRAIN_DIR)) {
+    if (!SESSION_ID_RE.test(id)) continue;
+    const transcriptPath = path.join(AGY_BRAIN_DIR, id, '.system_generated', 'logs', 'transcript.jsonl');
+    let stat;
+    try { stat = fs.statSync(transcriptPath); } catch { continue; }
+    if (stat.mtime < cutoff) continue;
+    let model = 'gemini-4-argon';
+    let hadUsage = false;
+    try {
+      forEachJsonlEntry(transcriptPath, {}, entry => {
+        if (!entry) return;
+        if (entry.type === 'USER_INPUT' && typeof entry.content === 'string') {
+          // Lazy, terminated by a sentence-ending period: the line continues "...to
+          // Gemini 4 Argon (High). No need to comment on this change...", so a greedy
+          // match backtracks to that later " to " and bills the session under a
+          // sentence fragment, while a bare `.` terminator cuts "Gemini 3.8 Flash" at "3".
+          const m = entry.content.match(/changed setting `Model Selection` from [^\n]+? to ([^\n]+?)\.(?=\s|$)/);
+          if (m) {
+            const slug = m[1].trim().toLowerCase().replace(/\s*\([^)]*\)\s*/g, '').replace(/[^a-z0-9.]+/g, '-').replace(/^-|-$/g, '');
+            if (slug) model = slug;
+          }
+          return;
+        }
+        if (entry.type !== 'PLANNER_RESPONSE') return;
+        const ts = typeof entry.created_at === 'string' ? entry.created_at : null;
+        if (ts) {
+          try { if (new Date(ts) < cutoff) return; } catch {}
+        }
+        const input = entry.input_tokens || 0;
+        const cached = entry.cache_read_tokens || 0;
+        const output = entry.output_tokens || 0;
+        if (input + cached + output === 0) return;
+        hadUsage = true;
+        addUsage(acc, model, ts ? ts.slice(0, 10) : null, {
+          input: Math.max(0, input - cached),
+          cache_read: cached,
+          output,
+        });
+      });
+    } catch {}
+    if (hadUsage && !subagents.has(id)) acc.totalSessions++;
+  }
+}
+
 function computeTokenUsage() {
   const now = Date.now();
   if (tokenUsageCache && now - tokenUsageCacheTime < TOKEN_CACHE_TTL) return tokenUsageCache;
@@ -1961,6 +2226,7 @@ function computeTokenUsage() {
   scanGeminiUsage(acc, cutoff);
   scanPiUsage(acc, cutoff);
   scanGrokUsage(acc, cutoff);
+  scanAgyUsage(acc, cutoff);
   const { byModel, byDate, totalMessages, totalSessions } = acc;
 
   // Totals per model (cost is accumulated per call in addUsage — tiered
@@ -2092,6 +2358,7 @@ app.get('/api/projects', (req, res) => {
         geminiAvailable: !!geminiBin,
         piAvailable: !!piBin,
         grokAvailable: !!grokBin,
+        agyAvailable: !!agyBin,
         // Keep encoded id for backward compat with session endpoint
         id: p.claudeEncoded || null,
       }))
@@ -3447,21 +3714,28 @@ function spawnTerminal({ ws, clientId, agent, agentDef, resume, resolvedProject,
     // don't leave the timer dead.
     scheduleNextRename();
 
-    // Grok writes generated_title to summary.json. Alt-screen TUI output is
-    // useless for Haiku, so poll the native title and never send it there.
-    if (agent === 'grok') {
-      try { scanGrokSessions(); } catch {}
+    // Grok and Agy write generated titles to their session stores. Alt-screen
+    // TUI output is useless for Haiku, so poll the native title and never send
+    // it there.
+    if (agent === 'grok' || agent === 'agy') {
+      try { AGENTS[agent].scan(); } catch {}
       const sid = detectSessionId();
       if (!sid) return;
-      const title = findAgentSession('grok', sid)?.nativeTitle;
-      if (!title) return;
-      const key = summaryCacheKey('grok', sid);
+      const title = findAgentSession(agent, sid)?.nativeTitle;
+      if (!title) {
+        if (renameCount === 0 && !sessionEnded && Date.now() - sessionStart < MAX_RENAME_AGE) {
+          if (renameTimer) clearTimeout(renameTimer);
+          renameTimer = setTimeout(generateTitle, 5000);
+        }
+        return;
+      }
+      const key = summaryCacheKey(agent, sid);
       if (getSummaryText(key) === title) return;
       renameCount++;
       sendTitle(title);
       setSummary(key, title);
       scheduleSaveSummary();
-      broadcastSummaryUpdate(sid, 'grok', title);
+      broadcastSummaryUpdate(sid, agent, title);
       return;
     }
 
@@ -3547,7 +3821,7 @@ function spawnTerminal({ ws, clientId, agent, agentDef, resume, resolvedProject,
       }
       if (!detectSessionId()) {
         sessionDetectTimer = setTimeout(pollSessionId, SESSION_DETECT_INTERVAL);
-      } else if (agent === 'grok') {
+      } else if (agent === 'grok' || agent === 'agy') {
         // Title lands shortly after the first prompt — don't wait 90s for Haiku.
         if (renameTimer) clearTimeout(renameTimer);
         renameTimer = setTimeout(generateTitle, 3000);

@@ -3,7 +3,7 @@
 This file provides guidance to the Gemini CLI when working with code in this repository.
 
 ## Architecture overview
-Herd is a web-based terminal multiplexer for Claude Code, OpenAI Codex, Gemini CLI, pi, and Grok Build sessions. It lets you browse, resume, and manage sessions across all your projects from a single browser tab. It scans for session histories in `~/.claude/projects/`, `~/.codex/sessions/`, `~/.gemini/tmp/`, `~/.pi/agent/sessions/`, and `~/.grok/sessions/`, merging them into a unified project view based on the real working directory.
+Herd is a web-based terminal multiplexer for Claude Code, OpenAI Codex, Gemini CLI, pi, Grok Build, and Antigravity CLI sessions. It lets you browse, resume, and manage sessions across all your projects from a single browser tab. It scans for session histories in `~/.claude/projects/`, `~/.codex/sessions/`, `~/.gemini/tmp/`, `~/.pi/agent/sessions/`, `~/.grok/sessions/`, and `~/.gemini/antigravity-cli/`, merging them into a unified project view based on the real working directory.
 
 ## Core tasks & behaviors
 - **Restart server from Gemini CLI**: The server runs on port 3456. To restart it correctly, run `lsof -ti:3456 | xargs kill -9 2>/dev/null; while lsof -ti:3456 >/dev/null 2>&1; do sleep 0.3; done; nohup node server.js > /tmp/herd.log 2>&1 &` — must be a single foreground Bash call.
@@ -23,7 +23,7 @@ Herd is a web-based terminal multiplexer for Claude Code, OpenAI Codex, Gemini C
 - `GET /api/summary-events` — SSE endpoint for broadcasting live Haiku summary updates.
 
 ## Multi-Agent Integration
-- **Agents**: Claude Code via `claude`, Codex via `codex`, Gemini CLI via `gemini`.
+- **Agents**: Claude Code via `claude`, Codex via `codex`, Gemini CLI via `gemini`, pi via `pi`, Grok Build via `grok`, Antigravity CLI via `agy`.
 - **Merging**: Projects are grouped by their canonical `cwd` (realPath) across all providers.
-- **WebSocket**: Connections include an `agent=claude|codex|gemini` parameter to determine which binary to spawn.
-- **Precedence**: `claudeBin`, `codexBin`, and `geminiBin` are resolved once at startup. If a binary is missing, its UI should be hidden without breaking the rest of the application.
+- **WebSocket**: Connections include an `agent=claude|codex|gemini|pi|grok|agy` parameter to determine which binary to spawn.
+- **Precedence**: `claudeBin`, `codexBin`, `geminiBin`, `piBin`, `grokBin`, and `agyBin` are resolved once at startup. If a binary is missing, its UI should be hidden without breaking the rest of the application.
