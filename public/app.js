@@ -145,6 +145,7 @@ class Herd {
     this.setupFiles();
     this.setupDictation();
     this.setupPassword();
+    this.setupVoice();
     this.setupLocalServices();
     this.listenForSummaryUpdates();
     this.refreshLive();
@@ -205,10 +206,18 @@ class Herd {
       this._lastWall = wall;
       this._lastPerf = perf;
     };
-    setInterval(wakeCheck, 5000);
+    setInterval(() => {
+      wakeCheck();
+      // Re-assert focus: the active tab's termId changes on reconnect, and a
+      // restarted server forgets. A blurred window stays silent here, so it
+      // never clobbers the focused one.
+      if (document.hasFocus()) this.reportFocus();
+    }, 5000);
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible') wakeCheck();
     });
+    window.addEventListener('focus', () => this.reportFocus());
+    window.addEventListener('blur', () => this.reportFocus());
 
     // xterm WebGL atlas LRU eviction can corrupt individual glyph slots in
     // long sessions — scattered wrong characters appear mid-word. A periodic
@@ -467,6 +476,26 @@ class Herd {
         this.createTab(data.path, data.name);
       } catch {}
       finally { btn.disabled = false; }
+    });
+  }
+
+  // ── Voice summaries (macOS host): on/off for ~/.claude/hooks/speak_done.sh ──
+
+  async setupVoice() {
+    const btn = document.getElementById('voice-btn');
+    if (!btn || !this.host.native) return;
+    const show = on => btn.classList.toggle('active', on);
+    try { show((await (await fetch('/api/voice')).json()).on); } catch { return; }
+    btn.hidden = false;
+    btn.addEventListener('click', async () => {
+      const on = !btn.classList.contains('active');
+      try {
+        const r = await fetch('/api/voice', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ on }),
+        });
+        if (r.ok) show(on);
+      } catch {}
     });
   }
 
@@ -1987,6 +2016,17 @@ class Herd {
     // F8: Highlight active project in sidebar
     this.highlightActiveProject();
     this.saveTabState();
+    this.reportFocus();
+  }
+
+  // Tell the server which terminal is in front of the user (see /api/focus in
+  // server.js): the active tab while this window has focus, else none.
+  reportFocus() {
+    const tab = document.hasFocus() && this.tabs.get(this.activeTabId);
+    fetch('/api/focus', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ termId: tab?.termId || null }),
+    }).catch(() => {});
   }
 
   // Fit a tab that has just been made visible. If xterm still has no cell

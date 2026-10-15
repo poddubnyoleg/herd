@@ -980,7 +980,7 @@ body {
   background: var(--bg-hover);
 }
 
-.theme-btn.active {
+.theme-btn.active, #voice-btn.active {
   color: var(--accent);
   border-color: var(--accent);
   background: var(--bg-hover);

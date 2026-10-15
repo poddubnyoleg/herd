@@ -3008,9 +3008,9 @@ function killTerminal(term, { byUser = false } = {}) {
   try { term.proc.kill('SIGHUP'); } catch {}
 }
 
-function createTerm({ proc, agent, project, sessionId, cols, rows }) {
+function createTerm({ termId, proc, agent, project, sessionId, cols, rows }) {
   const term = {
-    termId: crypto.randomUUID(), proc, agent, project, sessionId, title: null,
+    termId, proc, agent, project, sessionId, title: null,
     viewer: null, viewerClientId: null, viewerSize: { cols, rows },
     // Attach handoff (see placeCut)
     attaching: false, pending: [], cutWaiting: false, cutForced: false, cutTimer: null,
@@ -3408,6 +3408,33 @@ const reaper = setInterval(() => {
   }
 }, REAPER_INTERVAL);
 
+// The terminal in front of the user: the page reports its active tab while its
+// window has focus, null on blur. GET answers only "is THIS one focused?", so it
+// never names an attach id to a caller that doesn't already hold it.
+let focusedTermId = null;
+app.post('/api/focus', express.json({ limit: '1kb' }), (req, res) => {
+  focusedTermId = typeof req.body?.termId === 'string' ? req.body.termId : null;
+  res.end();
+});
+app.get('/api/focus', (req, res) => {
+  res.json({ focused: focusedTermId !== null && req.query.termId === focusedTermId });
+});
+
+// Voice summaries (~/.claude/hooks/speak_done.sh) stay quiet while this file
+// exists — a file, so the hook honors it in non-Herd terminals too.
+const VOICE_OFF_FILE = path.join(os.homedir(), '.claude', 'speak_done.off');
+app.get('/api/voice', (req, res) => res.json({ on: !fs.existsSync(VOICE_OFF_FILE) }));
+app.post('/api/voice', express.json({ limit: '1kb' }), (req, res) => {
+  const on = req.body?.on === true;
+  try {
+    if (on) fs.rmSync(VOICE_OFF_FILE, { force: true });
+    else fs.writeFileSync(VOICE_OFF_FILE, '');
+    res.json({ on });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/api/live', (req, res) => {
   res.json([...terminals.values()].filter(t => !t.killed).map(t => ({
     termId: t.termId, pid: t.proc.pid, agent: t.agent, sessionId: t.sessionId,
@@ -3554,6 +3581,7 @@ function spawnTerminal({ ws, clientId, agent, agentDef, resume, resolvedProject,
     } catch {}
   }
 
+  const termId = crypto.randomUUID();
   const proc = pty.spawn(shell, ['-li'], {
     name: 'xterm-256color',
     cols,
@@ -3573,11 +3601,13 @@ function spawnTerminal({ ws, clientId, agent, agentDef, resume, resolvedProject,
       TERM_PROGRAM: 'iTerm.app',
       TERM_PROGRAM_VERSION: '3.7.0',
       LC_TERMINAL: 'iTerm2',
+      // Lets processes in this tab ask whether it is the one in front of the
+      // user (see /api/focus) — the voice-summary hook stays quiet if so.
+      HERD_FOCUS_URL: `http://127.0.0.1:${PORT}/api/focus?termId=${termId}`,
     },
   });
 
-  const term = createTerm({ proc, agent, project: resolvedProject, sessionId, cols, rows });
-  const termId = term.termId;
+  const term = createTerm({ termId, proc, agent, project: resolvedProject, sessionId, cols, rows });
   attachViewer(term, ws, clientId, { cols, rows, snapshot: false });
   sendJson(ws, { type: 'ready', termId, sessionId });
   const sendTitle = title => {
