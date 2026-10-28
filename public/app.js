@@ -2584,14 +2584,18 @@ class Herd {
   // (one DEL per keydown, nothing deleted natively), and this repeats it
   // while the key is down, as a hardware keyboard would: after 450ms,
   // every 60ms until the keyup. If iOS does repeat the keydown, that
-  // repeat is xterm's and this stands down.
+  // repeat is xterm's and this stands down. Only once a ⌫ keyup has been
+  // seen to come a tap's length after its keydown, i.e. at the release:
+  // were it sent with the keydown, or never, repeating would run on.
   setupIosRepeat(tab) {
     const { terminal } = tab, ta = terminal.textarea;
-    let timer = 0;
+    let timer = 0, downStamp = 0;
     const stop = () => { clearTimeout(timer); timer = 0; };
     ta.addEventListener('keydown', e => {
       const del = e.key === 'Backspace' && !e.altKey && !e.ctrlKey && !e.metaKey;
       if (!del || e.repeat || timer) return stop();
+      downStamp = e.timeStamp;
+      if (!this._keyupAtRelease) return;
       // A keyup that never comes must not empty the prompt
       const until = performance.now() + 10000;
       const tick = delay => {
@@ -2604,7 +2608,10 @@ class Herd {
       };
       tick(450);
     }, true); // capture: xterm stops the propagation of keys it sends on
-    ta.addEventListener('keyup', stop, true);
+    ta.addEventListener('keyup', e => {
+      if (e.key === 'Backspace' && e.timeStamp - downStamp > 40) this._keyupAtRelease = true;
+      stop();
+    }, true);
     ta.addEventListener('blur', stop, true);
   }
 
