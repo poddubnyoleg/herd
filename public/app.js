@@ -2574,18 +2574,23 @@ class Herd {
   // press deleted one character and holding did nothing — clearing a
   // dictated paragraph took a tap per character. Keep filler in the
   // textarea for iOS to delete natively (createTab's key handler lets ⌫
-  // through) and send one DEL per deletion. One, not one per character
-  // removed: iOS deletes more than a character from the filler on a single
-  // press (spaces go in runs), and counting them sent a burst of DELs. A
-  // keyCode-229 edit is xterm's: its IME handling diffs the field and sends
-  // the DEL itself, so it is only refilled after.
+  // through) and send one DEL per press. A single press could remove
+  // several characters of the filler, or arrive as more than one deletion,
+  // and sending a DEL per character removed made it delete several. So a
+  // deletion after a ⌫ keydown sends one DEL; one without a keydown of its
+  // own (iOS may repeat a held ⌫ that way) sends one only 30ms or more
+  // after the last — the repeat comes about every 100ms. A keyCode-229
+  // edit is xterm's: its IME handling diffs the field and sends the DEL
+  // itself, so it is only refilled after.
   setupIosDelete(tab) {
     const { terminal } = tab, ta = terminal.textarea;
-    let xtermOwns = false;
+    let xtermOwns = false, pressed = false, lastDel = 0;
     tab.iosKeydown = e => {
       Herd.padTextarea(ta);
       xtermOwns = e.keyCode === 229 && e.key !== 'Backspace';
-      return e.key === 'Backspace' && !e.altKey && !e.ctrlKey && !e.metaKey;
+      const del = e.key === 'Backspace' && !e.altKey && !e.ctrlKey && !e.metaKey;
+      if (del) pressed = true;
+      return del;
     };
     ta.addEventListener('keyup', () => { xtermOwns = false; });
     ta.addEventListener('input', e => {
@@ -2593,8 +2598,11 @@ class Herd {
       xtermOwns = false;
       if (!/^delete.*Backward$/.test(e.inputType) || e.isComposing) return;
       if (!ours) return void setTimeout(() => Herd.padTextarea(ta));
+      const now = performance.now();
       // Private API, as in setupKeybar: input sent as if typed
-      terminal._core.coreService.triggerDataEvent('\x7f', true);
+      if (pressed || now - lastDel >= 30) terminal._core.coreService.triggerDataEvent('\x7f', true);
+      pressed = false;
+      lastDel = now;
       Herd.padTextarea(ta, true);
     });
     ta.addEventListener('focus', () => Herd.padTextarea(ta));
@@ -2635,7 +2643,7 @@ class Herd {
     const log = s => this.diag.push(`${tab.id.slice(-4)} ${performance.now().toFixed(0)} ${s}`);
     let sentAt = 0, parsed = false, len = 0;
     ta.addEventListener('keydown', e => {
-      log(`kd ${e.key.length === 1 ? 'c' : e.key} kc=${e.keyCode} late=${(performance.now() - e.timeStamp).toFixed(0)}`);
+      log(`kd ${/^[A-Z][A-Za-z0-9]+$/.test(e.key) ? e.key : 'c'} kc=${e.keyCode} late=${(performance.now() - e.timeStamp).toFixed(0)}`);
     }, true);
     ta.addEventListener('beforeinput', () => { len = ta.value.length; }, true);
     ta.addEventListener('input', e => log(`in ${e.inputType} ${len}→${ta.value.length}${e.isComposing ? ' composing' : ''}`), true);

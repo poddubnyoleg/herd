@@ -3425,7 +3425,7 @@ app.post('/api/focus', express.json({ limit: '1kb' }), (req, res) => {
 // phone-only problem can be read from the server log
 app.post('/api/diag', express.json({ limit: '64kb' }), (req, res) => {
   const lines = Array.isArray(req.body?.lines) ? req.body.lines : [];
-  for (const line of lines.slice(0, 500)) console.log(`[diag] ${String(line).slice(0, 300)}`);
+  for (const line of lines.slice(0, 500)) console.log(`[diag] ${String(line).slice(0, 300).replace(/[\x00-\x1f\x7f]/g, ' ')}`);
   res.end();
 });
 app.get('/api/focus', (req, res) => {
