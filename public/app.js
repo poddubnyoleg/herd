@@ -1366,8 +1366,6 @@ class Herd {
     // macOS keyboard navigation: Option+Arrow for word jump, Cmd+Arrow for line jump
     terminal.attachCustomKeyEventHandler(e => {
       if (e.type !== 'keydown') return true;
-      // iOS: ⌫ deletes from the textarea natively (setupIosDelete)
-      if (this.ios && tab.iosKeydown?.(e)) return false;
       // Cmd+C with a selection: copy with prose reflow. TUIs (Claude Code
       // et al.) hard-wrap prose at the terminal width, so the buffer holds
       // real newlines xterm can't distinguish from intentional ones —
@@ -1434,12 +1432,22 @@ class Herd {
         tab._awaitingInput = false;
         this._dbg('input-gate-cleared', { tab: tab.id, name: tab.name });
       }
+      const typed = tab._typed;
+      tab._typed = false;
       if (tab.ws?.readyState === WebSocket.OPEN) {
         tab.ws.send(JSON.stringify({ type: 'input', data }));
-        tab._echoPending = true;
-        if (this.touch.matches) this.predictEcho(tab, data);
+        // Only what the user typed. xterm also answers the app's queries
+        // through onData — Claude asks after every frame — and taking
+        // those replies for keys reset every guess
+        if (typed) {
+          tab._echoPending = true;
+          if (this.touch.matches) this.predictEcho(tab, data);
+        }
       }
     });
+    // Private API: fires just before onData, for input the user made (keys,
+    // paste) and not for xterm's replies or focus reports
+    terminal._core.coreService.onUserInput(() => { tab._typed = true; });
     terminal.onResize(({ cols, rows }) => {
       this.clearEcho(tab, true);
       if (tab.ws?.readyState === WebSocket.OPEN) tab.ws.send(JSON.stringify({ type: 'resize', cols, rows }));
@@ -1472,7 +1480,7 @@ class Herd {
       const hidden = wrapper.getClientRects().length === 0;
       if (hidden) wrapper.classList.add('measuring');
       terminal.open(wrapper);
-      if (this.ios) this.setupIosDelete(tab);
+      if (this.ios) this.setupIosRepeat(tab);
       if (this.diag) this.setupDiag(tab);
 
       // GPU-accelerated rendering via WebGL (major FPS improvement).
@@ -2568,47 +2576,36 @@ class Herd {
     terminal.focus();
   }
 
-  // iOS repeats a held ⌫ only while the field has text to delete, and
-  // xterm's textarea never has any: it cancels every key it sends on, and
-  // empties the field on blur, ⏎, ^C and after a paste (dictation). So a
-  // press deleted one character and holding did nothing — clearing a
-  // dictated paragraph took a tap per character. Keep filler in the
-  // textarea for iOS to delete natively (createTab's key handler lets ⌫
-  // through) and send one DEL per press. A single press could remove
-  // several characters of the filler, or arrive as more than one deletion,
-  // and sending a DEL per character removed made it delete several. So a
-  // deletion after a ⌫ keydown sends one DEL; one without a keydown of its
-  // own (iOS may repeat a held ⌫ that way) sends one only 30ms or more
-  // after the last — the repeat comes about every 100ms. A keyCode-229
-  // edit is xterm's: its IME handling diffs the field and sends the DEL
-  // itself, so it is only refilled after.
-  setupIosDelete(tab) {
+  // A held ⌫ on the iOS keyboard sends a single keydown — measured with
+  // ?diag: no repeats, so holding it deleted one character. Letting iOS
+  // delete from the textarea natively instead (so it would repeat) made a
+  // single press remove whole words, or everything, and left an undo
+  // history behind ("Undo Typing" on a shake). So xterm keeps the ⌫
+  // (one DEL per keydown, nothing deleted natively), and this repeats it
+  // while the key is down, as a hardware keyboard would: after 450ms,
+  // every 60ms until the keyup. If iOS does repeat the keydown, that
+  // repeat is xterm's and this stands down.
+  setupIosRepeat(tab) {
     const { terminal } = tab, ta = terminal.textarea;
-    let xtermOwns = false, pressed = false, lastDel = 0;
-    tab.iosKeydown = e => {
-      Herd.padTextarea(ta);
-      xtermOwns = e.keyCode === 229 && e.key !== 'Backspace';
+    let timer = 0;
+    const stop = () => { clearTimeout(timer); timer = 0; };
+    ta.addEventListener('keydown', e => {
       const del = e.key === 'Backspace' && !e.altKey && !e.ctrlKey && !e.metaKey;
-      if (del) pressed = true;
-      return del;
-    };
-    ta.addEventListener('keyup', () => { xtermOwns = false; });
-    ta.addEventListener('input', e => {
-      const ours = !xtermOwns;
-      xtermOwns = false;
-      if (!/^delete.*Backward$/.test(e.inputType) || e.isComposing) return;
-      if (!ours) return void setTimeout(() => Herd.padTextarea(ta));
-      const now = performance.now();
-      // Private API, as in setupKeybar: input sent as if typed
-      if (pressed || now - lastDel >= 30) terminal._core.coreService.triggerDataEvent('\x7f', true);
-      pressed = false;
-      lastDel = now;
-      Herd.padTextarea(ta, true);
-    });
-    ta.addEventListener('focus', () => Herd.padTextarea(ta));
-    // After xterm has emptied the field (paste, ⏎, ^C), not when ⌫ is
-    // already down: iOS may decide on repeating before the keydown
-    terminal.onData(() => setTimeout(() => Herd.padTextarea(ta)));
+      if (!del || e.repeat || timer) return stop();
+      // A keyup that never comes must not empty the prompt
+      const until = performance.now() + 10000;
+      const tick = delay => {
+        timer = setTimeout(() => {
+          if (performance.now() > until) return stop();
+          // Private API, as in setupKeybar: input sent as if typed
+          terminal._core.coreService.triggerDataEvent('\x7f', true);
+          tick(60);
+        }, delay);
+      };
+      tick(450);
+    }, true); // capture: xterm stops the propagation of keys it sends on
+    ta.addEventListener('keyup', stop, true);
+    ta.addEventListener('blur', stop, true);
   }
 
   // ── Diagnostics (?diag) ──
@@ -2641,10 +2638,13 @@ class Herd {
   setupDiag(tab) {
     const { terminal } = tab, ta = terminal.textarea;
     const log = s => this.diag.push(`${tab.id.slice(-4)} ${performance.now().toFixed(0)} ${s}`);
-    let sentAt = 0, parsed = false, len = 0;
+    let sentAt = 0, parsed = false, len = 0, downAt = 0;
+    const name = e => /^[A-Z][A-Za-z0-9]+$/.test(e.key) ? e.key : 'c';
     ta.addEventListener('keydown', e => {
-      log(`kd ${/^[A-Z][A-Za-z0-9]+$/.test(e.key) ? e.key : 'c'} kc=${e.keyCode} late=${(performance.now() - e.timeStamp).toFixed(0)}`);
+      downAt = performance.now();
+      log(`kd ${name(e)} kc=${e.keyCode}${e.repeat ? ' repeat' : ''} late=${(downAt - e.timeStamp).toFixed(0)}`);
     }, true);
+    ta.addEventListener('keyup', e => log(`ku ${name(e)} after=${(performance.now() - downAt).toFixed(0)}`), true);
     ta.addEventListener('beforeinput', () => { len = ta.value.length; }, true);
     ta.addEventListener('input', e => log(`in ${e.inputType} ${len}→${ta.value.length}${e.isComposing ? ' composing' : ''}`), true);
     terminal.onData(d => {
@@ -2660,16 +2660,6 @@ class Herd {
     terminal.onRender(() => {
       if (sentAt && parsed) { log(`echo drawn +${(performance.now() - sentAt).toFixed(0)}`); sentAt = 0; }
     });
-  }
-
-  // Spaces, so QuickType and dictation still see the start of a word. A
-  // field with text is left alone unless the edit was ours: xterm's IME
-  // handling diffs the value around a keystroke, and text it has yet to
-  // send must not change under it.
-  static padTextarea(ta, reset = false) {
-    if (ta.value && !reset) return;
-    ta.value = ' '.repeat(8);
-    ta.setSelectionRange(8, 8);
   }
 
   // The terminal's buffer as plain text the browser can select natively.
@@ -2790,6 +2780,7 @@ class Herd {
       tab.terminal._core.coreService.triggerDataEvent(data, true);
     };
     for (const btn of bar.querySelectorAll('button')) {
+      if (btn.dataset.key === 'bksp') { this.holdKey(btn); continue; }
       // Cancelling touchstart/mousedown keeps focus in the terminal, so the
       // keyboard stays up. Act on touchend: a clipboard read needs user
       // activation, which touchstart does not grant. A touch that slid off
@@ -2805,6 +2796,29 @@ class Herd {
     }
     // navigator.clipboard exists only in secure contexts (https, localhost)
     if (!navigator.clipboard?.readText) bar.querySelector('[data-key="paste"]').hidden = true;
+  }
+
+  // ⌫ on the key bar repeats while held — the page sees this button's
+  // touch begin and end, which it may not for the iOS keyboard's own ⌫
+  // (setupIosRepeat). Acts on touchstart, unlike the other keys: a held
+  // key has to start at once.
+  holdKey(btn) {
+    let timer = 0;
+    // Private API, as in press(): input sent as if typed
+    const send = () => this.tabs.get(this.activeTabId)?.terminal._core.coreService.triggerDataEvent('\x7f', true);
+    const stop = () => { clearTimeout(timer); timer = 0; };
+    const start = e => {
+      e.preventDefault(); // focus, and the keyboard, stay with the terminal
+      stop();
+      send();
+      const tick = delay => { timer = setTimeout(() => { send(); tick(60); }, delay); };
+      tick(450);
+    };
+    btn.addEventListener('touchstart', start, { passive: false });
+    btn.addEventListener('mousedown', start);
+    // Cancelled, or the browser follows the touch with a mousedown: a second ⌫
+    btn.addEventListener('touchend', e => { e.preventDefault(); stop(); });
+    for (const type of ['touchcancel', 'mouseup', 'mouseleave']) btn.addEventListener(type, stop);
   }
 
   armCtrl(on) {
