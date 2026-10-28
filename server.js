@@ -3421,6 +3421,13 @@ app.post('/api/focus', express.json({ limit: '1kb' }), (req, res) => {
   focusedTermId = typeof req.body?.termId === 'string' ? req.body.termId : null;
   res.end();
 });
+// Input timings from a page opened with ?diag (startDiag in app.js), so a
+// phone-only problem can be read from the server log
+app.post('/api/diag', express.json({ limit: '64kb' }), (req, res) => {
+  const lines = Array.isArray(req.body?.lines) ? req.body.lines : [];
+  for (const line of lines.slice(0, 500)) console.log(`[diag] ${String(line).slice(0, 300)}`);
+  res.end();
+});
 app.get('/api/focus', (req, res) => {
   res.json({ focused: focusedTermId !== null && req.query.termId === focusedTermId });
 });

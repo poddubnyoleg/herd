@@ -114,6 +114,9 @@ class Herd {
     // iPadOS presents itself as a Mac
     this.ios = /iP(hone|ad|od)/.test(navigator.userAgent) || (/Mac/.test(navigator.platform) && navigator.maxTouchPoints > 1);
     this._ctrlArmed = false; // key bar's sticky ctrl
+    // ?diag: report input timings to the server log (startDiag)
+    this.diag = new URLSearchParams(location.search).has('diag') ? [] : null;
+    if (this.diag) this.startDiag();
     // Diagnostic ring buffer for the unread/finished pipeline. Dump with
     // __herd.dumpLog() in the console when tabs pulse green spuriously.
     this._log = [];
@@ -1470,6 +1473,7 @@ class Herd {
       if (hidden) wrapper.classList.add('measuring');
       terminal.open(wrapper);
       if (this.ios) this.setupIosDelete(tab);
+      if (this.diag) this.setupDiag(tab);
 
       // GPU-accelerated rendering via WebGL (major FPS improvement).
       // On context loss, re-install on the next frame — otherwise the
@@ -2570,13 +2574,13 @@ class Herd {
   // press deleted one character and holding did nothing — clearing a
   // dictated paragraph took a tap per character. Keep filler in the
   // textarea for iOS to delete natively (createTab's key handler lets ⌫
-  // through) and send each deletion on as a DEL per character removed; a
-  // long hold speeds up to a word per step, which arrives as a larger
-  // deletion. A keyCode-229 edit is xterm's: its IME handling diffs the
-  // field and sends the DEL itself, so it is only refilled after.
+  // through) and send one DEL per deletion. One, not one per character
+  // removed: iOS deletes more than a character from the filler on a single
+  // press (spaces go in runs), and counting them sent a burst of DELs. A
+  // keyCode-229 edit is xterm's: its IME handling diffs the field and sends
+  // the DEL itself, so it is only refilled after.
   setupIosDelete(tab) {
     const { terminal } = tab, ta = terminal.textarea;
-    let before = null; // the value at beforeinput
     let xtermOwns = false;
     tab.iosKeydown = e => {
       Herd.padTextarea(ta);
@@ -2584,30 +2588,70 @@ class Herd {
       return e.key === 'Backspace' && !e.altKey && !e.ctrlKey && !e.metaKey;
     };
     ta.addEventListener('keyup', () => { xtermOwns = false; });
-    ta.addEventListener('beforeinput', () => { before = ta.value; });
     ta.addEventListener('input', e => {
-      const was = before, ours = !xtermOwns;
-      before = null;
+      const ours = !xtermOwns;
       xtermOwns = false;
       if (!/^delete.*Backward$/.test(e.inputType) || e.isComposing) return;
       if (!ours) return void setTimeout(() => Herd.padTextarea(ta));
-      // Characters, not UTF-16 units: one ⌫ over an emoji is one DEL
-      let removed = 1;
-      if (was !== null) {
-        const now = ta.value;
-        let i = 0;
-        while (i < now.length && now[i] === was[i]) i++;
-        const gone = was.slice(i, i + was.length - now.length);
-        removed = Intl.Segmenter ? [...new Intl.Segmenter().segment(gone)].length : [...gone].length;
-      }
       // Private API, as in setupKeybar: input sent as if typed
-      terminal._core.coreService.triggerDataEvent('\x7f'.repeat(Math.max(1, removed)), true);
+      terminal._core.coreService.triggerDataEvent('\x7f', true);
       Herd.padTextarea(ta, true);
     });
     ta.addEventListener('focus', () => Herd.padTextarea(ta));
     // After xterm has emptied the field (paste, ⏎, ^C), not when ⌫ is
     // already down: iOS may decide on repeating before the keydown
     terminal.onData(() => setTimeout(() => Herd.padTextarea(ta)));
+  }
+
+  // ── Diagnostics (?diag) ──
+  // Phone-only input problems can't be watched from a desk, so a page
+  // opened with ?diag reports what its terminals see to the server log
+  // (POST /api/diag): how late each key event reaches the page, what iOS
+  // does to the textarea, how long until the echo is parsed and drawn, and
+  // frames the page missed. Typed characters are logged as "c", never as
+  // themselves.
+  startDiag() {
+    const send = () => {
+      if (!this.diag.length) return;
+      const lines = this.diag.splice(0);
+      fetch('/api/diag', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ lines }), keepalive: true,
+      }).catch(() => {});
+    };
+    setInterval(send, 2000);
+    this.diag.push(`- start ${navigator.userAgent} touch=${this.touch.matches} ios=${this.ios} vv=${window.visualViewport?.height}`);
+    let last = performance.now();
+    const frame = now => {
+      if (now - last > 100 && document.visibilityState === 'visible') this.diag.push(`- stall ${(now - last).toFixed(0)}ms`);
+      last = now;
+      requestAnimationFrame(frame);
+    };
+    requestAnimationFrame(frame);
+  }
+
+  setupDiag(tab) {
+    const { terminal } = tab, ta = terminal.textarea;
+    const log = s => this.diag.push(`${tab.id.slice(-4)} ${performance.now().toFixed(0)} ${s}`);
+    let sentAt = 0, parsed = false, len = 0;
+    ta.addEventListener('keydown', e => {
+      log(`kd ${e.key.length === 1 ? 'c' : e.key} kc=${e.keyCode} late=${(performance.now() - e.timeStamp).toFixed(0)}`);
+    }, true);
+    ta.addEventListener('beforeinput', () => { len = ta.value.length; }, true);
+    ta.addEventListener('input', e => log(`in ${e.inputType} ${len}→${ta.value.length}${e.isComposing ? ' composing' : ''}`), true);
+    terminal.onData(d => {
+      sentAt = performance.now();
+      parsed = false;
+      const what = /^\x7f+$/.test(d) ? `DEL×${d.length}` : d.startsWith('\x1b') ? 'esc' : d === '\r' ? 'CR' : d.length === 1 && d >= ' ' ? 'c' : `n=${d.length}`;
+      const e = tab._echo;
+      log(`data ${what}${e ? ` ghosts=${e.ghosts.length}${e.shown ? ' shown' : ''}` : ''}`);
+    });
+    terminal.onWriteParsed(() => {
+      if (sentAt && !parsed) { parsed = true; log(`echo parsed +${(performance.now() - sentAt).toFixed(0)}`); }
+    });
+    terminal.onRender(() => {
+      if (sentAt && parsed) { log(`echo drawn +${(performance.now() - sentAt).toFixed(0)}`); sentAt = 0; }
+    });
   }
 
   // Spaces, so QuickType and dictation still see the start of a word. A
