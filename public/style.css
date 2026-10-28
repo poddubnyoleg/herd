@@ -1105,6 +1105,12 @@ body {
   overscroll-behavior: contain;
 }
 
+/* Predictive echo (predictEcho): typed characters drawn at the cursor
+   ahead of the server's echo */
+.echo-ghosts { position: absolute; inset: 0; pointer-events: none; z-index: 8; }
+.echo-ghosts span { position: absolute; text-align: center; white-space: pre; }
+.echo-ghosts .echo-cursor { box-shadow: 1px 0 0 currentColor; }
+
 /* ── Touch ── */
 
 @media (pointer: coarse) {

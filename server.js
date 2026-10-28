@@ -3014,8 +3014,9 @@ function createTerm({ termId, proc, agent, project, sessionId, cols, rows }) {
     viewer: null, viewerClientId: null, viewerSize: { cols, rows },
     // Attach handoff (see placeCut)
     attaching: false, pending: [], cutWaiting: false, cutForced: false, cutTimer: null,
-    // 8ms output coalescer — belongs to the current viewer
-    outBuf: '', outTimer: null,
+    // 8ms output coalescer — belongs to the current viewer. echoPending:
+    // input arrived, so the next output (usually its echo) skips the wait
+    outBuf: '', outTimer: null, echoPending: false,
     // Backpressure (see updatePause)
     wsPressure: false, lagPressure: false, paused: false, drainTimer: null, lag: 0,
     // Headless-side bookkeeping: per-chunk reply tags, chunk rate, growth
@@ -3165,7 +3166,10 @@ function onPtyData(term, str) {
       }
     } else {
       term.outBuf += str;
-      if (!term.outTimer) term.outTimer = setTimeout(() => flushOutput(term), 8);
+      // A keystroke's echo goes out at once: the 8ms would be added to
+      // every typed character. Later chunks coalesce as before.
+      if (term.echoPending) { term.echoPending = false; flushOutput(term); }
+      else if (!term.outTimer) term.outTimer = setTimeout(() => flushOutput(term), 8);
     }
   }
   updatePause(term);
@@ -3252,6 +3256,7 @@ function bindViewer(term, ws) {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
     if (msg.type === 'input' && typeof msg.data === 'string') {
+      term.echoPending = true;
       try { term.proc.write(msg.data); } catch {}
     } else if (msg.type === 'resize') {
       const cols = clampInt(msg.cols, 0, MAX_TERM_COLS);

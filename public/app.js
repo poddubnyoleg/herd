@@ -111,6 +111,8 @@ class Herd {
     this.host = { native: true, workspace: null }; // see /api/host
     this.narrow = window.matchMedia(Herd.NARROW);
     this.touch = window.matchMedia('(pointer: coarse)');
+    // iPadOS presents itself as a Mac
+    this.ios = /iP(hone|ad|od)/.test(navigator.userAgent) || (/Mac/.test(navigator.platform) && navigator.maxTouchPoints > 1);
     this._ctrlArmed = false; // key bar's sticky ctrl
     // Diagnostic ring buffer for the unread/finished pipeline. Dump with
     // __herd.dumpLog() in the console when tabs pulse green spuriously.
@@ -1361,6 +1363,8 @@ class Herd {
     // macOS keyboard navigation: Option+Arrow for word jump, Cmd+Arrow for line jump
     terminal.attachCustomKeyEventHandler(e => {
       if (e.type !== 'keydown') return true;
+      // iOS: ⌫ deletes from the textarea natively (setupIosDelete)
+      if (this.ios && tab.iosKeydown?.(e)) return false;
       // Cmd+C with a selection: copy with prose reflow. TUIs (Claude Code
       // et al.) hard-wrap prose at the terminal width, so the buffer holds
       // real newlines xterm can't distinguish from intentional ones —
@@ -1427,9 +1431,14 @@ class Herd {
         tab._awaitingInput = false;
         this._dbg('input-gate-cleared', { tab: tab.id, name: tab.name });
       }
-      if (tab.ws?.readyState === WebSocket.OPEN) tab.ws.send(JSON.stringify({ type: 'input', data }));
+      if (tab.ws?.readyState === WebSocket.OPEN) {
+        tab.ws.send(JSON.stringify({ type: 'input', data }));
+        tab._echoPending = true;
+        if (this.touch.matches) this.predictEcho(tab, data);
+      }
     });
     terminal.onResize(({ cols, rows }) => {
+      this.clearEcho(tab, true);
       if (tab.ws?.readyState === WebSocket.OPEN) tab.ws.send(JSON.stringify({ type: 'resize', cols, rows }));
     });
 
@@ -1460,6 +1469,7 @@ class Herd {
       const hidden = wrapper.getClientRects().length === 0;
       if (hidden) wrapper.classList.add('measuring');
       terminal.open(wrapper);
+      if (this.ios) this.setupIosDelete(tab);
 
       // GPU-accelerated rendering via WebGL (major FPS improvement).
       // On context loss, re-install on the next frame — otherwise the
@@ -1626,24 +1636,34 @@ class Herd {
             }
             // Batch writes via rAF to reduce render calls and improve FPS
             tab._writeBuf += msg.data;
-            if (!tab._writeRaf) {
-              tab._writeRaf = requestAnimationFrame(() => {
-                tab._writeRaf = 0;
-                const chunk = tab._writeBuf;
-                tab._writeBuf = '';
-                // Check if viewport is near the bottom before writing
-                const buf = terminal.buffer.active;
-                const atBottom = buf.viewportY >= buf.baseY - 1;
-                // onScroll also fires on viewport scrolls (user scrolling,
-                // scrollToBottom), not just buffer growth. Reset the flag
-                // before the write and consume it before scrolling, so only
-                // scrolls caused by this write's content count as growth.
-                tab._scrolled = false;
-                terminal.write(chunk, () => {
-                  this.trackTabActivity(tabId, tab, terminal);
-                  if (atBottom) terminal.scrollToBottom();
-                });
+            const flush = () => {
+              tab._writeRaf = 0;
+              const chunk = tab._writeBuf;
+              tab._writeBuf = '';
+              // Check if viewport is near the bottom before writing
+              const buf = terminal.buffer.active;
+              const atBottom = buf.viewportY >= buf.baseY - 1;
+              // onScroll also fires on viewport scrolls (user scrolling,
+              // scrollToBottom), not just buffer growth. Reset the flag
+              // before the write and consume it before scrolling, so only
+              // scrolls caused by this write's content count as growth.
+              tab._scrolled = false;
+              terminal.write(chunk, () => {
+                this.trackTabActivity(tabId, tab, terminal);
+                if (atBottom) terminal.scrollToBottom();
+                this.checkEcho(tab);
               });
+            };
+            // The first output after a keystroke — usually its echo — is
+            // written at once: xterm parses the first write after input
+            // immediately, and a frame's wait here was added to every
+            // typed character
+            if (tab._echoPending) {
+              tab._echoPending = false;
+              if (tab._writeRaf) cancelAnimationFrame(tab._writeRaf);
+              flush();
+            } else if (!tab._writeRaf) {
+              tab._writeRaf = requestAnimationFrame(flush);
             }
             // Incoming-chunk rate (rolling 2s window): the activity signal for
             // alt-screen TUIs and the "still working" test before the green
@@ -1734,6 +1754,7 @@ class Herd {
             // anything xterm still has queued is parsed first, then wiped.
             if (tab._writeRaf) { cancelAnimationFrame(tab._writeRaf); tab._writeRaf = 0; }
             tab._writeBuf = '';
+            this.clearEcho(tab, true);
             // Bypasses trackTabActivity: restored content is not new output.
             terminal.write('\x1bc' + msg.data, () => {
               tab._lineWatermark = undefined;
@@ -2082,6 +2103,92 @@ class Herd {
     if (wrapper.style.transform !== transform) wrapper.style.transform = transform;
   }
 
+  // ── Predictive echo (touch) ──
+  // From a phone, a typed character appears only after the round trip to
+  // the server: the agent echoes it in ~8ms, the rest is network. Draw it
+  // at the cursor at once and let the real echo replace it — mosh's idea,
+  // simplified. Each guess is checked against what comes back, and guesses
+  // are shown only once one has come true since the last ⏎, control key or
+  // miss: a prompt that does not echo (a password) shows nothing, and the
+  // first character after ⏎ waits for its echo.
+  predictEcho(tab, data) {
+    const e = tab._echo ??= { ghosts: [], shown: false, el: null, timer: 0 };
+    const { terminal } = tab;
+    for (const ch of data) {
+      if (ch === '\x7f' && e.ghosts.length) { e.ghosts.pop(); continue; }
+      // Single-width text only (Latin, Greek, Cyrillic); anything else moves
+      // the cursor in ways not worth guessing — ⏎, ^C, ⇥, arrows, a paste
+      if (!/^[\x20-\x7e\u00a0-\u024f\u0370-\u04ff]$/.test(ch)) return this.clearEcho(tab, true);
+      const buf = terminal.buffer.active;
+      const last = e.ghosts[e.ghosts.length - 1];
+      const row = last ? last.row : buf.baseY + buf.cursorY;
+      const x = last ? last.x + 1 : buf.cursorX;
+      // Private API: xterm 5.3 has no public cursor-visibility state
+      if (x >= terminal.cols - 2 || terminal._core.coreService.isCursorHidden) return this.clearEcho(tab, true);
+      e.ghosts.push({ row, x, ch });
+    }
+    clearTimeout(e.timer);
+    // No echo in time: not an echoing prompt
+    if (e.ghosts.length) e.timer = setTimeout(() => this.clearEcho(tab, true), 1500);
+    this.renderEcho(tab);
+  }
+
+  // After output is parsed: a guess is settled once the cursor has passed
+  // its cell — right if the cell holds that character.
+  checkEcho(tab) {
+    const e = tab._echo;
+    if (!e?.ghosts.length) return;
+    const buf = tab.terminal.buffer.active;
+    const cy = buf.baseY + buf.cursorY;
+    while (e.ghosts.length) {
+      const g = e.ghosts[0];
+      if (cy < g.row || (cy === g.row && buf.cursorX <= g.x)) break; // not echoed yet
+      const cell = buf.getLine(g.row)?.getCell(g.x)?.getChars();
+      if (cell !== g.ch && !(g.ch === ' ' && cell === '')) return this.clearEcho(tab, true);
+      e.ghosts.shift();
+      e.shown = true;
+    }
+    if (!e.ghosts.length) clearTimeout(e.timer);
+    this.renderEcho(tab);
+  }
+
+  clearEcho(tab, tentative) {
+    const e = tab._echo;
+    if (!e) return;
+    e.ghosts = [];
+    if (tentative) e.shown = false;
+    clearTimeout(e.timer);
+    e.el?.replaceChildren();
+  }
+
+  renderEcho(tab) {
+    const e = tab._echo, { terminal } = tab;
+    const screen = terminal.element?.querySelector('.xterm-screen');
+    if (!screen) return;
+    if (!e.el) {
+      e.el = document.createElement('div');
+      e.el.className = 'echo-ghosts';
+      screen.appendChild(e.el);
+    }
+    const buf = terminal.buffer.active;
+    if (!e.shown || buf.viewportY !== buf.baseY) return e.el.replaceChildren();
+    const w = screen.offsetWidth / terminal.cols, h = screen.offsetHeight / terminal.rows;
+    const { fontFamily, fontSize, theme } = terminal.options;
+    Object.assign(e.el.style, {
+      fontFamily, fontSize: `${fontSize}px`, lineHeight: `${h}px`, background: 'none',
+      // A shade dimmer than the real echo that replaces it
+      color: `color-mix(in srgb, ${theme.foreground} 70%, ${theme.background})`,
+    });
+    e.el.replaceChildren(...e.ghosts.map(g => {
+      const span = document.createElement('span');
+      span.textContent = g.ch;
+      span.style.cssText = `left:${g.x * w}px;top:${(g.row - buf.viewportY) * h}px;width:${w}px;height:${h}px;background:${theme.background}`;
+      return span;
+    }));
+    // The cursor waits at the real one; draw a bar after the last guess
+    e.el.lastChild?.classList.add('echo-cursor');
+  }
+
   closeTab(tabId) {
     const tab = this.tabs.get(tabId);
     if (!tab) return;
@@ -2414,13 +2521,15 @@ class Herd {
 
   // Long-press a terminal for its text view: xterm 5.3 has no touch
   // selection (a drag scrolls), so there is no other way to copy on a phone.
+  // A tap raises the keyboard (showKeyboard).
   setupLongPress() {
     const area = document.getElementById('terminal-area');
-    let timer = 0, fired = false, x0 = 0, y0 = 0;
+    let timer = 0, fired = false, tap = false, x0 = 0, y0 = 0;
     area.addEventListener('touchstart', e => {
       clearTimeout(timer);
-      fired = false;
+      fired = tap = false;
       if (e.touches.length !== 1 || e.target.closest('.text-view, .terminal-takeover')) return;
+      tap = true;
       ({ clientX: x0, clientY: y0 } = e.touches[0]);
       timer = setTimeout(() => {
         const tab = this.tabs.get(this.activeTabId);
@@ -2429,15 +2538,86 @@ class Herd {
     }, { passive: true });
     area.addEventListener('touchmove', e => {
       const t = e.touches[0];
-      if (Math.hypot(t.clientX - x0, t.clientY - y0) > 10) clearTimeout(timer);
+      if (Math.hypot(t.clientX - x0, t.clientY - y0) > 10) { clearTimeout(timer); tap = false; }
     }, { passive: true });
     area.addEventListener('touchend', e => {
       clearTimeout(timer);
       // No click after a long-press: it would focus the terminal and raise
       // the keyboard over the view
       if (fired) e.preventDefault();
+      else if (tap) this.showKeyboard();
     }, { passive: false });
-    area.addEventListener('touchcancel', () => clearTimeout(timer));
+    area.addEventListener('touchcancel', () => { clearTimeout(timer); tap = false; });
+  }
+
+  // iOS raises the keyboard only for a focus change made during a tap. Put
+  // away with the terminal still focused, it never came back: xterm's
+  // focus() on the next tap changed nothing, and only a reload helped. So
+  // refocus from scratch while no keyboard is up — keyboards are taller
+  // than 100px, Safari's bars are not. (With an iPad's hardware keyboard
+  // every tap refocuses, sending the app a focus-out/in pair.) Focusing
+  // here, in touchend, also covers a tap iOS delivers no mousedown for.
+  showKeyboard() {
+    const terminal = this.tabs.get(this.activeTabId)?.terminal;
+    if (!this.ios || !terminal?.textarea || this._kbHeight > 100) return;
+    if (document.activeElement === terminal.textarea) terminal.textarea.blur();
+    terminal.focus();
+  }
+
+  // iOS repeats a held ⌫ only while the field has text to delete, and
+  // xterm's textarea never has any: it cancels every key it sends on, and
+  // empties the field on blur, ⏎, ^C and after a paste (dictation). So a
+  // press deleted one character and holding did nothing — clearing a
+  // dictated paragraph took a tap per character. Keep filler in the
+  // textarea for iOS to delete natively (createTab's key handler lets ⌫
+  // through) and send each deletion on as a DEL per character removed; a
+  // long hold speeds up to a word per step, which arrives as a larger
+  // deletion. A keyCode-229 edit is xterm's: its IME handling diffs the
+  // field and sends the DEL itself, so it is only refilled after.
+  setupIosDelete(tab) {
+    const { terminal } = tab, ta = terminal.textarea;
+    let before = null; // the value at beforeinput
+    let xtermOwns = false;
+    tab.iosKeydown = e => {
+      Herd.padTextarea(ta);
+      xtermOwns = e.keyCode === 229 && e.key !== 'Backspace';
+      return e.key === 'Backspace' && !e.altKey && !e.ctrlKey && !e.metaKey;
+    };
+    ta.addEventListener('keyup', () => { xtermOwns = false; });
+    ta.addEventListener('beforeinput', () => { before = ta.value; });
+    ta.addEventListener('input', e => {
+      const was = before, ours = !xtermOwns;
+      before = null;
+      xtermOwns = false;
+      if (!/^delete.*Backward$/.test(e.inputType) || e.isComposing) return;
+      if (!ours) return void setTimeout(() => Herd.padTextarea(ta));
+      // Characters, not UTF-16 units: one ⌫ over an emoji is one DEL
+      let removed = 1;
+      if (was !== null) {
+        const now = ta.value;
+        let i = 0;
+        while (i < now.length && now[i] === was[i]) i++;
+        const gone = was.slice(i, i + was.length - now.length);
+        removed = Intl.Segmenter ? [...new Intl.Segmenter().segment(gone)].length : [...gone].length;
+      }
+      // Private API, as in setupKeybar: input sent as if typed
+      terminal._core.coreService.triggerDataEvent('\x7f'.repeat(Math.max(1, removed)), true);
+      Herd.padTextarea(ta, true);
+    });
+    ta.addEventListener('focus', () => Herd.padTextarea(ta));
+    // After xterm has emptied the field (paste, ⏎, ^C), not when ⌫ is
+    // already down: iOS may decide on repeating before the keydown
+    terminal.onData(() => setTimeout(() => Herd.padTextarea(ta)));
+  }
+
+  // Spaces, so QuickType and dictation still see the start of a word. A
+  // field with text is left alone unless the edit was ours: xterm's IME
+  // handling diffs the value around a keystroke, and text it has yet to
+  // send must not change under it.
+  static padTextarea(ta, reset = false) {
+    if (ta.value && !reset) return;
+    ta.value = ' '.repeat(8);
+    ta.setSelectionRange(8, 8);
   }
 
   // The terminal's buffer as plain text the browser can select natively.
