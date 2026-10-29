@@ -25,6 +25,7 @@ volumes were created through the GraphQL `volumeCreate` mutation.
 | `TZ` | Optional IANA zone (e.g. `America/New_York`); the status line's reset time uses it. Default UTC. |
 | `ALLOWED_ORIGINS` | Only for a custom domain. The Railway domain is allowed automatically via `RAILWAY_PUBLIC_DOMAIN`. |
 | `OPENAI_API_KEY` | Optional; turns on dictation. The server relays recordings to OpenAI's `gpt-transcribe` (`HERD_STT_MODEL` overrides); it is kept out of terminals' environment, but a shell runs as the server's user and can read it from `/proc` — on someone else's deployment, use a restricted project key with a budget. `HERD_STT_LANGUAGES` (e.g. `en,de`) names the languages you speak — listing English as well keeps English terms spelled as English inside the other; unset, the model detects. `HERD_STT_KEYWORDS` (comma-separated) replaces the default vocabulary hints. |
+| `YT_PROXY` | Optional residential proxy URL (`http://user:pass@host:port`) for yt-dlp, which YouTube otherwise often refuses from a datacenter IP (bot challenge, PO-token-locked subtitles). Written to `/etc/yt-dlp.conf` at boot, so every yt-dlp run uses it — a video download spends proxy bandwidth too. |
 
 Set by the Dockerfile: `HOST=0.0.0.0`, `HOME=/data/home`, `HERD_DATA_DIR=/data/herd`
 (summary cache), `HERD_WORKSPACE=/data/work` (projects), `HERD_CLAUDE_SANDBOX=0`,

@@ -11,6 +11,15 @@ for d in /data/home /data/work /data/herd; do
   [ "$(stat -c %U "$d")" = herd ] || chown -R herd:herd "$d"
 done
 
+# yt-dlp (yt-subs skill): node solves YouTube's JS challenges, and YT_PROXY, if
+# set, is a residential proxy — YouTube answers datacenter IPs with a bot
+# challenge or PO-token-locked subtitles. Rewritten every boot, so unsetting
+# the variable takes effect.
+{
+  echo '--js-runtimes node'
+  [ -z "${YT_PROXY:-}" ] || printf -- '--proxy "%s"\n' "$YT_PROXY"
+} > /etc/yt-dlp.conf
+
 # A fresh HOME has no ~/.claude.json, and without hasCompletedOnboarding the
 # interactive TUI runs first-time setup instead of picking up the token.
 if [ ! -f /data/home/.claude.json ]; then

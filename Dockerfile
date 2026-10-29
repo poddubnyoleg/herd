@@ -42,9 +42,9 @@ RUN npm ci --omit=dev && npm cache clean --force
 
 # yt-dlp for the yt-subs skill (deploy/claude/skills): the standalone build
 # bundles curl_cffi (without impersonation YouTube 429s the subtitle endpoints)
-# and the EJS challenge solver, which runs on the image's node — /etc/yt-dlp.conf
-# enables it, since yt-dlp only looks for deno by default. Pinned like Claude
-# Code; its directory is herd's so `yt-dlp -U` (which follows the symlink and
+# and the EJS challenge solver, which runs on the image's node — the entrypoint's
+# /etc/yt-dlp.conf enables it (yt-dlp only looks for deno by default), plus
+# YT_PROXY when set. Pinned like Claude Code; its directory is herd's so `yt-dlp -U` (which follows the symlink and
 # writes a sibling file) works between deploys when YouTube breaks it. A symlink,
 # not ENV PATH: a login shell's /etc/profile resets PATH for non-root users.
 ARG YT_DLP_VERSION=2026.10.26
@@ -55,8 +55,7 @@ RUN case "$(dpkg --print-architecture)" in \
     && curl -fsSL -o /opt/yt-dlp/yt-dlp \
         "https://github.com/yt-dlp/yt-dlp/releases/download/${YT_DLP_VERSION}/${asset}" \
     && chmod 755 /opt/yt-dlp/yt-dlp && chown -R herd:herd /opt/yt-dlp \
-    && ln -s /opt/yt-dlp/yt-dlp /usr/local/bin/yt-dlp \
-    && echo '--js-runtimes node' > /etc/yt-dlp.conf
+    && ln -s /opt/yt-dlp/yt-dlp /usr/local/bin/yt-dlp
 
 COPY . .
 
