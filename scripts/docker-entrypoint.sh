@@ -33,6 +33,16 @@ fs.mkdirSync(dir, { recursive: true });
 fs.writeFileSync(p, JSON.stringify({ ...seed, ...cur, statusLine: seed.statusLine }, null, 2) + "\n");
 ' || log "WARNING: could not merge Claude settings"
 
+# Skills shipped in the image replace their copy on the volume at every boot;
+# skills installed by hand under other names are left alone.
+gosu herd bash -c '
+mkdir -p /data/home/.claude/skills
+for s in /app/deploy/claude/skills/*/; do
+  d=/data/home/.claude/skills/$(basename "$s")
+  rm -rf "$d" && cp -r "$s" "$d"
+done
+' || log "WARNING: could not install bundled skills"
+
 [ -n "${HERD_PASSWORD:-}" ] || log "WARNING: HERD_PASSWORD is unset — the server will refuse to start."
 [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] || log "WARNING: CLAUDE_CODE_OAUTH_TOKEN is unset — run /login in a Claude tab."
 

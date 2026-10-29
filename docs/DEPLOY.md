@@ -37,6 +37,14 @@ Claude settings: at boot `deploy/claude/settings.json` is merged into
 changing the local one. A `setup-token` token can't read the plan, so without the
 `model` default Claude would start on Sonnet.
 
+Skills: each folder in `deploy/claude/skills/` replaces `~/.claude/skills/<name>`
+at boot; skills added by hand under other names stay. `yt-subs` is a copy of the
+local `~/.claude/skills/yt-subs` — re-copy it after changing that one. Its
+`yt-dlp` is the standalone build pinned in the `Dockerfile` (`YT_DLP_VERSION`),
+set to solve YouTube's JS challenges with the image's node. When YouTube breaks
+it, `yt-dlp -U` in a terminal updates it until the next deploy; bump the pin to
+keep the update.
+
 ## Handing a deployment to someone
 
 Give them the `HERD_PASSWORD` value; they sign in and use **password** in the
