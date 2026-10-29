@@ -23,11 +23,13 @@ Options:
 
 ## Behavior
 
-1. Tries **manual** subs in the requested languages.
-2. Falls back to **auto-generated** subs in the requested languages.
-3. Last resort: any auto-generated sub the video has (whatever language).
+One yt-dlp call per tier, best fidelity first:
 
-The chosen subtitle filename is printed to stderr so you know which language/track was used.
+1. **Manual** subs in the requested languages (`en` also matches `en-US`).
+2. The **original-language auto track** — YouTube names it `xx-orig` — whatever its language: the speaker's words, not a translation.
+3. Last resort: YouTube's **machine translation** into the requested languages. Requested together with the original, it has drawn HTTP 429s that cost the original too.
+
+stderr names the track and its origin — `# subtitle file: ID.en-orig.vtt (auto-original)`; origin is `manual`, `auto-original` or `auto-translated`. Say so when quoting an `auto-translated` transcript. On failure, stderr carries yt-dlp's ERROR/WARNING lines (bot challenge, 429, PO token) and the video's track list, and the exit code is 1.
 
 ## Examples
 
@@ -48,5 +50,5 @@ The chosen subtitle filename is printed to stderr so you know which language/tra
 - Also requires `curl_cffi` (`pip install curl_cffi`) — yt-dlp uses it for browser impersonation, without which YouTube returns HTTP 429 on subtitle endpoints.
 - Single-video only — `--no-playlist` is always set.
 - For long videos pipe to a file, then Read it; don't dump 50K-token transcripts into the chat.
-- For Russian (or other non-English) source videos, pass `--lang ru,en` so the original transcript is picked over an auto-translated English one. The default `en,ru` will otherwise pick a (often poor) machine translation when both exist.
+- `--lang` still decides between manual tracks: on a Russian talk with human English subs, the default `en,ru` returns those over the Russian auto track. Pass `--lang ru` for the original speech.
 - Privacy: yt-dlp talks to YouTube only. Don't paste transcript content into external research tools without checking it for PII first.
